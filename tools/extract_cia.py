@@ -2,7 +2,8 @@
 # DawnOfTermina — SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 DawnOfTermina contributors
 """Extract a *decrypted* 3DS .cia into game_data/: exheader.bin, exefs/ (code.bin
-LZSS-decompressed), code.elf (code.bin at its original VAs, for Hopper) and romfs/.
+LZSS-decompressed), code.elf (code.bin at its original VAs, for Hopper), romfs/ and the
+raw romfs.bin image (served to the game by the fs:USER HLE).
 Pure Python, no ctrtool/3dstool needed.
 
 usage: extract_cia.py <game.cia> [out_dir=game_data]
@@ -214,6 +215,17 @@ def main():
         if romfs_off:
             n = extract_romfs(f, ncch + romfs_off, out / "romfs")
             print(f"romfs/  {n} files")
+            # Raw RomFS image (from the IVFC header): what fs:USER serves to the game's SDK.
+            remaining = u32(h, 0x1B4) * MEDIA_UNIT
+            f.seek(ncch + romfs_off)
+            with open(out / "romfs.bin", "wb") as o:
+                while remaining:
+                    chunk = f.read(min(remaining, 1 << 20))
+                    if not chunk:
+                        break
+                    o.write(chunk)
+                    remaining -= len(chunk)
+            print(f"romfs.bin  {(out / 'romfs.bin').stat().st_size:#x}")
 
     print(f"\ntitle: {cs['name']}  code compressed: {cs['compressed']}")
     for s in ("text", "rodata", "data"):

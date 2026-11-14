@@ -95,6 +95,8 @@ Result send_sync_request(Handle session);
 using ServiceHandler = std::function<void(core::Memory& mem, u32 cmd)>;
 void register_service(const std::string& name, ServiceHandler handler);
 Handle open_session(const std::string& service);
+// A session with its own handler (e.g. an open file), freed when its handle is closed.
+Handle open_session(const std::string& name, ServiceHandler handler);
 
 // The calling guest thread's CPU context (for the svc dispatcher).
 recomp::Context& current_context();

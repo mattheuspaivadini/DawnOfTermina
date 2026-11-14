@@ -107,13 +107,36 @@ class Recompiler:
         return not stack  # every path ended (e.g. only tail calls), nothing undecodable
 
     def jump_table(self, insn):
-        """Targets of `cmp rX, #N; addls pc, pc, rX, lsl #2` (N+1 branch slots)."""
+        """Case targets of the two ARMCC switch idioms, bounded by an earlier `cmp rX, #N`:
+        `addls pc, pc, rX, lsl #2` (a table of branches right after) and
+        `ldrlo pc, [pc, rX, lsl #2]` (a table of absolute addresses right after)."""
+        out = []
         for kind, rm, pc in insn.extra_targets:
-            if kind == "table" and not insn.thumb and self.image.in_text(insn.addr - 4):
-                prev = self.decode(insn.addr - 4, False)
-                if prev.switch_cmp and prev.switch_cmp[0] == rm and prev.switch_cmp[1] < 4096:
-                    return [pc + 4 * k for k in range(prev.switch_cmp[1] + 1)]
-        return []
+            if insn.thumb or insn.cond not in (3, 9):  # LO: N cases, LS: N + 1 cases
+                continue
+            bound = None
+            for back in range(1, 7):
+                p = insn.addr - 4 * back
+                if not self.image.in_text(p):
+                    break
+                prev = self.decode(p, False)
+                if prev.switch_cmp and prev.switch_cmp[0] == rm:
+                    bound = prev.switch_cmp[1]
+                    break
+                if prev.kind != "normal":
+                    break
+            if bound is None or bound >= 4096:
+                continue
+            count = bound + 1 if insn.cond == 9 else bound
+            if kind == "table":
+                out += [pc + 4 * k for k in range(count)]
+            else:  # abs_table: words at pc
+                for k in range(count):
+                    if self.image.in_text(pc + 4 * k):
+                        t = self.image.read32(pc + 4 * k)
+                        if self.image.in_text(t) and not t & 3:
+                            out.append(t)
+        return out
 
     def successors(self, insn, local_only):
         """Intra-function successors as (addr) list; local_only excludes tail-call branches."""

@@ -34,6 +34,7 @@
 #include "hle/hid.h"
 #include "hle/srv.h"
 #include "hle/kernel.h"
+#include "hle/service/services.h"
 #include "hle/svc.h"
 #include "recomp/runtime.h"
 
@@ -101,7 +102,7 @@ int main(int argc, char** argv) {
     recomp::set_svc_memory(mem);
     recomp::set_function_table(recomp::kFunctions, recomp::kFunctionCount);
     hle::kernel::init(mem);
-    hle::srv::RegisterIpc();
+    hle::service::register_all(data);
     const u8 main_priority = read_main_priority(data);
     std::printf("boot: running recompiled code (%u functions), main thread priority 0x%02X\n",
                 recomp::kFunctionCount, main_priority);

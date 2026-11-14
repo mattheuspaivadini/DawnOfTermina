@@ -85,7 +85,8 @@ struct AddressArbiter : Object {};
 struct ResourceLimit : Object {};
 struct Session : Object {
     std::string service;
-    explicit Session(std::string s) : service(std::move(s)) {}
+    ServiceHandler handler;  // per-session handler; empty = look the service up by name
+    explicit Session(std::string s, ServiceHandler h = {}) : service(std::move(s)), handler(std::move(h)) {}
 };
 struct Process : Object {};
 
@@ -566,6 +567,11 @@ Handle open_session(const std::string& service) {
     return add(std::make_shared<Session>(service));
 }
 
+Handle open_session(const std::string& name, ServiceHandler handler) {
+    std::lock_guard lk(g_lock);
+    return add(std::make_shared<Session>(name, std::move(handler)));
+}
+
 Result connect_to_port(const std::string& name, Handle* out) {
     {
         std::lock_guard lk(g_lock);
@@ -583,8 +589,12 @@ Result send_sync_request(Handle session) {
         auto* s = get_as<Session>(session);
         if (!s) return ERR_INVALID_HANDLE;
         name = s->service;
-        auto it = g_services.find(name);
-        if (it != g_services.end()) handler = it->second;
+        if (s->handler) {
+            handler = s->handler;
+        } else {
+            auto it = g_services.find(name);
+            if (it != g_services.end()) handler = it->second;
+        }
     }
     const u32 cmd = t_self->ctx.tls + 0x80;
     if (!handler)

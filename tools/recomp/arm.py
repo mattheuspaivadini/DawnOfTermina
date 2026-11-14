@@ -355,6 +355,9 @@ def lift_ldst(image, insn, w, pc):
     addr_stmt, wb_stmt = address_mode(w, pc, off)
     width = "8" if byte else "32"
     insn.asm = f"{'ldr' if load else 'str'}{'b' if byte else ''} r{rd}, [r{rn}]"
+    # ldrlo/ldrls pc, [pc, rX, lsl #2] followed by a table of absolute case addresses
+    if load and rd == 15 and rn == 15 and not byte and (w & 0x01E00FF0) == 0x01800100:
+        insn.extra_targets = [("abs_table", w & 0xF, pc)]
     if load:
         return finish_load(image, insn, w, pc, rd, f"recomp::r{width}(a)", addr_stmt, wb_stmt)
     value = h(pc) if rd == 15 else f"c->r[{rd}]"  # ARM11 stores PC + 8

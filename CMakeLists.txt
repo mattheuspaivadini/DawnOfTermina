@@ -27,6 +27,11 @@ add_library(dot_runtime STATIC
     src/game/guest.cpp
     src/game/crt0.cpp
     src/hle/kernel.cpp
+    src/hle/service/services.cpp
+    src/hle/service/apt.cpp
+    src/hle/service/misc.cpp
+    src/hle/service/fs.cpp
+    src/hle/service/cfg.cpp
     src/recomp/runtime.cpp
     src/recomp/svc.cpp
 )

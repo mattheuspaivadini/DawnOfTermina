@@ -41,7 +41,7 @@ cmake --build build
 ./build/dawnoftermina game_data
 ```
 
-Para renderizar acima da resolução do 3DS: `DOT_RES_SCALE=3 ./build/dawnoftermina game_data` (1–8, ou `native` para o maior fator que cabe na janela). Widescreen sem barras: `DOT_WIDESCREEN=window DOT_RES_SCALE=native DOT_WINDOW=1920x1080 ./build/dawnoftermina game_data` (a tela de cima preenche a janela; Tab mostra/esconde a tela de baixo; F11 = tela cheia).
+Para renderizar acima da resolução do 3DS: `DOT_RES_SCALE=3 ./build/dawnoftermina game_data` (1–8, ou `native` para o maior fator que cabe na janela). Widescreen sem barras: `DOT_WIDESCREEN=window DOT_RES_SCALE=native DOT_WINDOW=1920x1080 ./build/dawnoftermina game_data` (a tela de cima preenche a janela; Tab mostra/esconde a tela de baixo; F11 = tela cheia). 60 FPS: `DOT_FPS=60` (quadros intermediários interpolados; a lógica do jogo continua a 30 Hz).
 
 ## Arquitetura
 
@@ -73,7 +73,8 @@ Cada função transcrita mantém o endereço virtual original em comentário (`/
 | 8 | Áudio: HLE do DSP (24 vozes, PCM8/PCM16/ADPCM) com saída via SDL3 | ✅ música e efeitos; sem reverb/filtros |
 | 9 | Renderização em alta resolução (`DOT_RES_SCALE`) com framebuffers residentes na GPU | ✅ |
 | 10 | Widescreen real (`DOT_WIDESCREEN=16:9`, `21:9`, `window`…) | ✅ |
-| 11+ | Subsistemas do jogo (cenas, loop, colisão, atores, HUD) | ⏳ |
+| 11 | 60 FPS por interpolação de quadros (`DOT_FPS=60`), sem acelerar a lógica | ✅ |
+| 12+ | Subsistemas do jogo (cenas, loop, colisão, atores, HUD) | ⏳ |
 
 ## Licença
 

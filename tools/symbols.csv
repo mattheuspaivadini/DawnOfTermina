@@ -44,3 +44,11 @@
 0x0017ac3c,nn_snd_ReadAudioPipe,? ReadPipeIfPossible on channel 2
 0x0017ab94,nn_dsp_SetSemaphore,? dsp::DSP SetSemaphore (0x4000 after writing shared memory)
 0x00192d3c,nn_os_CriticalSection_Enter,? recursive: owner = TLS id, count at +8
+0x00124ee8,GfxManager_SwapAndWait,? end of frame: swap, then nngxWaitVSync until vcount >= this+0xD0; this+0xCC lag (VBlanks behind, capped at this+0xC8)
+0x0013765c,nngxWaitVSync,? waits the VSync counter of display 0x400 (top) / 0x401 (bottom) / 0x402 (both) to change
+0x00123678,nngx_WaitVSyncEvent,? waits the VSync event (*0x6b0834)
+0x001d71ac,GetGfxManager,? returns *(0x6a3a4c)
+0x00108f94,GfxManager_SetNextFrameTarget,? (inside a larger function) this+0xD0 = vcount (0x6a3a08) + frame step (0x6a3a14)
+0x0015d20c,EndingScene_Init,? loads Joker.Main.Ending.gar; frame step 1 (60 fps), max lag 8 -- the only 60 fps mode
+0x00170680,EndingScene_Destroy,? restores frame step 2 (30 fps), max lag 16
+0x0010677c,MainLoop_Frame,? one game frame: update, top/bottom render, GfxManager_SwapAndWait(0x402)

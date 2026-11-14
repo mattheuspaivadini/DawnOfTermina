@@ -408,7 +408,7 @@ bool gpu_screen(int screen, gfx::vulkan::GpuScreen& out) {
     return r && va && r->display(*g_mem, va, out);
 }
 
-bool screen_dump(int screen, std::vector<u32>& rgba, u32& width, u32& height) {
+bool screen_dump(int screen, std::vector<u32>& rgba, u32& width, u32& height, bool interp) {
     auto* r = g_renderer.load();
     u32 va;
     {
@@ -416,7 +416,8 @@ bool screen_dump(int screen, std::vector<u32>& rgba, u32& width, u32& height) {
         va = g_fb[screen].va;
     }
     gfx::vulkan::GpuScreen g;
-    if (r && va && r->display(*g_mem, va, g)) return r->read_display(va, rgba, width, height);
+    if (r && va && r->display(*g_mem, va, g, false)) return r->read_display(va, rgba, width, height, interp);
+    if (interp) return false;
     width = screen == 0 ? 400 : 320, height = 240;
     return screen_image(screen, rgba);
 }

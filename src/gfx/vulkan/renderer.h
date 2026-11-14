@@ -60,13 +60,16 @@ public:
     // the transfer is not one the GPU path handles (the caller then runs it on the CPU).
     bool display_transfer(core::Memory& mem, u32 in, u32 out, u32 in_dim, u32 out_dim, u32 flags);
     // The screen image last transferred to `va`, if guest memory there is unchanged since.
-    bool display(core::Memory& mem, u32 va, GpuScreen& out);
+    // With frame interpolation (DOT_FPS=60), a presenting call (`consume`) returns the
+    // in-between frame during the first 60 Hz period after a new frame, then the real one.
+    bool display(core::Memory& mem, u32 va, GpuScreen& out, bool consume = true);
     // Reads a screen image back (DOT_DUMP_FRAMES), RGBA8 rows top first.
-    bool read_display(u32 va, std::vector<u32>& rgba, u32& width, u32& height);
+    bool read_display(u32 va, std::vector<u32>& rgba, u32& width, u32& height, bool interp = false);
     u32 scale() const;
 
     struct Stats {
         u64 draws, skipped, pipelines, readbacks, shaders;  // shaders = GLSL compiled (not from the disk cache)
+        u64 interpolated, not_interpolated;                 // DOT_FPS=60: in-between frames made / skipped (cuts)
     };
     Stats stats() const;
 

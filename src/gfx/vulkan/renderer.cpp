@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <set>
 #include <mutex>
 #include <span>
@@ -112,11 +113,14 @@ u64 fnv(const void* data, size_t n, u64 h = 1469598103934665603ull) {
     return h;
 }
 
-// Fast 64-bit hash of guest memory (surfaces are hashed on every bind to catch CPU writes).
+// Sampled 64-bit hash of guest memory: one 8-byte word every 256 bytes plus the tail. Surfaces
+// are hashed on every bind to catch CPU writes; sampling keeps that cheap.
+// shortcut: CPU writes that touch none of the sampled words go unnoticed (whole-buffer writes,
+// fills and videos always do); hash every word if that ever shows up.
 u64 hash_ram(const u8* p, size_t n) {
     u64 h = n;
     size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
+    for (; i + 8 <= n; i += 256) {
         u64 w;
         std::memcpy(&w, p + i, 8);
         h = (h ^ w) * 0x9E3779B97F4A7C15ull;
@@ -124,6 +128,20 @@ u64 hash_ram(const u8* p, size_t n) {
     }
     for (; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
     return h;
+}
+
+// Full 64-bit hash, 8 bytes per step (texture contents: every byte matters).
+u64 hash_words(const u8* p, size_t n) {
+    u64 h = n, a = 0x243F6A8885A308D3ull;
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {  // two independent lanes
+        u64 w0, w1;
+        std::memcpy(&w0, p + i, 8), std::memcpy(&w1, p + i + 8, 8);
+        h = (h ^ w0) * 0x9E3779B97F4A7C15ull;
+        a = (a ^ w1) * 0xC2B2AE3D27D4EB4Full;
+    }
+    for (; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
+    return h ^ (a + (h >> 31));
 }
 
 // DisplayTransfer on the GPU: colour surface -> screen-oriented image (framebuffer rows are
@@ -222,6 +240,9 @@ struct Renderer::Impl {
     };
     struct Display {  // DisplayTransfer output, screen-oriented, scaled
         Image image;
+        Image interp;              // frame interpolation: the in-between frame shown before `image`
+        bool interp_fresh = false;  // `interp` goes with the current `image`
+        std::chrono::steady_clock::time_point ready;  // when `image` and `interp` were both done
         u32 width = 0, height = 0, bytes = 0;
         u64 ram_hash = 0;  // guest memory at the output when the transfer ran
     };
@@ -256,6 +277,27 @@ struct Renderer::Impl {
     std::map<u32, Display> displays;              // by output VA
     std::map<u32, Image> scratch;                 // guest-size staging images, by width << 16 | height
     Surface* cur = nullptr;                       // current render target
+
+    // Frame interpolation (DOT_FPS=60): the game simulates at 30 Hz (one step per 2 VBlanks,
+    // fixed-step logic). Every GPU operation of a top-screen frame is recorded; when the frame
+    // ends (its DisplayTransfer to the 400-row framebuffer) it is replayed with the vertex
+    // shaders' float uniforms (camera, model and bone matrices) averaged with the matching
+    // draw of the previous frame, into an extra screen image shown one VBlank before the real
+    // frame. Guest memory still holds everything the frame used at that point (the real GPU
+    // reads it asynchronously, so the game cannot have reused it yet).
+    struct Op {
+        enum Kind : u8 { Draw, Fill, Transfer } kind;
+        bool indexed = false, gpu = true;  // gpu: the original ran on the GPU path (else skipped)
+        std::array<u32, pica::reg::COUNT> regs;
+        std::shared_ptr<const pica::ShaderState> vs;
+        u32 a[6] = {};
+        u64 key = 0;  // draws: what it draws (program, buffers, texture) + ordinal in the frame
+    };
+    bool interpolate = false, replaying = false;
+    std::vector<Op> frame_ops, prev_ops;
+    std::map<u64, u32> key_counts;
+    std::shared_ptr<pica::ShaderState> last_vs;
+    u64 interp_frames = 0, interp_skipped = 0;
     // Widescreen: the colour buffers that feed the top screen get W times more rows (rows are
     // the screen's horizontal axis). DOT_WIDESCREEN=<w>:<h> or "window" (follows the window).
     float wide_aspect = 0;  // top screen aspect; 0 = off, < 0 = window
@@ -589,6 +631,7 @@ struct Renderer::Impl {
             scale = std::min(scale, 8u);
         }
         anisotropy = scale > 1 ? std::min(16.0f, ctx.max_anisotropy()) : 0.0f;
+        if (const char* e = std::getenv("DOT_FPS")) interpolate = std::atoi(e) >= 60;
         std::printf("renderer: resolution scale %ux%s\n", scale, anisotropy > 1 ? ", anisotropic filtering" : "");
 
         // 1x1 white texture for disabled units.
@@ -968,15 +1011,20 @@ struct Renderer::Impl {
         // Screen horizontal = surface rows: the top screen keeps the widened rows, others are resampled.
         const float src_cols = out_h * sy;
         const u32 screen_w = out_h == 400 ? u32(std::lround(src_cols)) : out_h * scale;
+        if (replaying && out_h != 400) return true;  // only the top screen is interpolated
         if (d.image.img && (d.width != screen_w || d.height != out_w * scale)) {
             submit_and_wait();
-            destroy(d.image);
+            destroy(d.image), destroy(d.interp);
         }
         if (!d.image.img) {
             d.width = screen_w, d.height = out_w * scale;
             d.image = make_general(d.width, d.height, VK_FORMAT_R8G8B8A8_UNORM,
                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
         }
+        if (replaying && !d.interp.img)
+            d.interp = make_general(d.width, d.height, VK_FORMAT_R8G8B8A8_UNORM,
+                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+        const Image& dst_img = replaying ? d.interp : d.image;
         begin();
         VkDescriptorSet set;
         VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -987,7 +1035,7 @@ struct Renderer::Impl {
             vkAllocateDescriptorSets(dev, &dai, &set);
         }
         const VkDescriptorImageInfo ii[2] = {{sampler(0), sf.color.view, VK_IMAGE_LAYOUT_GENERAL},
-                                             {VK_NULL_HANDLE, d.image.view, VK_IMAGE_LAYOUT_GENERAL}};
+                                             {VK_NULL_HANDLE, dst_img.view, VK_IMAGE_LAYOUT_GENERAL}};
         VkWriteDescriptorSet w[2]{};
         w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                 &ii[0], nullptr, nullptr};
@@ -1005,6 +1053,11 @@ struct Renderer::Impl {
         vkCmdDispatch(cmd, (d.width + 7) / 8, (d.height + 7) / 8, 1);
         memory_barrier();
         submit_and_wait();  // presentation (another thread) reads the image next
+        if (replaying) {
+            d.interp_fresh = true;
+            return true;
+        }
+        d.interp_fresh = false;  // a new real frame: its in-between frame comes from the replay
         d.bytes = out_w * out_h * pica::pixel::bytes_per_pixel(out_fmt);
         d.ram_hash = hash_ram(mem.host(out), d.bytes);
         if (cache_dirty && std::chrono::steady_clock::now() - cache_saved > std::chrono::seconds(10)) save_caches();
@@ -1081,7 +1134,7 @@ struct Renderer::Impl {
         if (!va || !w || !h || !size || w % 8 || h % 8) return dummy;
         const u64 key = fnv(&va, 4, fnv(&w, 4, fnv(&h, 4, u64(fmt))));
         Texture& t = textures[key];
-        const u64 hash = fnv(mem.host(va), size);
+        const u64 hash = hash_words(mem.host(va), size);
         if (t.ready && t.hash == hash) return t;
         const auto rgba = pica::decode_texture({mem.host(va), size}, w, h, fmt);
         if (std::getenv("DOT_TRACE_DRAWS")) {
@@ -1201,6 +1254,98 @@ struct Renderer::Impl {
         return vertex_shaders[key] = glsl.empty() ? VK_NULL_HANDLE : module(glsl, ShaderStage::Vertex);
     }
 
+    void record_draw(const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs, bool indexed) {
+        if (!interpolate || replaying) return;
+        if (!last_vs || std::memcmp(last_vs.get(), &vs, sizeof vs)) last_vs = std::make_shared<pica::ShaderState>(vs);
+        Op op{Op::Draw};
+        op.indexed = indexed, op.regs = regs, op.vs = last_vs;
+        // What is drawn: program entry, attribute buffers, index buffer and count, texture 0.
+        const u32 what[] = {regs[VS_ENTRY] & 0xFFFF, regs[0x200], regs[0x203], regs[0x227], regs[0x228], regs[0x085],
+                            regs[COLOR_ADDR]};
+        const u64 k = fnv(what, sizeof what);
+        op.key = k ^ u64(key_counts[k]++) * 0x9E3779B97F4A7C15ull;
+        frame_ops.push_back(std::move(op));
+    }
+
+    void record_op(Op::Kind kind, std::initializer_list<u32> args, bool gpu) {
+        if (!interpolate || replaying) return;
+        Op op{kind};
+        op.gpu = gpu;
+        u32 i = 0;
+        for (u32 v : args) op.a[i++] = v;
+        frame_ops.push_back(std::move(op));
+    }
+
+    // End of a top-screen frame (its transfer was just recorded and run): replay it halfway
+    // between the previous frame and this one.
+    void end_frame(Memory& mem) {
+        if (!interpolate || replaying) return;
+        std::map<u64, const Op*> prev;
+        for (const Op& op : prev_ops)
+            if (op.kind == Op::Draw) prev[op.key] = &op;
+        u32 draws = 0, matched = 0;
+        for (const Op& op : frame_ops)
+            if (op.kind == Op::Draw) ++draws, matched += prev.count(op.key);
+        // A camera cut or scene change matches few draws: show the real frame twice instead.
+        if (draws && matched * 2 >= draws) {
+            replaying = true;
+            pica::ShaderState vs;
+            for (const Op& op : frame_ops) {
+                switch (op.kind) {
+                case Op::Draw: {
+                    vs = *op.vs;
+                    if (auto it = prev.find(op.key); it != prev.end())
+                        for (u32 i = 0; i < 96; ++i) {
+                            const pica::Vec4& a = it->second->vs->float_uniforms[i];
+                            pica::Vec4& b = vs.float_uniforms[i];
+                            b = {(a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f, (a.z + b.z) * 0.5f, (a.w + b.w) * 0.5f};
+                        }
+                    draw(mem, op.regs, vs, op.indexed);
+                    break;
+                }
+                case Op::Fill:
+                    if (op.gpu) fill(mem, op.a[0], op.a[1]);
+                    break;
+                case Op::Transfer:
+                    if (op.gpu) display_transfer(mem, op.a[0], op.a[1], op.a[2], op.a[3], op.a[4]);
+                    break;
+                }
+            }
+            replaying = false;
+            ++interp_frames;
+            for (auto& [va, d] : displays)
+                if (d.interp_fresh) d.ready = std::chrono::steady_clock::now();
+        } else {
+            ++interp_skipped;
+        }
+        prev_ops.swap(frame_ops);
+        frame_ops.clear();
+        key_counts.clear();
+    }
+
+    // Fragment shader text depends only on these registers (shader_gen.cpp: texture unit
+    // config, TEV stages without their constant colours, fog mode, alpha test, lighting
+    // structure); per-draw values travel as push constants or in the lighting buffer.
+    // DOT_VERIFY_FS=1 regenerates every time and reports a mismatch with the memoised one.
+    std::map<u64, VkShaderModule> fs_memo;
+    VkShaderModule fragment_shader(const std::array<u32, pica::reg::COUNT>& regs) {
+        u32 key_regs[64];
+        u32 n = 0;
+        for (u32 r : {0x080u, 0x08Fu, 0x090u, 0x0E0u, 0x104u, 0x1C2u, 0x1C3u, 0x1C4u, 0x1C6u, 0x1D0u, 0x1D1u, 0x1D2u, 0x1D9u})
+            key_regs[n++] = regs[r];
+        for (u32 base : {0xC0u, 0xC8u, 0xD0u, 0xD8u, 0xF0u, 0xF8u})
+            for (u32 k = 0; k < 5; ++k)
+                if (k != 3) key_regs[n++] = regs[base + k];
+        for (u32 l = 0; l < 8; ++l) key_regs[n++] = regs[0x149 + 16 * l];
+        const u64 key = fnv(key_regs, n * 4);
+        static const bool verify = std::getenv("DOT_VERIFY_FS") != nullptr;
+        auto it = fs_memo.find(key);
+        if (it != fs_memo.end() && !verify) return it->second;
+        const VkShaderModule m = module(pica::generate_fragment_shader(regs), ShaderStage::Fragment);
+        if (verify && it != fs_memo.end() && it->second != m) std::fprintf(stderr, "renderer: fragment shader memo MISMATCH\n");
+        return fs_memo[key] = m;
+    }
+
     // Clip-space y factor for a draw (u.depth.z). On a widened top-screen surface every draw
     // covering the whole screen (viewport rows 0..height) is squeezed back by 1/W, so 3D
     // perspective gains field of view and 2D elements keep their shape, centred; orthographic
@@ -1277,7 +1422,7 @@ struct Renderer::Impl {
         }
         if (!pass_vs) pass_vs = module(PASS_VS, ShaderStage::Vertex);
         const VkShaderModule vmod = gpu_vs ? gpu_vs : pass_vs;
-        const VkShaderModule fmod = module(pica::generate_fragment_shader(regs), ShaderStage::Fragment);
+        const VkShaderModule fmod = fragment_shader(regs);
         if (!vmod || !fmod) return skip("shader compile");
         const VkPipeline pipe = pipeline(vmod, fmod, regs);
         if (!pipe) return skip("pipeline creation");
@@ -1413,6 +1558,7 @@ template <class F> static void timed(const char* what, F&& f) {
 void Renderer::draw(core::Memory& mem, const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs,
                     bool indexed) {
     std::lock_guard lk(impl_->lock);
+    impl_->record_draw(regs, vs, indexed);
     timed("draw (total)", [&] { impl_->draw(mem, regs, vs, indexed); });
 }
 
@@ -1426,29 +1572,44 @@ void Renderer::memory_fill(core::Memory& mem, u32 start, u32 end, u32 value, u32
     // 16-bit fills clear D16; 24/32-bit fills D24, the 32-bit ones with the stencil in the top byte.
     impl_->depth_clears[start] = width_mode == 0 ? Impl::DepthClear{(value & 0xFFFF) / 65535.0f, 0}
                                                  : Impl::DepthClear{(value & 0xFFFFFF) / 16777215.0f, width_mode == 2 ? value >> 24 : 0};
+    impl_->record_op(Impl::Op::Fill, {start, end}, true);
     impl_->fill(mem, start, end);
 }
 
 bool Renderer::display_transfer(core::Memory& mem, u32 in, u32 out, u32 in_dim, u32 out_dim, u32 flags) {
     std::lock_guard lk(impl_->lock);
-    return impl_->display_transfer(mem, in, out, in_dim, out_dim, flags);
+    const bool gpu = impl_->display_transfer(mem, in, out, in_dim, out_dim, flags);
+    impl_->record_op(Impl::Op::Transfer, {in, out, in_dim, out_dim, flags}, gpu);
+    // A transfer to the top screen's framebuffer (400 rows, linear) ends a game frame.
+    const u32 scaling = flags >> 24 & 3, rows = (out_dim >> 16) >> (scaling == 2 ? 1 : 0);
+    if (gpu && !(flags >> 5 & 1) && rows == 400) impl_->end_frame(mem);
+    return gpu;
 }
 
-bool Renderer::display(core::Memory& mem, u32 va, GpuScreen& out) {
+bool Renderer::display(core::Memory& mem, u32 va, GpuScreen& out, bool consume) {
     std::lock_guard lk(impl_->lock);
     auto it = impl_->displays.find(va);
     if (it == impl_->displays.end() || !it->second.image.img) return false;
-    const Impl::Display& d = it->second;
+    Impl::Display& d = it->second;
     if (hash_ram(mem.host(va), d.bytes) != d.ram_hash) return false;  // the CPU wrote the framebuffer since
+    // The in-between frame stays up for one 60 Hz period after both were ready, then the real
+    // one: even pacing at any monitor refresh (shortcut: assumes DOT_SPEED=1).
+    if (consume && d.interp_fresh) {
+        if (std::chrono::steady_clock::now() - d.ready < std::chrono::microseconds(16'715)) {
+            out = {d.interp.img, d.width, d.height};
+            return true;
+        }
+        d.interp_fresh = false;
+    }
     out = {d.image.img, d.width, d.height};
     return true;
 }
 
-bool Renderer::read_display(u32 va, std::vector<u32>& rgba, u32& width, u32& height) {
+bool Renderer::read_display(u32 va, std::vector<u32>& rgba, u32& width, u32& height, bool interp) {
     std::lock_guard lk(impl_->lock);
     Impl& m = *impl_;
     auto it = m.displays.find(va);
-    if (it == m.displays.end() || !it->second.image.img) return false;
+    if (it == m.displays.end() || !(interp ? it->second.interp : it->second.image).img) return false;
     const Impl::Display& d = it->second;
     const VkDeviceSize bytes = VkDeviceSize(d.width) * d.height * 4;
     m.submit_and_wait();
@@ -1458,7 +1619,7 @@ bool Renderer::read_display(u32 va, std::vector<u32>& rgba, u32& width, u32& hei
     VkBufferImageCopy copy{};
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageExtent = {d.width, d.height, 1};
-    vkCmdCopyImageToBuffer(m.cmd, d.image.img, VK_IMAGE_LAYOUT_GENERAL, m.xfer.buf, 1, &copy);
+    vkCmdCopyImageToBuffer(m.cmd, (interp ? d.interp : d.image).img, VK_IMAGE_LAYOUT_GENERAL, m.xfer.buf, 1, &copy);
     m.submit_and_wait();
     width = d.width, height = d.height;
     rgba.resize(size_t(width) * height);
@@ -1468,6 +1629,10 @@ bool Renderer::read_display(u32 va, std::vector<u32>& rgba, u32& width, u32& hei
 
 u32 Renderer::scale() const { return impl_->scale; }
 
-Renderer::Stats Renderer::stats() const { return impl_->stats; }
+Renderer::Stats Renderer::stats() const {
+    Stats s = impl_->stats;
+    s.interpolated = impl_->interp_frames, s.not_interpolated = impl_->interp_skipped;
+    return s;
+}
 
 }  // namespace gfx::vulkan

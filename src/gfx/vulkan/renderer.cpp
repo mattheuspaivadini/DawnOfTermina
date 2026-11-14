@@ -1134,15 +1134,42 @@ struct Renderer::Impl {
     // A texture taller than the surface at its address (power-of-two padding) samples a
     // texture-sized copy with the surface in its first memory rows (the image's last rows).
     std::map<u32, Surface> padded;
+    std::map<u32, Surface> cropped;  // centre 5:3 part of a widened surface, per address
 
-    Surface* resolve_texture(Memory& mem, const std::array<u32, pica::reg::COUNT>& regs, u32 unit) {
+    Surface* resolve_texture(Memory& mem, const std::array<u32, pica::reg::COUNT>& regs, u32 unit, bool crop) {
         const TexSource t = tex_source(regs, unit);
         if (!t.va || !t.size) return nullptr;
         auto it = surfaces.find(t.va);
         if (it != surfaces.end() && it->second.width == t.w && it->second.height <= t.h &&
             it->second.format == u32(t.fmt)) {
             Surface& sf = surface(mem, t.va, it->second.width, it->second.height, it->second.format);
-            if (sf.height == t.h) return &sf;
+            if (sf.height == t.h && !(crop && sf.image_h != sf.height * scale)) return &sf;
+            if (sf.height == t.h) {
+                // The game's UVs assume the original 5:3 view, but a widened surface holds extra
+                // field of view on both sides: sampling it whole shifts and squeezes refraction /
+                // heat-haze effects (rings, stripes). Sample a copy of the centre instead.
+                Surface& c = cropped[t.va];
+                const u32 ch = sf.height * scale;
+                if (c.color.img && (c.width != sf.width || c.image_h != ch)) submit_and_wait(), destroy(c.color);
+                if (!c.color.img) {
+                    c.va = t.va, c.width = sf.width, c.height = sf.height, c.format = sf.format, c.image_h = ch;
+                    c.color = make_general(sf.width * scale, ch, VK_FORMAT_R8G8B8A8_UNORM,
+                                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                           VK_IMAGE_ASPECT_COLOR_BIT);
+                }
+                const s32 top = s32((sf.image_h - ch) / 2);
+                VkImageBlit b{};
+                b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                b.srcOffsets[0] = {0, top, 0};
+                b.srcOffsets[1] = {s32(sf.width * scale), top + s32(ch), 1};
+                b.dstOffsets[1] = {s32(sf.width * scale), s32(ch), 1};
+                begin();
+                memory_barrier();
+                vkCmdBlitImage(cmd, sf.color.img, VK_IMAGE_LAYOUT_GENERAL, c.color.img, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
+                               VK_FILTER_LINEAR);
+                memory_barrier();
+                return &c;
+            }
             Surface& p = padded[t.va];
             if (p.color.img && (p.width != t.w || p.height != t.h)) submit_and_wait(), destroy(p.color);
             if (!p.color.img) {
@@ -1467,13 +1494,13 @@ struct Renderer::Impl {
             ++stats.skipped;
         };
         if (!bind_target(mem, regs)) return skip("unsupported or missing colour buffer");
-        Surface* tex_surface[3] = {};
-        for (u32 i = 0; i < 3; ++i)
-            if (regs[TEX_CONFIG] >> i & 1) tex_surface[i] = resolve_texture(mem, regs, i);
-        if (!cur) return skip("render target lost");  // a resolved texture replaced it
-
         std::vector<pica::VertexInput> verts;
         if (!pica::load_vertices(mem, regs, vs, indexed, verts) || verts.empty()) return skip("vertex fetch");
+        const float wclip = widescreen_clip(regs, vs, verts);
+        Surface* tex_surface[3] = {};
+        for (u32 i = 0; i < 3; ++i)
+            if (regs[TEX_CONFIG] >> i & 1) tex_surface[i] = resolve_texture(mem, regs, i, wclip != 1.0f);
+        if (!cur) return skip("render target lost");  // a resolved texture replaced it
 
         // Vertex shader on the GPU when possible, else run on the CPU with the outputs packed
         // through VS_OUTMAP for the pass-through shader.
@@ -1533,7 +1560,7 @@ struct Renderer::Impl {
             std::memcpy(u + 1536 + i * 16, v, 16);
         }
         const float depth[4] = {f24_to_f32(regs[DEPTH_SCALE] & 0xFFFFFF), f24_to_f32(regs[DEPTH_OFFSET] & 0xFFFFFF),
-                                widescreen_clip(regs, vs, verts), 0};
+                                wclip, 0};
         std::memcpy(u + 1600, depth, 16);
         const u32 bools = vs.bool_uniforms;
         std::memcpy(u + 1616, &bools, 4);
@@ -1720,11 +1747,12 @@ void Renderer::set_scale(core::Memory& mem, u32 scale) {
     }
     for (auto& [va, sf] : m.surfaces) m.destroy(sf.color);
     for (auto& [va, sf] : m.padded) m.destroy(sf.color);
+    for (auto& [va, sf] : m.cropped) m.destroy(sf.color);
     for (auto& [key, d] : m.depths) m.destroy(d.image);
     for (auto& [va, d] : m.displays) m.destroy(d.image), m.destroy(d.interp);
     for (auto& [key, fb] : m.framebuffers) vkDestroyFramebuffer(m.dev, fb, nullptr);
     for (auto& [key, s] : m.samplers) vkDestroySampler(m.dev, s, nullptr);  // anisotropy follows the scale
-    m.surfaces.clear(), m.padded.clear(), m.depths.clear(), m.displays.clear(), m.framebuffers.clear(),
+    m.surfaces.clear(), m.padded.clear(), m.cropped.clear(), m.depths.clear(), m.displays.clear(), m.framebuffers.clear(),
         m.samplers.clear();
     m.cur = nullptr;
     m.frame_ops.clear(), m.prev_ops.clear(), m.key_counts.clear();  // no in-between frame across the change

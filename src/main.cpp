@@ -196,27 +196,32 @@ int main(int argc, char** argv) {
                     last_vblanks = st.vblanks;
                     const auto rs = renderer.stats();
                     std::printf("gsp: vblanks %llu, frames %llu, command lists %llu, draws %llu, fills %llu, transfers %llu | "
-                                "rendered %llu, skipped %llu, pipelines %llu, shaders %llu, flushes %llu\n",
+                                "rendered %llu, skipped %llu, pipelines %llu, shaders %llu, readbacks %llu\n",
                                 (unsigned long long)st.vblanks, (unsigned long long)st.frames, (unsigned long long)st.command_lists,
                                 (unsigned long long)st.draws, (unsigned long long)st.memory_fills,
                                 (unsigned long long)st.display_transfers, (unsigned long long)rs.draws,
                                 (unsigned long long)rs.skipped, (unsigned long long)rs.pipelines,
                                 (unsigned long long)rs.shaders,
-                                (unsigned long long)rs.flushes);
+                                (unsigned long long)rs.readbacks);
                 }
             }
-            const bool have_top = hle::service::gsp::screen_image(0, game_top);
-            const bool have_bottom = hle::service::gsp::screen_image(1, game_bottom);
-            if (const char* dir = std::getenv("DOT_DUMP_FRAMES"); dir && have_top) {
+            // Screens the renderer produced on the GPU are presented from there; otherwise from memory.
+            gfx::vulkan::GpuScreen gpu_screens[2];
+            const bool gpu_top = hle::service::gsp::gpu_screen(0, gpu_screens[0]);
+            const bool gpu_bottom = hle::service::gsp::gpu_screen(1, gpu_screens[1]);
+            const bool have_top = !gpu_top && hle::service::gsp::screen_image(0, game_top);
+            const bool have_bottom = !gpu_bottom && hle::service::gsp::screen_image(1, game_bottom);
+            if (const char* dir = std::getenv("DOT_DUMP_FRAMES"); dir && (have_top || gpu_top)) {
                 static u32 n = 0;
                 static const u32 every = std::max(1, std::atoi(std::getenv("DOT_DUMP_EVERY") ? std::getenv("DOT_DUMP_EVERY") : "120"));
                 if (++n % every == 0) {
                     const std::string id = std::to_string(n / every);
-                    write_ppm(std::filesystem::path(dir) / ("top_" + id + ".ppm"), game_top, gfx::vulkan::TOP_W,
-                              gfx::vulkan::SCREEN_H);
-                    if (have_bottom)
-                        write_ppm(std::filesystem::path(dir) / ("bottom_" + id + ".ppm"), game_bottom,
-                                  gfx::vulkan::BOTTOM_W, gfx::vulkan::SCREEN_H);
+                    std::vector<u32> px;
+                    u32 w = 0, h = 0;
+                    if (hle::service::gsp::screen_dump(0, px, w, h))
+                        write_ppm(std::filesystem::path(dir) / ("top_" + id + ".ppm"), px, w, h);
+                    if (hle::service::gsp::screen_dump(1, px, w, h))
+                        write_ppm(std::filesystem::path(dir) / ("bottom_" + id + ".ppm"), px, w, h);
                     // Guest time of each dump, in the units of DOT_INPUT, to line scripts up with frames.
                     if (std::FILE* f = std::fopen((std::filesystem::path(dir) / "frames.txt").c_str(), "a")) {
                         std::fprintf(f, "%s %.1f\n", id.c_str(), hle::service::gsp::stats().vblanks / 59.83);
@@ -226,12 +231,16 @@ int main(int argc, char** argv) {
             }
             const u32* top_px = have_top ? game_top.data() : top.data();
             const u32* bottom_px = have_bottom ? game_bottom.data() : bottom.data();
+            const gfx::vulkan::GpuScreen* gpu_top_ptr = gpu_top ? &gpu_screens[0] : nullptr;
+            const gfx::vulkan::GpuScreen* gpu_bottom_ptr = gpu_bottom ? &gpu_screens[1] : nullptr;
 #else
             const u32* top_px = top.data();
             const u32* bottom_px = bottom.data();
+            const gfx::vulkan::GpuScreen* gpu_top_ptr = nullptr;
+            const gfx::vulkan::GpuScreen* gpu_bottom_ptr = nullptr;
 #endif
             if (!gpu.present({gfx::vulkan::TOP_W, gfx::vulkan::SCREEN_H, top_px},
-                             {gfx::vulkan::BOTTOM_W, gfx::vulkan::SCREEN_H, bottom_px}))
+                             {gfx::vulkan::BOTTOM_W, gfx::vulkan::SCREEN_H, bottom_px}, gpu_top_ptr, gpu_bottom_ptr))
                 break;  // FIFO present paces the loop to vsync
         }
 #ifdef DOT_HAVE_RECOMP

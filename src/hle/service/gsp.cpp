@@ -24,10 +24,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 
 #include "gfx/pica/command_processor.h"
 #include "gfx/pica/pixel.h"
+#include "gfx/vulkan/context.h"
 #include "gfx/vulkan/renderer.h"
 #include "hle/ipc.h"
 #include "hle/service/services.h"
@@ -175,13 +177,42 @@ void display_transfer(u32 in, u32 out, u32 in_dim, u32 out_dim, u32 flags) {
         }
 }
 
+// DisplayTransfers the renderer ran on the GPU: their output exists only as a screen image
+// until something on the CPU side needs those bytes, then the transfer is replayed here.
+struct Transfer {
+    u32 in, out, in_dim, out_dim, flags;
+    u32 in_end() const { return in + (in_dim & 0xFFFF) * (in_dim >> 16) * bytes_per_pixel(flags >> 8 & 7); }
+    u32 out_end() const {
+        const u32 scaling = flags >> 24 & 3, hs = scaling ? 1 : 0, vs = scaling == 2 ? 1 : 0;
+        return out + ((out_dim & 0xFFFF) >> hs) * ((out_dim >> 16) >> vs) * bytes_per_pixel(flags >> 12 & 7);
+    }
+};
+std::map<u32, Transfer> g_gpu_transfers;  // by output VA
+
+// Guest memory in [start, end) is about to be read or written by the CPU side.
+void settle(u32 start, u32 end, bool overwrite = false) {
+    auto* r = g_renderer.load();
+    if (!r) return;
+    for (auto it = g_gpu_transfers.begin(); it != g_gpu_transfers.end();) {
+        const Transfer t = it->second;
+        if (t.out >= end || t.out_end() <= start) {
+            ++it;
+            continue;
+        }
+        it = g_gpu_transfers.erase(it);
+        r->sync(*g_mem, t.in, t.in_end());
+        display_transfer(t.in, t.out, t.in_dim, t.out_dim, t.flags);
+    }
+    r->sync(*g_mem, start, end, overwrite);
+}
+
 void run_command(u32 cmd) {
     auto w = [&](u32 i) { return g_mem->read<u32>(cmd + i * 4); };
-    // Anything but a command list may read or overwrite VRAM: settle the render target first.
-    if ((w(0) & 0xFF) != 0x01)
-        if (auto* r = g_renderer.load()) r->flush(*g_mem);
+    auto* r = g_renderer.load();
     switch (w(0) & 0xFF) {
     case 0x00:  // RequestDma(src, dst, size)
+        settle(w(1), w(1) + w(3));
+        settle(w(2), w(2) + w(3), true);
         std::memmove(g_mem->host(w(2)), g_mem->host(w(1)), w(3));
         signal_interrupt(DMA);
         return;
@@ -197,11 +228,12 @@ void run_command(u32 cmd) {
         if (std::getenv("DOT_TRACE_FB"))
             std::fprintf(stderr, "gsp: memory fill %08X-%08X = %08X, %08X-%08X = %08X\n", w(1), w(3), w(2), w(4),
                          w(6), w(5));
-        memory_fill(w(1), w(2), w(3), u16(w(7)));
-        memory_fill(w(4), w(5), w(6), u16(w(7) >> 16));
-        if (auto* r = g_renderer.load()) {
-            if (w(1)) r->memory_fill(w(1), w(3), w(2), w(7) >> 8 & 3);
-            if (w(4)) r->memory_fill(w(4), w(6), w(5), w(7) >> 24 & 3);
+        for (u32 k = 0; k < 2; ++k) {
+            const u32 start = w(1 + k * 3), value = w(2 + k * 3), end = w(3 + k * 3);
+            if (!start) continue;
+            settle(start, end, true);
+            memory_fill(start, value, end, u16(w(7) >> (k * 16)));
+            if (r) r->memory_fill(*g_mem, start, end, value, w(7) >> (8 + k * 16) & 3);
         }
         ++g_fills;
         if (w(1)) signal_interrupt(PSC0);
@@ -212,8 +244,20 @@ void run_command(u32 cmd) {
         if (std::getenv("DOT_TRACE_FB"))
             std::fprintf(stderr, "gsp: display transfer %08X -> %08X in %08X out %08X flags %08X\n", w(1), w(2), w(3),
                          w(4), w(5));
-        if (w(5) >> 3 & 1) texture_copy(w(1), w(2), (w(3) & 0xFFFF) * (w(3) >> 16) * 4, 0, 0);
-        else display_transfer(w(1), w(2), w(3), w(4), w(5));
+        if (r && r->display_transfer(*g_mem, w(1), w(2), w(3), w(4), w(5))) {
+            // Tiled outputs became cached surfaces (synced like any other); linear ones are screens.
+            if (!(w(5) >> 5 & 1)) g_gpu_transfers[w(2)] = {w(1), w(2), w(3), w(4), w(5)};
+        } else if (w(5) >> 3 & 1) {
+            const u32 size = (w(3) & 0xFFFF) * (w(3) >> 16) * 4;
+            settle(w(1), w(1) + size);
+            settle(w(2), w(2) + size, true);
+            texture_copy(w(1), w(2), size, 0, 0);
+        } else {
+            const Transfer t{w(1), w(2), w(3), w(4), w(5)};
+            settle(t.in, t.in_end());
+            settle(t.out, t.out_end(), true);
+            display_transfer(t.in, t.out, t.in_dim, t.out_dim, t.flags);
+        }
         if (std::getenv("DOT_TRACE_FB")) {
             const u32 n = (w(4) & 0xFFFF) * (w(4) >> 16) * bytes_per_pixel(w(5) >> 12 & 7);
             u32 in_nz = 0, out_nz = 0;
@@ -225,10 +269,16 @@ void run_command(u32 cmd) {
         ++g_transfers;
         signal_interrupt(PPF);
         return;
-    case 0x04:  // TextureCopy(in, out, size, in width|gap, out width|gap, flags)
+    case 0x04: {  // TextureCopy(in, out, size, in width|gap, out width|gap, flags)
+        // shortcut: settles generous ranges (size plus gaps) rather than exact strided spans.
+        const u32 in_gap = (w(4) >> 16) * 16, out_gap = (w(5) >> 16) * 16, in_w = (w(4) & 0xFFFF) * 16, out_w = (w(5) & 0xFFFF) * 16;
+        const u32 in_span = in_w ? w(3) + w(3) / in_w * in_gap : w(3), out_span = out_w ? w(3) + w(3) / out_w * out_gap : w(3);
+        settle(w(1), w(1) + in_span);
+        settle(w(2), w(2) + out_span);
         texture_copy(w(1), w(2), w(3), w(4), w(5));
         signal_interrupt(PPF);
         return;
+    }
     case 0x05:  // FlushCacheRegions
         return;
     default: {
@@ -277,6 +327,8 @@ void gsp_command(core::Memory& mem, u32 base) {
     }
     case 0x18: {  // ImportDisplayCaptureInfo -> {left, right, format, stride} per screen
         std::lock_guard lk(g_fb_lock);
+        for (const Framebuffer& f : g_fb)  // the caller is about to read them
+            if (f.va) settle(f.va, f.va + f.stride * (&f == &g_fb[0] ? 400 : 320));
         c.reply(9, 0);
         for (u32 i = 0; i < 2; ++i) {
             const Framebuffer& f = g_fb[i];
@@ -344,6 +396,29 @@ bool screen_image(int screen, std::vector<u32>& rgba) {
         }
     }
     return true;
+}
+
+bool gpu_screen(int screen, gfx::vulkan::GpuScreen& out) {
+    auto* r = g_renderer.load();
+    u32 va;
+    {
+        std::lock_guard lk(g_fb_lock);
+        va = g_fb[screen].va;
+    }
+    return r && va && r->display(*g_mem, va, out);
+}
+
+bool screen_dump(int screen, std::vector<u32>& rgba, u32& width, u32& height) {
+    auto* r = g_renderer.load();
+    u32 va;
+    {
+        std::lock_guard lk(g_fb_lock);
+        va = g_fb[screen].va;
+    }
+    gfx::vulkan::GpuScreen g;
+    if (r && va && r->display(*g_mem, va, g)) return r->read_display(va, rgba, width, height);
+    width = screen == 0 ? 400 : 320, height = 240;
+    return screen_image(screen, rgba);
 }
 
 Stats stats() { return {g_vblanks, g_lists, g_draws, g_fills, g_transfers, g_frames}; }

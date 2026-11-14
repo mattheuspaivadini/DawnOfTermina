@@ -136,6 +136,11 @@ bool Context::init(SDL_Window* window) {
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = 1;
     dci.ppEnabledExtensionNames = &dev_ext;
+    VkPhysicalDeviceFeatures supported{}, features{};
+    vkGetPhysicalDeviceFeatures(gpu_, &supported);
+    features.samplerAnisotropy = supported.samplerAnisotropy;  // used when rendering above 1x
+    anisotropy_ = supported.samplerAnisotropy ? props.limits.maxSamplerAnisotropy : 0.0f;
+    dci.pEnabledFeatures = &features;
     if (!check(vkCreateDevice(gpu_, &dci, nullptr, &device_), "vkCreateDevice")) return false;
     vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
 
@@ -275,7 +280,9 @@ void Context::destroy_swapchain() {
     swapchain_ = VK_NULL_HANDLE;
 }
 
-bool Context::present(const ScreenImage& top, const ScreenImage& bottom) {
+bool Context::present(const ScreenImage& top, const ScreenImage& bottom, const GpuScreen* gpu_top,
+                      const GpuScreen* gpu_bottom) {
+    const GpuScreen* gpu_screens[2] = {gpu_top, gpu_bottom};
     if (top.width != TOP_W || bottom.width != BOTTOM_W || top.height != SCREEN_H ||
         bottom.height != SCREEN_H) {
         std::fprintf(stderr, "vulkan: unexpected screen size\n");
@@ -302,8 +309,8 @@ bool Context::present(const ScreenImage& top, const ScreenImage& bottom) {
     if (r != VK_SUBOPTIMAL_KHR && !check(r, "vkAcquireNextImageKHR")) return false;
     vkResetFences(device_, 1, &frame_fence_);
 
-    std::memcpy(staging_ptr_, top.pixels, TOP_BYTES);
-    std::memcpy(staging_ptr_ + TOP_BYTES, bottom.pixels, BOTTOM_BYTES);
+    if (!gpu_top) std::memcpy(staging_ptr_, top.pixels, TOP_BYTES);
+    if (!gpu_bottom) std::memcpy(staging_ptr_ + TOP_BYTES, bottom.pixels, BOTTOM_BYTES);
 
     VkCommandBuffer cmd = cmd_;
     vkResetCommandBuffer(cmd, 0);
@@ -314,6 +321,13 @@ bool Context::present(const ScreenImage& top, const ScreenImage& bottom) {
     const u32 widths[2] = {TOP_W, BOTTOM_W};
     const VkDeviceSize offsets[2] = {0, TOP_BYTES};
     for (int i = 0; i < 2; ++i) {
+        if (gpu_screens[i]) {  // rendered by the PICA renderer, kept in GENERAL layout
+            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0,
+                                 nullptr, 0, nullptr);
+            continue;
+        }
         image_barrier(cmd, screens_[i], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                       VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         VkBufferImageCopy copy{};
@@ -343,13 +357,14 @@ bool Context::present(const ScreenImage& top, const ScreenImage& bottom) {
         {ox + s32(40 * s), oy + s32(240 * s), ox + s32(360 * s), oy + s32(480 * s)},
     };
     for (int i = 0; i < 2; ++i) {
+        const GpuScreen* g = gpu_screens[i];
         VkImageBlit blit{};
         blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        blit.srcOffsets[1] = {s32(widths[i]), s32(SCREEN_H), 1};
+        blit.srcOffsets[1] = g ? VkOffset3D{s32(g->width), s32(g->height), 1} : VkOffset3D{s32(widths[i]), s32(SCREEN_H), 1};
         blit.dstOffsets[0] = {dst[i][0], dst[i][1], 0};
         blit.dstOffsets[1] = {dst[i][2], dst[i][3], 1};
-        vkCmdBlitImage(cmd, screens_[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+        vkCmdBlitImage(cmd, g ? g->image : screens_[i], g ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, g ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
     VkImageMemoryBarrier to_present{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     to_present.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;

@@ -24,7 +24,7 @@
 
 namespace gfx::vulkan {
 
-enum class ShaderStage { Vertex, Fragment };
+enum class ShaderStage { Vertex, Fragment, Compute };
 
 // GLSL 450 -> SPIR-V 1.3 for Vulkan 1.1. Returns empty on failure with `log` set.
 std::vector<u32> compile_glsl(std::string_view source, ShaderStage stage, std::string* log);

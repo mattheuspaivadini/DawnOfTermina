@@ -16,6 +16,7 @@
 
 #include "gfx/vulkan/renderer.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -109,6 +110,41 @@ u64 fnv(const void* data, size_t n, u64 h = 1469598103934665603ull) {
     return h;
 }
 
+// Fast 64-bit hash of guest memory (surfaces are hashed on every bind to catch CPU writes).
+u64 hash_ram(const u8* p, size_t n) {
+    u64 h = n;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        u64 w;
+        std::memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 29;
+    }
+    for (; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
+    return h;
+}
+
+// DisplayTransfer on the GPU: colour surface -> screen-oriented image (framebuffer rows are
+// screen columns, bottom to top). a = {flip, x downscale shift, y downscale shift, source height}.
+constexpr const char* TRANSFER_CS = R"(#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
+layout(push_constant) uniform P { ivec4 a; } p;
+void main() {
+    const ivec2 o = ivec2(gl_GlobalInvocationID.xy), size = imageSize(dst);
+    if (o.x >= size.x || o.y >= size.y) return;
+    const int row = p.a.x != 0 ? size.x - 1 - o.x : o.x;  // output framebuffer row = screen column
+    const int col = (size.y - 1 - o.y) << p.a.y;
+    const int mem_row = row << p.a.z;                      // colour buffers are bottom-up
+    const int nx = 1 << p.a.y, ny = 1 << p.a.z;
+    vec4 c = vec4(0.0);
+    for (int dy = 0; dy < ny; ++dy)
+        for (int dx = 0; dx < nx; ++dx) c += texelFetch(src, ivec2(col + dx, p.a.w - 1 - (mem_row + dy)), 0);
+    imageStore(dst, o, vec4(c.rgb / float(nx * ny), 1.0));
+}
+)";
+
 bool check(VkResult r, const char* what) {
     if (r == VK_SUCCESS) return true;
     std::fprintf(stderr, "renderer: %s failed (VkResult %d)\n", what, int(r));
@@ -165,17 +201,30 @@ struct Renderer::Impl {
         VkDeviceMemory mem = VK_NULL_HANDLE;
         VkImageView view = VK_NULL_HANDLE;
     };
-    struct Target {
-        u32 color_va = 0, depth_va = 0, width = 0, height = 0, format = 0;
-        Image color, depth;
-        VkFramebuffer fb = VK_NULL_HANDLE;
-        bool fresh = true;  // needs the guest pixels uploaded + depth initialised
+    // A guest colour buffer on the GPU, `scale` times its guest size. All cached images stay
+    // in GENERAL layout so they can be attachments, sampled, blitted and cleared without
+    // tracking layouts; barriers only order memory.
+    struct Surface {
+        u32 va = 0, width = 0, height = 0, format = 0;  // guest size and PICA colour format
+        Image color;
+        bool gpu_newer = false;  // drawn to since guest memory was last in sync
+        u64 ram_hash = 0;        // guest memory when it was last in sync
+    };
+    struct Depth {
+        u32 width = 0, height = 0;
+        Image image;
+    };
+    struct Display {  // DisplayTransfer output, screen-oriented, scaled
+        Image image;
+        u32 width = 0, height = 0, bytes = 0;
+        u64 ram_hash = 0;  // guest memory at the output when the transfer ran
     };
     struct Texture {
         Image image;
         u32 width = 0, height = 0;
         u64 hash = 0;
         bool ready = false;
+        VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     };
 
     VkCommandPool pool = VK_NULL_HANDLE;
@@ -192,7 +241,19 @@ struct Renderer::Impl {
     u32 batch_draws = 0;
     VkDeviceSize vb_used = 0, ub_used = 0, lb_used = 0, x_used = 0, lb_last = 0;
     std::vector<u32> last_light;  // lighting data at lb_last, to skip re-uploading it
-    Target target;
+    u32 scale = 1;
+    float anisotropy = 0;
+    bool always_readback = std::getenv("DOT_READBACK") != nullptr;
+    std::map<u32, Surface> surfaces;              // by colour buffer VA
+    std::map<u32, Depth> depths;                  // by depth buffer VA
+    std::map<u64, VkFramebuffer> framebuffers;    // by colour VA << 32 | depth VA
+    std::map<u32, Display> displays;              // by output VA
+    std::map<u32, Image> scratch;                 // guest-size staging images, by width << 16 | height
+    Surface* cur = nullptr;                       // current render target
+    u32 cur_depth = 0;
+    VkDescriptorSetLayout xfer_set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout xfer_layout = VK_NULL_HANDLE;
+    VkPipeline xfer_pipe = VK_NULL_HANDLE;
     Texture dummy;
     std::map<u64, Texture> textures;  // by (va, size, format)
     std::map<u32, VkSampler> samplers;
@@ -435,11 +496,10 @@ struct Renderer::Impl {
             att[i].samples = VK_SAMPLE_COUNT_1_BIT;
             att[i].loadOp = att[i].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             att[i].storeOp = att[i].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
-            att[i].initialLayout = att[i].finalLayout =
-                i ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            att[i].initialLayout = att[i].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
         }
-        VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-        VkAttachmentReference dref{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+        VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_GENERAL};
+        VkAttachmentReference dref{1, VK_IMAGE_LAYOUT_GENERAL};
         VkSubpassDescription sub{};
         sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
         sub.colorAttachmentCount = 1;
@@ -469,12 +529,13 @@ struct Renderer::Impl {
         const VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, pica::FRAGMENT_PUSH_WORDS * 4};
         pli.pushConstantRangeCount = 1, pli.pPushConstantRanges = &push;
         vkCreatePipelineLayout(dev, &pli, nullptr, &pipeline_layout);
-        VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_BATCH_DRAWS},
-                                         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * MAX_BATCH_DRAWS},
-                                         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAX_BATCH_DRAWS}};
+        VkDescriptorPoolSize sizes[4] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_BATCH_DRAWS},
+                                         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4 * MAX_BATCH_DRAWS},
+                                         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAX_BATCH_DRAWS},
+                                         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, MAX_BATCH_DRAWS}};
         VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        dpi.maxSets = 2 * MAX_BATCH_DRAWS;
-        dpi.poolSizeCount = 3;
+        dpi.maxSets = 3 * MAX_BATCH_DRAWS;
+        dpi.poolSizeCount = 4;
         dpi.pPoolSizes = sizes;
         vkCreateDescriptorPool(dev, &dpi, nullptr, &desc_pool);
 
@@ -482,6 +543,36 @@ struct Renderer::Impl {
         ensure(ubuf, MAX_BATCH_DRAWS * align(UBO_SIZE), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
         ensure(lbuf, 64 * align(LIGHT_BUF_SIZE), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         ensure(xfer, 16 << 20, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+
+        // DisplayTransfer compute pipeline.
+        const VkDescriptorSetLayoutBinding xb[2] = {
+            {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+        li.bindingCount = 2, li.pBindings = xb;
+        vkCreateDescriptorSetLayout(dev, &li, nullptr, &xfer_set_layout);
+        const VkPushConstantRange xpush{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+        pli.setLayoutCount = 1, pli.pSetLayouts = &xfer_set_layout;
+        pli.pushConstantRangeCount = 1, pli.pPushConstantRanges = &xpush;
+        vkCreatePipelineLayout(dev, &pli, nullptr, &xfer_layout);
+        VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,
+                     module(TRANSFER_CS, ShaderStage::Compute), "main", nullptr};
+        cpi.layout = xfer_layout;
+        if (!cpi.stage.module ||
+            !check(vkCreateComputePipelines(dev, pipeline_cache, 1, &cpi, nullptr, &xfer_pipe), "transfer pipeline"))
+            return false;
+
+        // Resolution scale: DOT_RES_SCALE=<1..8> or "native" (the window's size at startup).
+        if (const char* e = std::getenv("DOT_RES_SCALE")) {
+            if (std::string(e) == "native") {
+                const VkExtent2D ext = ctx.extent();
+                scale = std::max(1u, std::min(ext.width / 400, ext.height / 480));
+            } else {
+                scale = u32(std::clamp(std::atoi(e), 1, 8));
+            }
+        }
+        anisotropy = scale > 1 ? std::min(16.0f, ctx.max_anisotropy()) : 0.0f;
+        std::printf("renderer: resolution scale %ux%s\n", scale, anisotropy > 1 ? ", anisotropic filtering" : "");
 
         // 1x1 white texture for disabled units.
         dummy.image = make_image(1, 1, VK_FORMAT_R8G8B8A8_UNORM,
@@ -545,6 +636,8 @@ struct Renderer::Impl {
         si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         si.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
         si.maxLod = 0;
+        si.anisotropyEnable = anisotropy > 1 && si.minFilter == VK_FILTER_LINEAR;
+        si.maxAnisotropy = si.anisotropyEnable ? anisotropy : 1.0f;
         VkSampler s;
         vkCreateSampler(dev, &si, nullptr, &s);
         samplers[key] = s;
@@ -553,79 +646,206 @@ struct Renderer::Impl {
 
     // Guest colour buffer (tiled, guest format) <-> Vulkan image rows (window y). PICA lays
     // colour buffers out bottom-up: memory row r holds window row H - 1 - r.
-    void read_guest_color(const Memory& mem, u8* out) {
-        const u32 bpp = pica::pixel::bytes_per_pixel(target.format);
-        const u8* src = mem.host(target.color_va);
-        for (u32 y = 0; y < target.height; ++y)
-            for (u32 x = 0; x < target.width; ++x) {
-                const u32 my = target.height - 1 - y;
-                const u32 off = pica::pixel::morton_offset(x, my, bpp) + (my & ~7u) * target.width * bpp;
-                const auto c = pica::pixel::decode(target.format, src + off);
-                u8* d = out + (y * target.width + x) * 4;
+    void read_guest_color(const Memory& mem, const Surface& sf, u8* out) {
+        const u32 bpp = pica::pixel::bytes_per_pixel(sf.format);
+        const u8* src = mem.host(sf.va);
+        for (u32 y = 0; y < sf.height; ++y)
+            for (u32 x = 0; x < sf.width; ++x) {
+                const u32 my = sf.height - 1 - y;
+                const u32 off = pica::pixel::morton_offset(x, my, bpp) + (my & ~7u) * sf.width * bpp;
+                const auto c = pica::pixel::decode(sf.format, src + off);
+                u8* d = out + (y * sf.width + x) * 4;
                 d[0] = u8(c.r), d[1] = u8(c.g), d[2] = u8(c.b), d[3] = u8(c.a);
             }
     }
 
-    void write_guest_color(Memory& mem, const u8* in) {
-        const u32 bpp = pica::pixel::bytes_per_pixel(target.format);
-        u8* dst = mem.host(target.color_va);
-        for (u32 y = 0; y < target.height; ++y)
-            for (u32 x = 0; x < target.width; ++x) {
-                const u32 my = target.height - 1 - y;
-                const u32 off = pica::pixel::morton_offset(x, my, bpp) + (my & ~7u) * target.width * bpp;
-                const u8* s = in + (y * target.width + x) * 4;
-                pica::pixel::encode(target.format, {s[0], s[1], s[2], s[3]}, dst + off);
+    void write_guest_color(Memory& mem, const Surface& sf, const u8* in) {
+        const u32 bpp = pica::pixel::bytes_per_pixel(sf.format);
+        u8* dst = mem.host(sf.va);
+        for (u32 y = 0; y < sf.height; ++y)
+            for (u32 x = 0; x < sf.width; ++x) {
+                const u32 my = sf.height - 1 - y;
+                const u32 off = pica::pixel::morton_offset(x, my, bpp) + (my & ~7u) * sf.width * bpp;
+                const u8* p = in + (y * sf.width + x) * 4;
+                pica::pixel::encode(sf.format, {p[0], p[1], p[2], p[3]}, dst + off);
             }
     }
 
-    void drop_target() {
-        if (!target.color.img) return;
-        vkDestroyFramebuffer(dev, target.fb, nullptr);
-        destroy(target.color);
-        destroy(target.depth);
-        target = {};
+    u32 guest_bytes(const Surface& sf) const { return sf.width * sf.height * pica::pixel::bytes_per_pixel(sf.format); }
+    u64 ram_hash(const Memory& mem, const Surface& sf) const { return hash_ram(mem.host(sf.va), guest_bytes(sf)); }
+
+    void memory_barrier() {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
+                             nullptr, 0, nullptr);
     }
 
-    void flush(Memory& mem) {
-        if (!target.color.img) return;
-        if (!target.fresh) {  // only write back if something was drawn
-            const VkDeviceSize bytes = VkDeviceSize(target.width) * target.height * 4;
-            if (x_used + bytes > xfer.size) submit_and_wait();
-            ensure(xfer, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-            begin();
-            const VkDeviceSize xoff = take(x_used, bytes);
-            barrier(target.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-            VkBufferImageCopy copy{};
-            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            copy.bufferOffset = xoff;
-            copy.imageExtent = {target.width, target.height, 1};
-            vkCmdCopyImageToBuffer(cmd, target.color.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, xfer.buf, 1, &copy);
-            submit_and_wait();
-            const u8* const px = xfer.ptr + xoff;
-            if (std::getenv("DOT_TRACE_DRAWS") || std::getenv("DOT_TRACE_FB")) {
-                size_t nonzero = 0;
-                for (VkDeviceSize i = 0; i < bytes; i += 4) nonzero += (px[i] | px[i + 1] | px[i + 2]) != 0;
-                std::fprintf(stderr, "renderer: flush %ux%u fmt %u at %08X: %zu non-black pixels\n", target.width,
-                             target.height, target.format, target.color_va, nonzero);
+    Image make_general(u32 w, u32 h, VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect) {
+        Image im = make_image(w, h, fmt, usage, aspect);
+        begin();
+        barrier(im.img, aspect, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        return im;
+    }
+
+    // Guest-size staging image between the transfer buffer and a scaled surface.
+    Image& scratch_image(u32 w, u32 h) {
+        Image& im = scratch[w << 16 | h];
+        if (!im.img)
+            im = make_general(w, h, VK_FORMAT_R8G8B8A8_UNORM,
+                              VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+        return im;
+    }
+
+    void blit(VkImage src, u32 sw, u32 sh, VkImage dst, u32 dw, u32 dh, VkFilter filter) {
+        VkImageBlit b{};
+        b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.srcOffsets[1] = {s32(sw), s32(sh), 1};
+        b.dstOffsets[1] = {s32(dw), s32(dh), 1};
+        vkCmdBlitImage(cmd, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &b, filter);
+    }
+
+    // Guest memory -> surface (scaled up). Records into the open batch.
+    void upload(const Memory& mem, Surface& sf) {
+        const VkDeviceSize bytes = VkDeviceSize(sf.width) * sf.height * 4;
+        if (x_used + align(bytes) > xfer.size) submit_and_wait();
+        ensure(xfer, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        Image& tmp = scratch_image(sf.width, sf.height);
+        begin();
+        const VkDeviceSize off = take(x_used, bytes);
+        read_guest_color(mem, sf, xfer.ptr + off);
+        memory_barrier();
+        VkBufferImageCopy copy{};
+        copy.bufferOffset = off;
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {sf.width, sf.height, 1};
+        vkCmdCopyBufferToImage(cmd, xfer.buf, tmp.img, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+        memory_barrier();
+        blit(tmp.img, sf.width, sf.height, sf.color.img, sf.width * scale, sf.height * scale, VK_FILTER_NEAREST);
+        memory_barrier();
+        sf.ram_hash = ram_hash(mem, sf);
+        sf.gpu_newer = false;
+    }
+
+    // Surface -> guest memory (scaled down). Submits and waits.
+    void readback(Memory& mem, Surface& sf) {
+        if (!sf.gpu_newer) return;
+        if (std::getenv("DOT_TRACE_FB"))
+            std::fprintf(stderr, "renderer: readback %ux%u fmt %u at %08X\n", sf.width, sf.height, sf.format, sf.va);
+        const VkDeviceSize bytes = VkDeviceSize(sf.width) * sf.height * 4;
+        if (x_used + align(bytes) > xfer.size) submit_and_wait();
+        ensure(xfer, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        Image& tmp = scratch_image(sf.width, sf.height);
+        begin();
+        const VkDeviceSize off = take(x_used, bytes);
+        memory_barrier();
+        blit(sf.color.img, sf.width * scale, sf.height * scale, tmp.img, sf.width, sf.height, VK_FILTER_LINEAR);
+        memory_barrier();
+        VkBufferImageCopy copy{};
+        copy.bufferOffset = off;
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {sf.width, sf.height, 1};
+        vkCmdCopyImageToBuffer(cmd, tmp.img, VK_IMAGE_LAYOUT_GENERAL, xfer.buf, 1, &copy);
+        submit_and_wait();
+        const u8* const px = xfer.ptr + off;
+        if (const char* dir = std::getenv("DOT_DUMP_TARGETS"); dir && sf.width >= 256) {
+            static u32 n = 0;
+            char name[512];
+            std::snprintf(name, sizeof name, "%s/target_%04u_%08X.ppm", dir, n++, sf.va);
+            if (std::FILE* f = std::fopen(name, "wb")) {
+                std::fprintf(f, "P6\n%u %u\n255\n", sf.width, sf.height);
+                for (u32 y = sf.height; y-- > 0;)  // top row first in the image file
+                    for (u32 x = 0; x < sf.width; ++x) std::fwrite(px + (y * sf.width + x) * 4, 1, 3, f);
+                std::fclose(f);
             }
-            if (const char* dir = std::getenv("DOT_DUMP_TARGETS"); dir && target.width >= 256) {
-                static u32 n = 0;
-                char name[512];
-                std::snprintf(name, sizeof name, "%s/target_%04u_%08X.ppm", dir, n++, target.color_va);
-                if (std::FILE* f = std::fopen(name, "wb")) {
-                    std::fprintf(f, "P6\n%u %u\n255\n", target.width, target.height);
-                    for (u32 y = target.height; y-- > 0;)  // top row first in the image file
-                        for (u32 x = 0; x < target.width; ++x) std::fwrite(px + (y * target.width + x) * 4, 1, 3, f);
-                    std::fclose(f);
-                }
-            }
-            write_guest_color(mem, px);
-            ++stats.flushes;
         }
-        submit_and_wait();  // nothing may still use the target or this batch's buffers
-        drop_target();
-        if (cache_dirty && std::chrono::steady_clock::now() - cache_saved > std::chrono::seconds(10)) save_caches();
+        write_guest_color(mem, sf, px);
+        sf.ram_hash = ram_hash(mem, sf);
+        sf.gpu_newer = false;
+        ++stats.readbacks;
+    }
+
+    void forget_framebuffers(u32 color_va, u32 depth_va) {
+        for (auto it = framebuffers.begin(); it != framebuffers.end();)
+            if (u32(it->first >> 32) == color_va || u32(it->first) == depth_va) {
+                vkDestroyFramebuffer(dev, it->second, nullptr);
+                it = framebuffers.erase(it);
+            } else {
+                ++it;
+            }
+    }
+
+    // The cached surface for a colour buffer: created (from guest memory) on first use,
+    // re-uploaded when guest memory changed behind the GPU's back.
+    Surface& surface(Memory& mem, u32 va, u32 w, u32 h, u32 fmt) {
+        auto it = surfaces.find(va);
+        if (it != surfaces.end() && (it->second.width != w || it->second.height != h || it->second.format != fmt)) {
+            if (std::getenv("DOT_TRACE_FB"))
+                std::fprintf(stderr, "renderer: surface %08X %ux%u fmt %u reused as %ux%u fmt %u\n", va, it->second.width,
+                             it->second.height, it->second.format, w, h, fmt);
+            readback(mem, it->second);  // the memory is being reused with another layout
+            submit_and_wait();
+            forget_framebuffers(va, ~0u);
+            destroy(it->second.color);
+            if (cur == &it->second) cur = nullptr;
+            surfaces.erase(it);
+            it = surfaces.end();
+        }
+        Surface& sf = surfaces[va];
+        if (!sf.color.img) {
+            sf.va = va, sf.width = w, sf.height = h, sf.format = fmt;
+            if (std::getenv("DOT_TRACE_FB")) std::fprintf(stderr, "renderer: new surface %08X %ux%u fmt %u\n", va, w, h, fmt);
+            sf.color = make_general(w * scale, h * scale, VK_FORMAT_R8G8B8A8_UNORM,
+                                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                    VK_IMAGE_ASPECT_COLOR_BIT);
+            upload(mem, sf);
+        } else if (ram_hash(mem, sf) != sf.ram_hash) {
+            upload(mem, sf);  // the CPU wrote it: guest memory is the newest copy
+        }
+        return sf;
+    }
+
+    void clear_depth(Image& im, u32 va) {
+        auto it = depth_clears.find(va);
+        const VkClearDepthStencilValue v = it == depth_clears.end() ? VkClearDepthStencilValue{0.0f, 0}
+                                                                    : VkClearDepthStencilValue{it->second.depth, it->second.stencil};
+        const VkImageSubresourceRange range{DS_ASPECT, 0, 1, 0, 1};
+        begin();
+        memory_barrier();
+        vkCmdClearDepthStencilImage(cmd, im.img, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
+        memory_barrier();
+    }
+
+    Depth& depth_buffer(u32 va, u32 w, u32 h) {
+        Depth& d = depths[va];
+        if (d.image.img && (d.width != w || d.height != h)) {
+            submit_and_wait();
+            forget_framebuffers(~0u, va);
+            destroy(d.image);
+        }
+        if (!d.image.img) {
+            d.width = w, d.height = h;
+            d.image = make_general(w * scale, h * scale, depth_format,
+                                   VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, DS_ASPECT);
+            clear_depth(d.image, va);
+        }
+        return d;
+    }
+
+    VkFramebuffer framebuffer(Surface& sf, u32 depth_va) {
+        VkFramebuffer& fb = framebuffers[u64(sf.va) << 32 | depth_va];
+        if (fb) return fb;
+        Depth& d = depth_buffer(depth_va, sf.width, sf.height);
+        VkImageView views[2] = {sf.color.view, d.image.view};
+        VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fi.renderPass = render_pass;
+        fi.attachmentCount = 2;
+        fi.pAttachments = views;
+        fi.width = sf.width * scale, fi.height = sf.height * scale, fi.layers = 1;
+        vkCreateFramebuffer(dev, &fi, nullptr, &fb);
+        return fb;
     }
 
     bool bind_target(Memory& mem, const std::array<u32, pica::reg::COUNT>& regs) {
@@ -634,35 +854,192 @@ struct Renderer::Impl {
         const u32 w = regs[FB_DIM] & 0x7FF, h = (regs[FB_DIM] >> 12 & 0x3FF) + 1;
         const u32 fmt = regs[COLOR_FORMAT] >> 16 & 7;
         if (!color_va || !w || fmt > 4) return false;
-        if (target.color.img && target.color_va == color_va && target.depth_va == depth_va && target.width == w &&
-            target.height == h && target.format == fmt)
+        if (cur && cur->va == color_va && cur_depth == depth_va && cur->width == w && cur->height == h &&
+            cur->format == fmt)
             return true;
-        flush(mem);
-        target.color_va = color_va, target.depth_va = depth_va, target.width = w, target.height = h;
-        target.format = fmt;
-        target.color = make_image(w, h, VK_FORMAT_R8G8B8A8_UNORM,
-                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                  VK_IMAGE_ASPECT_COLOR_BIT);
-        target.depth = make_image(w, h, depth_format, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, DS_ASPECT);
-        VkImageView views[2] = {target.color.view, target.depth.view};
-        VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-        fi.renderPass = render_pass;
-        fi.attachmentCount = 2;
-        fi.pAttachments = views;
-        fi.width = w, fi.height = h, fi.layers = 1;
-        vkCreateFramebuffer(dev, &fi, nullptr, &target.fb);
-        target.fresh = true;
+        cur = &surface(mem, color_va, w, h, fmt);
+        cur_depth = depth_va;
+        depth_buffer(depth_va, w, h);  // may have been resized by another target
+        return true;
+    }
+
+    void sync(Memory& mem, u32 start, u32 end, bool overwrite) {
+        for (auto& [va, sf] : surfaces) {
+            const u32 sf_end = va + guest_bytes(sf);
+            if (!sf.gpu_newer || sf_end <= start || va >= end) continue;
+            if (overwrite && va >= start && sf_end <= end) continue;
+            readback(mem, sf);
+        }
+    }
+
+    void fill(Memory& mem, u32 start, u32 end) {
+        for (auto& [va, d] : depths)
+            if (va == start) clear_depth(d.image, va);
+        auto it = surfaces.find(start);
+        if (it == surfaces.end() || start + guest_bytes(it->second) > end) return;
+        Surface& sf = it->second;
+        const auto c = pica::pixel::decode(sf.format, mem.host(start));  // the guest memory was just filled
+        const VkClearColorValue v{{c.r / 255.0f, c.g / 255.0f, c.b / 255.0f, c.a / 255.0f}};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        begin();
+        memory_barrier();
+        vkCmdClearColorImage(cmd, sf.color.img, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
+        memory_barrier();
+        sf.ram_hash = ram_hash(mem, sf);
+        sf.gpu_newer = false;
+    }
+
+    bool display_transfer(Memory& mem, u32 in, u32 out, u32 in_dim, u32 out_dim, u32 flags) {
+        const bool flip = flags & 1, input_linear = flags >> 1 & 1, dont_swizzle = flags >> 5 & 1;
+        const u32 scaling = flags >> 24 & 3, out_fmt = flags >> 12 & 7;
+        if (always_readback || input_linear || (flags >> 3 & 1) || scaling == 3) return false;
+        // The source may start at a tile row inside a surface (the game renders both screens
+        // into one buffer, one after the other, and transfers the bottom one from row 80).
+        const u32 in_w = in_dim & 0xFFFF;
+        Surface* src = nullptr;
+        u32 row0 = 0;
+        for (auto& [va, sf] : surfaces) {
+            const u32 row_bytes = sf.width * pica::pixel::bytes_per_pixel(sf.format);
+            if (in >= va && in < va + guest_bytes(sf) && sf.width == in_w && (in - va) % (row_bytes * 8) == 0) {
+                src = &sf, row0 = (in - va) / row_bytes;
+                break;
+            }
+        }
+        if (!src) return false;
+        Surface& sf = *src;
+        if (ram_hash(mem, sf) != sf.ram_hash) upload(mem, sf);
+        const u32 hs = scaling ? 1 : 0, vs = scaling == 2 ? 1 : 0;
+        const u32 out_w = (out_dim & 0xFFFF) >> hs, out_h = (out_dim >> 16) >> vs;
+        if (!out_w || !out_h || (out_w << hs) > sf.width || row0 + (out_h << vs) > sf.height) return false;
+        const u32 rows_above = sf.height - row0;  // image rows down to the first transferred memory row
+        if (dont_swizzle) {  // tiled -> tiled (downscaled copies used as textures): surface to surface
+            if (out_fmt > 4 || out == in) return false;
+            Surface& dst = surface(mem, out, out_w, out_h, out_fmt);
+            // Memory row r is image row H-1-r on both sides: the copied rows are the source's last ones.
+            const s32 S = s32(scale), sh = s32(rows_above) * S, rows = s32(out_h << vs) * S;
+            VkImageBlit b{};
+            b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            b.srcOffsets[0] = {0, sh - rows, 0};
+            b.srcOffsets[1] = {s32(out_w << hs) * S, sh, 1};
+            b.dstOffsets[0] = {0, flip ? s32(out_h) * S : 0, 0};
+            b.dstOffsets[1] = {s32(out_w) * S, flip ? 0 : s32(out_h) * S, 1};
+            begin();
+            memory_barrier();
+            vkCmdBlitImage(cmd, sf.color.img, VK_IMAGE_LAYOUT_GENERAL, dst.color.img, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
+                           VK_FILTER_LINEAR);
+            memory_barrier();
+            dst.gpu_newer = true;
+            return true;
+        }
+        // Screen orientation: one framebuffer row (out_w pixels) is one screen column.
+        Display& d = displays[out];
+        if (d.image.img && (d.width != out_h * scale || d.height != out_w * scale)) {
+            submit_and_wait();
+            destroy(d.image);
+        }
+        if (!d.image.img) {
+            d.width = out_h * scale, d.height = out_w * scale;
+            d.image = make_general(d.width, d.height, VK_FORMAT_R8G8B8A8_UNORM,
+                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+        begin();
+        VkDescriptorSet set;
+        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dai.descriptorPool = desc_pool, dai.descriptorSetCount = 1, dai.pSetLayouts = &xfer_set_layout;
+        if (vkAllocateDescriptorSets(dev, &dai, &set) != VK_SUCCESS) {
+            submit_and_wait();
+            begin();
+            vkAllocateDescriptorSets(dev, &dai, &set);
+        }
+        const VkDescriptorImageInfo ii[2] = {{sampler(0), sf.color.view, VK_IMAGE_LAYOUT_GENERAL},
+                                             {VK_NULL_HANDLE, d.image.view, VK_IMAGE_LAYOUT_GENERAL}};
+        VkWriteDescriptorSet w[2]{};
+        w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                &ii[0], nullptr, nullptr};
+        w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ii[1],
+                nullptr, nullptr};
+        vkUpdateDescriptorSets(dev, 2, w, 0, nullptr);
+        memory_barrier();
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, xfer_pipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, xfer_layout, 0, 1, &set, 0, nullptr);
+        const s32 pc[4] = {flip, s32(hs), s32(vs), s32(rows_above * scale)};
+        vkCmdPushConstants(cmd, xfer_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+        vkCmdDispatch(cmd, (d.width + 7) / 8, (d.height + 7) / 8, 1);
+        memory_barrier();
+        submit_and_wait();  // presentation (another thread) reads the image next
+        d.bytes = out_w * out_h * pica::pixel::bytes_per_pixel(out_fmt);
+        d.ram_hash = hash_ram(mem.host(out), d.bytes);
+        if (cache_dirty && std::chrono::steady_clock::now() - cache_saved > std::chrono::seconds(10)) save_caches();
         return true;
     }
 
     // Decodes and (re)uploads a texture unit if its contents changed. Records into cmd.
-    Texture& texture(const Memory& mem, const std::array<u32, pica::reg::COUNT>& regs, u32 unit) {
+    struct TexSource {
+        u32 va, w, h;
+        pica::TexFormat fmt;
+        size_t size;
+    };
+    static TexSource tex_source(const std::array<u32, pica::reg::COUNT>& regs, u32 unit) {
         const u32* r = TEX_REGS[unit];
         const u32 h = regs[r[0]] & 0x7FF, w = regs[r[0]] >> 16 & 0x7FF;
         const auto fmt = pica::TexFormat(regs[r[3]] & 0xF);
-        const u32 va = Memory::pa_to_va(regs[r[2]] << 3);
-        const size_t size = pica::texture_size(fmt, w, h);
+        return {Memory::pa_to_va(regs[r[2]] << 3), w, h, fmt, pica::texture_size(fmt, w, h)};
+    }
+
+    // Render-to-texture: a texture with a cached surface's exact address, size and (colour)
+    // format samples the surface itself; any other overlap with a GPU-newer surface writes it
+    // back to guest memory first. Must run before the draw takes batch memory (may submit).
+    // A texture taller than the surface at its address (power-of-two padding) samples a
+    // texture-sized copy with the surface in its first memory rows (the image's last rows).
+    std::map<u32, Surface> padded;
+
+    Surface* resolve_texture(Memory& mem, const std::array<u32, pica::reg::COUNT>& regs, u32 unit) {
+        const TexSource t = tex_source(regs, unit);
+        if (!t.va || !t.size) return nullptr;
+        auto it = surfaces.find(t.va);
+        if (it != surfaces.end() && it->second.width == t.w && it->second.height <= t.h &&
+            it->second.format == u32(t.fmt)) {
+            Surface& sf = surface(mem, t.va, it->second.width, it->second.height, it->second.format);
+            if (sf.height == t.h) return &sf;
+            Surface& p = padded[t.va];
+            if (p.color.img && (p.width != t.w || p.height != t.h)) submit_and_wait(), destroy(p.color);
+            if (!p.color.img) {
+                p.va = t.va, p.width = t.w, p.height = t.h, p.format = sf.format;
+                p.color = make_general(t.w * scale, t.h * scale, VK_FORMAT_R8G8B8A8_UNORM,
+                                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                       VK_IMAGE_ASPECT_COLOR_BIT);
+            }
+            const s32 S = s32(scale);
+            VkImageBlit b{};
+            b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            b.srcOffsets[1] = {s32(sf.width) * S, s32(sf.height) * S, 1};
+            b.dstOffsets[0] = {0, s32(t.h - sf.height) * S, 0};
+            b.dstOffsets[1] = {s32(t.w) * S, s32(t.h) * S, 1};
+            begin();
+            memory_barrier();
+            vkCmdBlitImage(cmd, sf.color.img, VK_IMAGE_LAYOUT_GENERAL, p.color.img, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
+                           VK_FILTER_NEAREST);
+            memory_barrier();
+            return &p;
+        }
+        if (std::getenv("DOT_TRACE_FB"))
+            for (auto& [va, sf] : surfaces)
+                if (sf.gpu_newer && va < t.va + t.size && t.va < va + guest_bytes(sf))
+                    std::fprintf(stderr, "renderer: texture %ux%u fmt %u at %08X overlaps surface %ux%u fmt %u at %08X\n",
+                                 t.w, t.h, u32(t.fmt), t.va, sf.width, sf.height, sf.format, va);
+        sync(mem, t.va, t.va + u32(t.size), false);
+        return nullptr;
+    }
+
+    Texture surface_tex[3];
+
+    Texture& texture(const Memory& mem, const std::array<u32, pica::reg::COUNT>& regs, u32 unit, Surface* from) {
+        if (from) {
+            Texture& t = surface_tex[unit];
+            t.image.view = from->color.view, t.layout = VK_IMAGE_LAYOUT_GENERAL;
+            return t;
+        }
+        const auto [va, w, h, fmt, size] = tex_source(regs, unit);
         if (!va || !w || !h || !size || w % 8 || h % 8) return dummy;
         const u64 key = fnv(&va, 4, fnv(&w, 4, fnv(&h, 4, u64(fmt))));
         Texture& t = textures[key];
@@ -793,6 +1170,10 @@ struct Renderer::Impl {
             ++stats.skipped;
         };
         if (!bind_target(mem, regs)) return skip("unsupported or missing colour buffer");
+        Surface* tex_surface[3] = {};
+        for (u32 i = 0; i < 3; ++i)
+            if (regs[TEX_CONFIG] >> i & 1) tex_surface[i] = resolve_texture(mem, regs, i);
+        if (!cur) return skip("render target lost");  // a resolved texture replaced it
 
         std::vector<pica::VertexInput> verts;
         if (!pica::load_vertices(mem, regs, vs, indexed, verts) || verts.empty()) return skip("vertex fetch");
@@ -830,7 +1211,7 @@ struct Renderer::Impl {
         // bounded by the units' full sizes, the target upload by its size).
         const void* const vdata = gpu_vs ? static_cast<const void*>(verts.data()) : shaded.data();
         const VkDeviceSize vbytes = gpu_vs ? verts.size() * sizeof(pica::VertexInput) : shaded.size() * sizeof(ShadedVertex);
-        VkDeviceSize xbytes = target.fresh ? align(VkDeviceSize(target.width) * target.height * 4) : 0;
+        VkDeviceSize xbytes = 0;
         for (u32 i = 0; i < 3; ++i)
             if (regs[TEX_CONFIG] >> i & 1) {
                 const u32 dim = regs[TEX_REGS[i][0]];
@@ -874,22 +1255,9 @@ struct Renderer::Impl {
         // Texture uploads (before the render pass).
         Texture* tex[3];
         for (u32 i = 0; i < 3; ++i)
-            tex[i] = regs[TEX_CONFIG] >> i & 1 ? &texture(mem, regs, i) : &dummy;
-        if (target.fresh) {  // bring in the guest's current pixels
-            const VkDeviceSize xoff = take(x_used, VkDeviceSize(target.width) * target.height * 4);
-            read_guest_color(mem, xfer.ptr + xoff);
-            barrier(target.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            VkBufferImageCopy copy{};
-            copy.bufferOffset = xoff;
-            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            copy.imageExtent = {target.width, target.height, 1};
-            vkCmdCopyBufferToImage(cmd, xfer.buf, target.color.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-            barrier(target.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-            barrier(target.depth.img, DS_ASPECT, VK_IMAGE_LAYOUT_UNDEFINED,
-                    VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-        }
+            tex[i] = regs[TEX_CONFIG] >> i & 1 ? &texture(mem, regs, i, tex_surface[i]) : &dummy;
+        if (tex_surface[0] || tex_surface[1] || tex_surface[2]) memory_barrier();  // earlier passes wrote them
+        const VkFramebuffer fb = framebuffer(*cur, cur_depth);
 
         // Descriptors (the pool is recycled per batch).
         VkDescriptorSet sets[2];
@@ -901,7 +1269,7 @@ struct Renderer::Impl {
         const VkDescriptorBufferInfo bi[2] = {{ubuf.buf, uoff, UBO_SIZE}, {lbuf.buf, lb_last, LIGHT_BUF_SIZE}};
         VkDescriptorImageInfo ii[3];
         for (u32 i = 0; i < 3; ++i)
-            ii[i] = {sampler(regs[TEX_REGS[i][1]]), tex[i]->image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            ii[i] = {sampler(regs[TEX_REGS[i][1]]), tex[i]->image.view, tex[i]->layout};
         VkWriteDescriptorSet w[3]{};
         w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                 nullptr, &bi[0], nullptr};
@@ -913,28 +1281,22 @@ struct Renderer::Impl {
 
         VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         rbi.renderPass = render_pass;
-        rbi.framebuffer = target.fb;
-        rbi.renderArea = {{0, 0}, {target.width, target.height}};
+        rbi.framebuffer = fb;
+        rbi.renderArea = {{0, 0}, {cur->width * scale, cur->height * scale}};
         vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
-        if (target.fresh) {  // depth/stencil start at the guest's last fill value for this buffer
-            auto it = depth_clears.find(target.depth_va);
-            VkClearAttachment ca{DS_ASPECT, 1, {}};
-            ca.clearValue.depthStencil = it == depth_clears.end() ? VkClearDepthStencilValue{0.0f, 0}
-                                                                  : VkClearDepthStencilValue{it->second.depth,
-                                                                                             it->second.stencil};
-            VkClearRect rect{{{0, 0}, {target.width, target.height}}, 0, 1};
-            vkCmdClearAttachments(cmd, 1, &ca, 1, &rect);
-            target.fresh = false;
-        }
+        cur->gpu_newer = true;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        const float S = float(scale);
         const float vw = f24_to_f32(regs[VIEWPORT_W] & 0xFFFFFF) * 2, vh = f24_to_f32(regs[VIEWPORT_H] & 0xFFFFFF) * 2;
-        VkViewport viewport{float(regs[VIEWPORT_XY] & 0x3FF), float(regs[VIEWPORT_XY] >> 16 & 0x3FF), vw, vh, 0, 1};
+        VkViewport viewport{float(regs[VIEWPORT_XY] & 0x3FF) * S, float(regs[VIEWPORT_XY] >> 16 & 0x3FF) * S, vw * S,
+                            vh * S, 0, 1};
         vkCmdSetViewport(cmd, 0, 1, &viewport);
-        VkRect2D scissor{{0, 0}, {target.width, target.height}};
+        VkRect2D scissor{{0, 0}, {cur->width * scale, cur->height * scale}};
         if ((regs[SCISSOR_MODE] & 3) == 3) {
             const s32 x1 = regs[SCISSOR_MIN] & 0x3FF, y1 = regs[SCISSOR_MIN] >> 16 & 0x3FF;
             const s32 x2 = regs[SCISSOR_MAX] & 0x3FF, y2 = regs[SCISSOR_MAX] >> 16 & 0x3FF;
-            scissor = {{x1, y1}, {u32(std::max(0, x2 - x1 + 1)), u32(std::max(0, y2 - y1 + 1))}};
+            const s32 k = s32(scale);
+            scissor = {{x1 * k, y1 * k}, {u32(std::max(0, x2 - x1 + 1) * k), u32(std::max(0, y2 - y1 + 1) * k)}};
         }
         vkCmdSetScissor(cmd, 0, 1, &scissor);
         const u32 bc = regs[BLEND_COLOR];
@@ -953,7 +1315,7 @@ struct Renderer::Impl {
         vkCmdEndRenderPass(cmd);
         ++stats.draws;
         if (std::getenv("DOT_TRACE_FB"))
-            std::fprintf(stderr, "renderer:   draw %zu vertices into %08X\n", verts.size(), target.color_va);
+            std::fprintf(stderr, "renderer:   draw %zu vertices into %08X\n", verts.size(), cur->va);
     }
 };
 
@@ -977,17 +1339,57 @@ void Renderer::draw(core::Memory& mem, const std::array<u32, pica::reg::COUNT>& 
     timed("draw (total)", [&] { impl_->draw(mem, regs, vs, indexed); });
 }
 
-void Renderer::flush(core::Memory& mem) {
+void Renderer::sync(core::Memory& mem, u32 start, u32 end, bool overwrite) {
     std::lock_guard lk(impl_->lock);
-    timed("flush", [&] { impl_->flush(mem); });
+    timed("sync", [&] { impl_->sync(mem, start, end, overwrite); });
 }
 
-void Renderer::memory_fill(u32 start, u32, u32 value, u32 width_mode) {
+void Renderer::memory_fill(core::Memory& mem, u32 start, u32 end, u32 value, u32 width_mode) {
     std::lock_guard lk(impl_->lock);
     // 16-bit fills clear D16; 24/32-bit fills D24, the 32-bit ones with the stencil in the top byte.
     impl_->depth_clears[start] = width_mode == 0 ? Impl::DepthClear{(value & 0xFFFF) / 65535.0f, 0}
                                                  : Impl::DepthClear{(value & 0xFFFFFF) / 16777215.0f, width_mode == 2 ? value >> 24 : 0};
+    impl_->fill(mem, start, end);
 }
+
+bool Renderer::display_transfer(core::Memory& mem, u32 in, u32 out, u32 in_dim, u32 out_dim, u32 flags) {
+    std::lock_guard lk(impl_->lock);
+    return impl_->display_transfer(mem, in, out, in_dim, out_dim, flags);
+}
+
+bool Renderer::display(core::Memory& mem, u32 va, GpuScreen& out) {
+    std::lock_guard lk(impl_->lock);
+    auto it = impl_->displays.find(va);
+    if (it == impl_->displays.end() || !it->second.image.img) return false;
+    const Impl::Display& d = it->second;
+    if (hash_ram(mem.host(va), d.bytes) != d.ram_hash) return false;  // the CPU wrote the framebuffer since
+    out = {d.image.img, d.width, d.height};
+    return true;
+}
+
+bool Renderer::read_display(u32 va, std::vector<u32>& rgba, u32& width, u32& height) {
+    std::lock_guard lk(impl_->lock);
+    Impl& m = *impl_;
+    auto it = m.displays.find(va);
+    if (it == m.displays.end() || !it->second.image.img) return false;
+    const Impl::Display& d = it->second;
+    const VkDeviceSize bytes = VkDeviceSize(d.width) * d.height * 4;
+    m.submit_and_wait();
+    m.ensure(m.xfer, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    m.begin();
+    m.memory_barrier();
+    VkBufferImageCopy copy{};
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageExtent = {d.width, d.height, 1};
+    vkCmdCopyImageToBuffer(m.cmd, d.image.img, VK_IMAGE_LAYOUT_GENERAL, m.xfer.buf, 1, &copy);
+    m.submit_and_wait();
+    width = d.width, height = d.height;
+    rgba.resize(size_t(width) * height);
+    std::memcpy(rgba.data(), m.xfer.ptr, bytes);
+    return true;
+}
+
+u32 Renderer::scale() const { return impl_->scale; }
 
 Renderer::Stats Renderer::stats() const { return impl_->stats; }
 

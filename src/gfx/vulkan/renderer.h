@@ -19,6 +19,7 @@
 #include <array>
 #include <filesystem>
 #include <memory>
+#include <vector>
 
 #include "core/memory.h"
 #include "gfx/pica/command_processor.h"
@@ -27,12 +28,18 @@ namespace gfx::vulkan {
 
 class Context;
 
-// Executes PICA200 draws with Vulkan. The render target mirrors the guest's colour buffer
-// in VRAM: it is loaded from guest memory when first drawn to and written back (tiled, in
-// the guest's pixel format) by flush(), which GSP calls before any GX command that could
-// read or overwrite VRAM. Draws are batched into one submission per flush.
-// shortcut: no logic ops, gas, shadow maps, geometry shaders; depth is kept
-// on the GPU only (cleared by MemoryFill on the depth buffer, never written back).
+struct GpuScreen;
+
+// Executes PICA200 draws with Vulkan. Colour buffers live in a GPU-resident surface cache keyed
+// by their guest address, rendered at DOT_RES_SCALE times the guest resolution; guest memory
+// is only written back when a CPU-side GX operation (DMA, TextureCopy, a DisplayTransfer the
+// GPU path does not handle) touches a surface, or when a texture reads part of one. CPU
+// writes to a surface's memory are detected by hashing it when the surface is next used.
+// DisplayTransfers from a cached surface go straight to a screen-oriented image that
+// presentation reads (see display()).
+// shortcut: plain CPU loads of rendered pixels are not detected (no read faults on guest
+// memory); DOT_READBACK=1 restores a write-back after every frame. No logic ops, gas, shadow
+// maps, geometry shaders or MSAA; depth stays on the GPU.
 class Renderer {
 public:
     explicit Renderer(Context& ctx);
@@ -42,13 +49,24 @@ public:
 
     void draw(core::Memory& mem, const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs,
               bool indexed);
-    // Writes the render target back to guest memory and drops it.
-    void flush(core::Memory& mem);
-    // The guest filled [start, end) through MemoryFill: a depth buffer there is cleared.
-    void memory_fill(u32 start_va, u32 end_va, u32 value, u32 width_mode);
+    // Brings guest memory in [start, end) up to date with the GPU before a CPU-side GX
+    // operation reads or writes it. With `overwrite`, surfaces entirely inside the range
+    // are skipped (they are about to be replaced).
+    void sync(core::Memory& mem, u32 start_va, u32 end_va, bool overwrite = false);
+    // The guest filled [start, end) through MemoryFill (already applied to guest memory):
+    // clears a colour surface or a depth buffer starting there.
+    void memory_fill(core::Memory& mem, u32 start_va, u32 end_va, u32 value, u32 width_mode);
+    // DisplayTransfer from a cached colour surface into a screen image on the GPU; false when
+    // the transfer is not one the GPU path handles (the caller then runs it on the CPU).
+    bool display_transfer(core::Memory& mem, u32 in, u32 out, u32 in_dim, u32 out_dim, u32 flags);
+    // The screen image last transferred to `va`, if guest memory there is unchanged since.
+    bool display(core::Memory& mem, u32 va, GpuScreen& out);
+    // Reads a screen image back (DOT_DUMP_FRAMES), RGBA8 rows top first.
+    bool read_display(u32 va, std::vector<u32>& rgba, u32& width, u32& height);
+    u32 scale() const;
 
     struct Stats {
-        u64 draws, skipped, pipelines, flushes, shaders;  // shaders = GLSL compiled (not from the disk cache)
+        u64 draws, skipped, pipelines, readbacks, shaders;  // shaders = GLSL compiled (not from the disk cache)
     };
     Stats stats() const;
 

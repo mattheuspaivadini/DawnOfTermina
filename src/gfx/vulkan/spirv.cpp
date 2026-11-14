@@ -28,7 +28,9 @@ std::vector<u32> compile_glsl(std::string_view source, ShaderStage stage, std::s
     static std::once_flag init;
     std::call_once(init, [] { glslang::InitializeProcess(); });
 
-    const EShLanguage lang = stage == ShaderStage::Vertex ? EShLangVertex : EShLangFragment;
+    const EShLanguage lang = stage == ShaderStage::Vertex     ? EShLangVertex
+                             : stage == ShaderStage::Fragment ? EShLangFragment
+                                                              : EShLangCompute;
     glslang::TShader shader(lang);
     const char* text = source.data();
     const int len = int(source.size());

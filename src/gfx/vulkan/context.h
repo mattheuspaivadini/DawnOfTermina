@@ -17,6 +17,12 @@ struct ScreenImage {
     const u32* pixels;
 };
 
+// A screen already on the GPU (renderer output, any size, GENERAL layout), screen-oriented.
+struct GpuScreen {
+    VkImage image;
+    u32 width, height;
+};
+
 constexpr u32 TOP_W = 400, BOTTOM_W = 320, SCREEN_H = 240;
 
 // Vulkan instance/device/swapchain owner. Presents the top and bottom screens stacked,
@@ -28,7 +34,12 @@ public:
     ~Context();
     bool init(SDL_Window* window);
     // Skips silently while the window is minimised. Returns false on a fatal device error.
-    bool present(const ScreenImage& top, const ScreenImage& bottom);
+    // A non-null GpuScreen replaces that screen's CPU pixels.
+    bool present(const ScreenImage& top, const ScreenImage& bottom, const GpuScreen* gpu_top = nullptr,
+                 const GpuScreen* gpu_bottom = nullptr);
+    // Window size in pixels at the last swapchain creation (0 while minimised).
+    VkExtent2D extent() const { return extent_; }
+    float max_anisotropy() const { return anisotropy_; }  // 0 = unsupported
 
     VkDevice device() const { return device_; }
     VkPhysicalDevice gpu() const { return gpu_; }
@@ -49,6 +60,7 @@ private:
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue queue_ = VK_NULL_HANDLE;
     u32 queue_family_ = 0;
+    float anisotropy_ = 0;
     std::mutex queue_lock_;
 
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;

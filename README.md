@@ -41,6 +41,8 @@ cmake --build build
 ./build/dawnoftermina game_data
 ```
 
+Para renderizar acima da resolução do 3DS: `DOT_RES_SCALE=3 ./build/dawnoftermina game_data` (1–8, ou `native` para o maior fator que cabe na janela).
+
 ## Arquitetura
 
 ```
@@ -69,7 +71,8 @@ Cada função transcrita mantém o endereço virtual original em comentário (`/
 | 6 | Recompilador estático automático ARM11 → C++ | ✅ boot do SDK roda recompilado até a criação de threads |
 | 7 | Threads do guest e serviços do sistema até o primeiro frame | ✅ título, criação de arquivo (teclado HLE), cutscene inicial da Lost Woods e Link controlável (circle pad) a ~60 VBlanks/s |
 | 8 | Áudio: HLE do DSP (24 vozes, PCM8/PCM16/ADPCM) com saída via SDL3 | ✅ música e efeitos; sem reverb/filtros |
-| 9+ | Subsistemas do jogo (cenas, loop, colisão, atores, HUD) | ⏳ |
+| 9 | Renderização em alta resolução (`DOT_RES_SCALE`) com framebuffers residentes na GPU | ✅ |
+| 10+ | Subsistemas do jogo (cenas, loop, colisão, atores, HUD) | ⏳ |
 
 ## Licença
 

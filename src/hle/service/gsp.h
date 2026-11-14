@@ -23,6 +23,7 @@
 // Host side of gsp::Gpu: the framebuffers the guest last swapped in.
 namespace gfx::vulkan {
 class Renderer;
+struct GpuScreen;
 }
 
 namespace hle::service::gsp {
@@ -33,6 +34,13 @@ void set_renderer(gfx::vulkan::Renderer* renderer);
 // Fills `rgba` (bytes R,G,B,A; row 0 = top) with the current framebuffer of screen
 // 0 (top, 400x240) or 1 (bottom, 320x240). Returns false until the guest set one.
 bool screen_image(int screen, std::vector<u32>& rgba);
+
+// The screen's framebuffer as a GPU image (the renderer's DisplayTransfer output, at the
+// render scale), if that is its newest copy.
+bool gpu_screen(int screen, gfx::vulkan::GpuScreen& out);
+
+// The screen as pixels for DOT_DUMP_FRAMES: read back from the GPU (scaled) or from memory.
+bool screen_dump(int screen, std::vector<u32>& rgba, u32& width, u32& height);
 
 // Counters for diagnostics.
 struct Stats {

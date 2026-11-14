@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include <string_view>
+#include <vector>
+
 #include "core/types.h"
 
 // nn::hid — 3DS pad state fed from SDL keyboard + first connected gamepad.
@@ -46,7 +49,19 @@ bool window_to_touch(float wx, float wy, int win_w, int win_h, u16& tx, u16& ty)
 // Pure state step: derives trigger/release and the CPAD_* direction bits.
 PadStatus next_pad(const PadStatus& prev, u32 buttons, s16 stick_x, s16 stick_y);
 
-bool Initialize();  // requires SDL_Init(SDL_INIT_GAMEPAD)
+// Scripted input (DOT_INPUT="<seconds>:<event>,..."), for runs without a usable keyboard or
+// mouse such as automated validation. An event is a button name (A B X Y L R ZL ZR START
+// SELECT UP DOWN LEFT RIGHT) or T<x>x<y> (bottom-screen touch); each is held for 150 ms,
+// timed from the first Update(). Returns false on a malformed script.
+struct ScriptEvent {
+    double t;
+    u32 buttons;
+    bool touch;
+    u16 x, y;
+};
+bool parse_input_script(std::string_view text, std::vector<ScriptEvent>& out);
+
+bool Initialize();  // requires SDL_Init(SDL_INIT_GAMEPAD); reads DOT_INPUT
 void Update();
 PadStatus ReadPad();
 

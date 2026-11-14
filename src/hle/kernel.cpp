@@ -757,6 +757,21 @@ Result send_sync_request(Handle session) {
         throw Unimplemented("IPC to service '" + name + "' (no HLE implementation), command header " +
                             hex(g_mem->read<u32>(cmd)));
     handler(*g_mem, cmd);  // runs without the kernel lock: handlers call back into the kernel
+
+    // Copied handles: the client gets its own handle to the object (closing it must not
+    // invalidate the service's), as the real kernel's reply translation does.
+    const u32 header = g_mem->read<u32>(cmd), normal = header >> 6 & 0x3F, translate = header & 0x3F;
+    for (u32 i = 1 + normal, end = i + translate; i < end;) {
+        const u32 desc = g_mem->read<u32>(cmd + i * 4);
+        const u32 words = (desc & 0xF) == 0 ? (desc >> 26) + 1 : 1;
+        if ((desc & 0x3F) == 0)  // copy-handle descriptor (not move, not calling PID)
+            for (u32 k = 1; k <= words && i + k < end; ++k) {
+                Handle copy = 0;
+                if (const Handle h = g_mem->read<u32>(cmd + (i + k) * 4); h && duplicate_handle(h, &copy) == RESULT_OK)
+                    g_mem->write<u32>(cmd + (i + k) * 4, copy);
+            }
+        i += 1 + words;
+    }
     return RESULT_OK;
 }
 

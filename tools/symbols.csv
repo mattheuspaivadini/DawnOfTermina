@@ -32,3 +32,7 @@
 0x0010589c,InitThreadSystem,F ?
 0x0010f5fc,InitHeapBlock,F ?
 0x00108108,InitMainThreadObject,F ? builds the "MainThread" object
+0x001bef68,svcCreateEvent,? svc 0x17 wrapper
+0x001d62ac,nn_ir_InitEvent,? creates an event via svcCreateEvent; fatal on failure
+0x001d5f30,nn_ir_GetConnectionStatusEvent,? closes the held event and stores the one ir:USER hands out (copy handle)
+0x001d5820,nn_ir_WaitConnection,? waits on the ir connection-status event; a failed wait is fatal (needs copied handles to stay valid)

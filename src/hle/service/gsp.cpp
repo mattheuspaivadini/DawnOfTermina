@@ -274,6 +274,15 @@ void gsp_command(core::Memory& mem, u32 base) {
         c.set(2, ipc::static_buffer(size, 0)), c.set(3, addr);
         return;
     }
+    case 0x18: {  // ImportDisplayCaptureInfo -> {left, right, format, stride} per screen
+        std::lock_guard lk(g_fb_lock);
+        c.reply(9, 0);
+        for (u32 i = 0; i < 2; ++i) {
+            const Framebuffer& f = g_fb[i];
+            c.set(2 + i * 4, f.va), c.set(3 + i * 4, f.va), c.set(4 + i * 4, f.format), c.set(5 + i * 4, f.stride);
+        }
+        return;
+    }
     case 0x05:  // SetBufferSwap(screen, FrameBufferInfo[7])
         set_framebuffer(c[1] & 1, base + 8);
         c.reply(1, 0);

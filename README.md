@@ -64,10 +64,10 @@ Cada função transcrita mantém o endereço virtual original em comentário (`/
 | 1 | Bootstrap do repositório, licença, documentação | ✅ |
 | 2 | Pipeline de extração do `.cia` e preparação do binário para o Hopper | ✅ |
 | 3 | Runtime, memória e HLE do Horizon OS | ✅ |
-| 4 | Backend Vulkan e tradutor PICA200 | 🟡 draws do jogo renderizados via Vulkan com iluminação por fragmento (abertura 3D e tela de título visíveis); faltam fog, sombras e desempenho |
+| 4 | Backend Vulkan e tradutor PICA200 | 🟡 draws em lote, vertex shaders na GPU e iluminação por fragmento; cenas com personagens renderizadas; faltam fog, sombras e cache de pipelines (engasgos na 1ª vez de cada cena) |
 | 5 | Entry point (`_start` / `nnMain`) | ✅ boot do crt0 transcrito até a fronteira atual |
 | 6 | Recompilador estático automático ARM11 → C++ | ✅ boot do SDK roda recompilado até a criação de threads |
-| 7 | Threads do guest e serviços do sistema até o primeiro frame | ✅ primeiro frame: menu de título na tela inferior |
+| 7 | Threads do guest e serviços do sistema até o primeiro frame | ✅ título, criação de arquivo (teclado HLE) e cutscene inicial da Lost Woods a ~60 VBlanks/s |
 | 8+ | Subsistemas do jogo (cenas, loop, áudio, colisão, atores, HUD) | ⏳ |
 
 ## Licença

@@ -92,6 +92,12 @@ static void test_hid() {
     assert(window_to_touch(719.9f, 959.9f, 800, 960, tx, ty) && tx == 319 && ty == 239);
     assert(!window_to_touch(79, 600, 800, 960, tx, ty) && !window_to_touch(400, 479, 800, 960, tx, ty));
     assert(window_to_touch(200 + 80, 480, 1200, 960, tx, ty) && tx == 0);  // pillarboxed by 200px
+
+    std::vector<ScriptEvent> ev;
+    assert(parse_input_script("20:START,21.5:A,30:T160x120", ev) && ev.size() == 3);
+    assert(ev[0].buttons == START && ev[1].t == 21.5 && ev[1].buttons == A);
+    assert(ev[2].touch && ev[2].x == 160 && ev[2].y == 120 && !ev[2].buttons);
+    assert(!parse_input_script("5:JUMP", ev) && !parse_input_script("5:T400x10", ev) && !parse_input_script("x", ev));
 }
 
 static void test_loader(Memory& mem, const stdfs::path& data) {

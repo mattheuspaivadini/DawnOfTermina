@@ -19,6 +19,9 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <mutex>
 #include <utility>
 
@@ -57,8 +60,41 @@ PadStatus next_pad(const PadStatus& prev, u32 buttons, s16 x, s16 y) {
     return {buttons, buttons & ~prev.hold, prev.hold & ~buttons, x, y};
 }
 
+static std::vector<ScriptEvent> script;
+
+bool parse_input_script(std::string_view text, std::vector<ScriptEvent>& out) {
+    static constexpr std::pair<std::string_view, u32> NAMES[] = {
+        {"A", A},   {"B", B},   {"X", X},   {"Y", Y},         {"L", L},          {"R", R},       {"ZL", ZL},
+        {"ZR", ZR}, {"UP", DUP}, {"DOWN", DDOWN}, {"LEFT", DLEFT}, {"RIGHT", DRIGHT}, {"START", START}, {"SELECT", SELECT},
+    };
+    out.clear();
+    while (!text.empty()) {
+        const size_t comma = text.find(',');
+        const std::string item(text.substr(0, comma));
+        text = comma == std::string_view::npos ? std::string_view{} : text.substr(comma + 1);
+        ScriptEvent e{};
+        char name[16] = {};
+        unsigned x = 0, y = 0;
+        if (std::sscanf(item.c_str(), "%lf:T%ux%u", &e.t, &x, &y) == 3 && x < 320 && y < 240) {
+            e.touch = true, e.x = u16(x), e.y = u16(y);
+        } else if (std::sscanf(item.c_str(), "%lf:%15[A-Z]", &e.t, name) == 2) {
+            for (auto [n, bit] : NAMES)
+                if (n == name) e.buttons = bit;
+            if (!e.buttons) return false;
+        } else {
+            return false;
+        }
+        out.push_back(e);
+    }
+    return true;
+}
+
 bool Initialize() {
     state = {};
+    if (const char* s = std::getenv("DOT_INPUT"); s && !parse_input_script(s, script)) {
+        std::fprintf(stderr, "hid: malformed DOT_INPUT\n");
+        return false;
+    }
     return true;
 }
 
@@ -108,12 +144,25 @@ void Update() {
     int w = 0, h = 0;
     if (SDL_Window* win = SDL_GetMouseFocus()) SDL_GetWindowSize(win, &w, &h);
 
+    bool script_touch = false;
+    u16 sx = 0, sy = 0;
+    if (!script.empty()) {
+        static const u64 start = SDL_GetTicks();
+        const double t = (SDL_GetTicks() - start) / 1000.0;
+        for (const auto& e : script)
+            if (t >= e.t && t < e.t + 0.15) {
+                buttons |= e.buttons;
+                if (e.touch) script_touch = true, sx = e.x, sy = e.y;
+            }
+    }
+
     std::lock_guard lk(state_lock);
     const PadStatus prev = state;
     state = next_pad(state, buttons, s16(std::clamp(x, -int(CPAD_MAX), int(CPAD_MAX))),
                      s16(std::clamp(y, -int(CPAD_MAX), int(CPAD_MAX))));
     u16 tx, ty;
-    if (down && window_to_touch(mx, my, w, h, tx, ty)) state.touch = true, state.touch_x = tx, state.touch_y = ty;
+    if (script_touch) state.touch = true, state.touch_x = sx, state.touch_y = sy;
+    else if (down && window_to_touch(mx, my, w, h, tx, ty)) state.touch = true, state.touch_x = tx, state.touch_y = ty;
     else if (down && prev.touch) state.touch = true, state.touch_x = prev.touch_x, state.touch_y = prev.touch_y;
 }
 

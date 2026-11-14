@@ -25,9 +25,9 @@ Recompilação estática nativa de *Majora's Mask 3D* (3DS, ARM11) para C++20 + 
 - `hle::svc`: `ControlMemory` (COMMIT/FREE/PROTECT, heap normal em `0x08000000` e linear em `0x14000000` via bump allocator, limite de 128 MB), `ExitProcess`, `SleepThread`, `GetSystemTick` (268.111.856 Hz), `Break`, `OutputDebugString`.
 - `hle::srv`: `GetServiceHandle` devolve handles fixos para serviços conhecidos.
 - `hle::fs`: `OpenFile("rom:/...")`/`GetSize`/`Read`/`Close` direto de `game_data/romfs/` (rejeita `..`).
-- `hle::hid`: SDL3. Teclado: K/J/I/U = A/B/X/Y, Q/E = L/R, 1/3 = ZL/ZR, Enter/Backspace = Start/Select, setas = D-pad, WASD = circle pad. Controle no layout posicional da Nintendo (leste = A).
+- `hle::hid`: SDL3. Teclado: K/J/I/U = A/B/X/Y, Q/E = L/R, 1/3 = ZL/ZR, Enter/Backspace = Start/Select, setas = D-pad, WASD = circle pad. Controle no layout posicional da Nintendo (leste = A). **Toque** = botão esquerdo do mouse sobre a tela inferior (`hid::window_to_touch`, mesmo layout 400×480 do `Context::present`); arrastar para fora mantém a caneta na última posição. No `hid:USER` o touch fica em shared+0xA8: cabeçalho do anel, entrada raw em +0x18, 8 entradas `{u16 x, u16 y, u32 valid}` em +0x20.
 - `hle::dsp`: stub, sem áudio.
-- **Faltam:** threads/handles/sincronização (`svcCreateThread`, eventos, mutexes), `cfg`, `ptm`, `apt`, toque na tela inferior, C-stick (`ir:rst`), áudio, saves.
+- **Faltam:** C-stick (`ir:rst`), áudio, saves.
 
 ## Gráficos (Etapa 4)
 
@@ -140,5 +140,5 @@ python3 tools/extract_cia.py "ISO/The Legend of Zelda Majora's Mask 3D (USA).cia
 | 4 | Vulkan + tradutor PICA200 | 🟡 | 4a ✅, 4b parte 1 ✅, **4b parte 2 ✅ draws reais na tela** (menu de título na tela inferior). Falta iluminação por fragmento para a cena 3D |
 | 5 | Entry point / `nnMain` | ✅ | crt0 transcrito até a fronteira `0x0011BECC`; srv/svc/err em HLE; 29 símbolos nomeados |
 | 6 | Recompilador estático ARM11 → C++ | ✅ | 16 mil funções compilam; boot recompilado roda o init do SDK até `svcCreateThread`; HLE do kernel por syscall/IPC |
-| 7 | Threads do guest + serviços IPC até o primeiro frame | 🟡 | Threads/scheduler com preempção em back-edges; APT, ndm, fs (RomFS via `romfs.bin` a partir do nível 3 da IVFC, saves em `saves/`), cfg, gsp (VBlank, fila GX, DisplayTransfer, apresentação), hid, dsp (placa de som muda). O jogo roda o loop de render sem parar (~600 command lists/s). O jogo exibe a tela de título (tela inferior completa). **Falta:** iluminação por fragmento (tela superior escura), toque, áudio real. Diagnóstico: `DOT_STATS=1`, `DOT_TRACE_HANDLES=1`, handler de SIGSEGV com VA do guest |
+| 7 | Threads do guest + serviços IPC até o primeiro frame | 🟡 | Threads/scheduler com preempção em back-edges; APT, ndm, fs (RomFS via `romfs.bin` a partir do nível 3 da IVFC, saves em `saves/`), cfg, gsp (VBlank, fila GX, DisplayTransfer, apresentação), hid, dsp (placa de som muda). O jogo roda o loop de render sem parar (~600 command lists/s). O jogo exibe a tela de título (tela inferior completa); toque pelo mouse (um toque pula a abertura até o logo). **Falta:** iluminação por fragmento (tela superior escura), áudio real. O guest roda lento (~14 VBlanks/s). Diagnóstico: `DOT_STATS=1`, `DOT_TRACE_HANDLES=1`, handler de SIGSEGV com VA do guest |
 | 8+ | Subsistemas do jogo | ⏳ | |

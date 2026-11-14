@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 // hid:USER — input through shared memory: a ring of 8 pad states (buttons + circle pad)
-// and touch states, refreshed periodically from the host input (hle::hid).
+// and touch states, refreshed periodically from the host input (hle::hid; the mouse is the stylus).
 
 #include "hle/hid.h"
 #include "hle/ipc.h"
@@ -76,9 +76,10 @@ void update() {
         g_mem->write<u32>(base + PAD + 0x1C, pad.hold);
         g_last_buttons = pad.hold;
 
-        // Touch: 8 entries {u16 x, u16 y, u32 valid}.
-        // shortcut: no touch input yet (always "not touching"); map the mouse on the bottom screen later.
-        g_mem->write<u64>(base + TOUCH + 0x18 + advance(base + TOUCH, 8, tick) * 8, 0);
+        // Touch: ring header, raw entry, then 8 entries {u16 x, u16 y, u32 valid}.
+        const u64 touch = pad.touch ? u64(pad.touch_x) | u64(pad.touch_y) << 16 | 1ull << 32 : 0;
+        g_mem->write<u64>(base + TOUCH + 0x18, touch);
+        g_mem->write<u64>(base + TOUCH + 0x20 + advance(base + TOUCH, 8, tick) * 8, touch);
 
         // Accelerometer: raw entry + 8 entries of s16 xyz; gyroscope: 32 entries. Console at rest.
         if (g_accel_on) write_xyz(base + ACCEL + 0x20 + advance(base + ACCEL, 8, tick) * 6, 0, 0, -512);

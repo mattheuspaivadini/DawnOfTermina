@@ -62,6 +62,15 @@ bool Initialize() {
     return true;
 }
 
+bool window_to_touch(float wx, float wy, int win_w, int win_h, u16& tx, u16& ty) {
+    const float s = std::min(win_w / 400.0f, win_h / 480.0f);
+    if (s <= 0) return false;
+    const float x = (wx - (win_w - 400 * s) / 2) / s - 40, y = (wy - (win_h - 480 * s) / 2) / s - 240;
+    if (x < 0 || y < 0 || x >= 320 || y >= 240) return false;
+    tx = u16(x), ty = u16(y);
+    return true;
+}
+
 static s16 axis(Sint16 v) { return s16(std::clamp(v * CPAD_MAX / 32767, -int(CPAD_MAX), int(CPAD_MAX))); }
 
 void Update() {
@@ -92,9 +101,20 @@ void Update() {
         x += axis(SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFTX));
         y -= axis(SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFTY));  // SDL Y grows downward
     }
+    // Touch: left mouse button over the bottom screen of the focused window. While dragged
+    // off-screen the pen stays down at the last position, like a stylus slid to the bezel.
+    float mx = 0, my = 0;
+    const bool down = SDL_GetMouseState(&mx, &my) & SDL_BUTTON_LMASK;
+    int w = 0, h = 0;
+    if (SDL_Window* win = SDL_GetMouseFocus()) SDL_GetWindowSize(win, &w, &h);
+
     std::lock_guard lk(state_lock);
+    const PadStatus prev = state;
     state = next_pad(state, buttons, s16(std::clamp(x, -int(CPAD_MAX), int(CPAD_MAX))),
                      s16(std::clamp(y, -int(CPAD_MAX), int(CPAD_MAX))));
+    u16 tx, ty;
+    if (down && window_to_touch(mx, my, w, h, tx, ty)) state.touch = true, state.touch_x = tx, state.touch_y = ty;
+    else if (down && prev.touch) state.touch = true, state.touch_x = prev.touch_x, state.touch_y = prev.touch_y;
 }
 
 PadStatus ReadPad() {

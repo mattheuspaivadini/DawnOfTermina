@@ -35,7 +35,13 @@ constexpr s16 CPAD_MAX = 0x9C;  // circle pad range is roughly +-156
 struct PadStatus {
     u32 hold = 0, trigger = 0, release = 0;
     s16 stick_x = 0, stick_y = 0;
+    bool touch = false;  // left mouse button held over the bottom screen
+    u16 touch_x = 0, touch_y = 0;  // digitizer coordinates, 0..319 x 0..239, origin top-left
 };
+
+// Maps a window point to the bottom screen of the 400x480 canvas that gfx::vulkan::Context
+// presents (same fit-and-centre layout). False if the point is outside the bottom screen.
+bool window_to_touch(float wx, float wy, int win_w, int win_h, u16& tx, u16& ty);
 
 // Pure state step: derives trigger/release and the CPAD_* direction bits.
 PadStatus next_pad(const PadStatus& prev, u32 buttons, s16 stick_x, s16 stick_y);

@@ -86,6 +86,12 @@ static void test_hid() {
     assert(p.hold == (A | CPAD_RIGHT | CPAD_DOWN) && p.trigger == (CPAD_RIGHT | CPAD_DOWN) && p.release == L);
     p = next_pad(p, A, 10, 0);  // inside the dead zone: no direction bits
     assert(p.hold == A && p.stick_x == 10);
+
+    u16 tx, ty;  // 800x960 window: scale 2, bottom screen spans x 80..719, y 480..959
+    assert(window_to_touch(80, 480, 800, 960, tx, ty) && tx == 0 && ty == 0);
+    assert(window_to_touch(719.9f, 959.9f, 800, 960, tx, ty) && tx == 319 && ty == 239);
+    assert(!window_to_touch(79, 600, 800, 960, tx, ty) && !window_to_touch(400, 479, 800, 960, tx, ty));
+    assert(window_to_touch(200 + 80, 480, 1200, 960, tx, ty) && tx == 0);  // pillarboxed by 200px
 }
 
 static void test_loader(Memory& mem, const stdfs::path& data) {

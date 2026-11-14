@@ -20,11 +20,14 @@
 
 namespace hle::service {
 
-void register_all(const std::filesystem::path& game_data) {
+void register_all(core::Memory& mem, const std::filesystem::path& game_data) {
     hle::srv::RegisterIpc();
     register_apt();
     register_misc();
     register_cfg();
+    register_gsp(mem);
+    register_hid(mem);
+    register_dsp(mem);
     register_fs(game_data);
 }
 

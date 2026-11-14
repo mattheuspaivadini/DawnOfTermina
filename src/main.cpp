@@ -34,6 +34,7 @@
 #include "hle/hid.h"
 #include "hle/srv.h"
 #include "hle/kernel.h"
+#include "hle/service/gsp.h"
 #include "hle/service/services.h"
 #include "hle/svc.h"
 #include "recomp/runtime.h"
@@ -102,7 +103,7 @@ int main(int argc, char** argv) {
     recomp::set_svc_memory(mem);
     recomp::set_function_table(recomp::kFunctions, recomp::kFunctionCount);
     hle::kernel::init(mem);
-    hle::service::register_all(data);
+    hle::service::register_all(mem, data);
     const u8 main_priority = read_main_priority(data);
     std::printf("boot: running recompiled code (%u functions), main thread priority 0x%02X\n",
                 recomp::kFunctionCount, main_priority);
@@ -133,6 +134,7 @@ int main(int argc, char** argv) {
         if (!gpu.init(window)) return 1;
         const std::vector<u32> top(gfx::vulkan::TOP_W * gfx::vulkan::SCREEN_H, 0xFF402010);
         const std::vector<u32> bottom = icon_screen(data / "exefs" / "icon.bin");
+        std::vector<u32> game_top, game_bottom;
 
         // Until the game loop is transcribed (stage 5), pump input, log pad changes and
         // present placeholder screens.
@@ -153,14 +155,39 @@ int main(int argc, char** argv) {
             auto pad = hle::hid::ReadPad();
             if (pad.trigger || pad.release)
                 std::printf("pad hold=%08x stick=(%d,%d)\n", pad.hold, pad.stick_x, pad.stick_y);
-            if (!gpu.present({gfx::vulkan::TOP_W, gfx::vulkan::SCREEN_H, top.data()},
-                             {gfx::vulkan::BOTTOM_W, gfx::vulkan::SCREEN_H, bottom.data()}))
+#ifdef DOT_HAVE_RECOMP
+            hle::kernel::host_tick();
+            if (std::getenv("DOT_STATS")) {  // once per second: what the guest GPU path is doing
+                static u64 frame = 0;
+                if (++frame % 60 == 0) {
+                    const auto st = hle::service::gsp::stats();
+                    std::printf("gsp: vblanks %llu, command lists %llu, draws %llu, fills %llu, transfers %llu\n",
+                                (unsigned long long)st.vblanks, (unsigned long long)st.command_lists,
+                                (unsigned long long)st.draws, (unsigned long long)st.memory_fills,
+                                (unsigned long long)st.display_transfers);
+                }
+            }
+            const bool have_top = hle::service::gsp::screen_image(0, game_top);
+            const bool have_bottom = hle::service::gsp::screen_image(1, game_bottom);
+            const u32* top_px = have_top ? game_top.data() : top.data();
+            const u32* bottom_px = have_bottom ? game_bottom.data() : bottom.data();
+#else
+            const u32* top_px = top.data();
+            const u32* bottom_px = bottom.data();
+#endif
+            if (!gpu.present({gfx::vulkan::TOP_W, gfx::vulkan::SCREEN_H, top_px},
+                             {gfx::vulkan::BOTTOM_W, gfx::vulkan::SCREEN_H, bottom_px}))
                 break;  // FIFO present paces the loop to vsync
         }
     }
 
+#ifdef DOT_HAVE_RECOMP
+    if (std::getenv("DOT_STATS")) std::printf("guest threads at exit:\n%s", hle::kernel::dump_threads().c_str());
+#endif
     SDL_DestroyWindow(window);
     SDL_Quit();
     hle::dsp::Shutdown();
-    return 0;
+    std::fflush(stdout);
+    // Guest threads may still be parked inside the kernel: skip static destructors.
+    std::_Exit(0);
 }

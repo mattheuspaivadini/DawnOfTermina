@@ -16,7 +16,9 @@
 
 #include "core/memory.h"
 
+#include <signal.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +26,21 @@
 namespace core {
 
 static constexpr u64 SPACE = 1ull << 32;
+static u8* g_fault_base = nullptr;
+
+// A fault inside the guest address space means recompiled code touched unmapped guest
+// memory: report the guest VA (async-signal-safe output only) and stop.
+static void on_fault(int sig, siginfo_t* info, void*) {
+    const u8* a = static_cast<const u8*>(info->si_addr);
+    if (g_fault_base && a >= g_fault_base && a < g_fault_base + SPACE) {
+        char msg[] = "guest: memory fault at guest VA 0x00000000 (unmapped page)\n";
+        u32 va = u32(a - g_fault_base);
+        for (int i = 0; i < 8; ++i) msg[41 - i] = "0123456789ABCDEF"[(va >> (i * 4)) & 0xF];
+        (void)!write(2, msg, sizeof msg - 1);
+    }
+    signal(sig, SIG_DFL);  // re-raise for a core dump / debugger
+    raise(sig);
+}
 
 static bool aligned(u32 addr, u32 size) {
     return addr % Memory::PAGE == 0 && size % Memory::PAGE == 0 && u64(addr) + size <= SPACE;
@@ -37,6 +54,13 @@ Memory::Memory() {
         std::abort();
     }
     base_ = static_cast<u8*>(p);
+    if (!g_fault_base) {
+        g_fault_base = base_;
+        struct sigaction sa = {};
+        sa.sa_sigaction = on_fault;
+        sa.sa_flags = SA_SIGINFO;
+        sigaction(SIGSEGV, &sa, nullptr);
+    }
     if (!map(VRAM_BASE, VRAM_SIZE) || !map(DSP_BASE, DSP_SIZE) || !map(CONFIG_MEM, PAGE) ||
         !map(SHARED_PAGE, PAGE) || !map(TLS_BASE, TLS_PAGES * PAGE)) {
         std::perror("mapping fixed 3DS regions");

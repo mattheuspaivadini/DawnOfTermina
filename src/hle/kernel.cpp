@@ -20,6 +20,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <memory>
@@ -49,6 +50,7 @@ std::string hex(u32 v) {
 
 struct Object {
     virtual ~Object() = default;
+    virtual std::string describe() const { return "object"; }
     virtual bool waitable() const { return false; }
     virtual bool ready(const Thread*) const { return false; }
     virtual void acquire(Thread*) {}
@@ -60,6 +62,7 @@ struct Event : Object {
     explicit Event(u32 r) : reset_type(r) {}
     bool waitable() const override { return true; }
     bool ready(const Thread*) const override { return signaled; }
+    std::string describe() const override { return std::string("event") + (signaled ? "(set)" : ""); }
     void acquire(Thread*) override {
         if (reset_type == 0) signaled = false;
     }
@@ -70,6 +73,7 @@ struct Mutex : Object {
     u32 count = 0;
     bool waitable() const override { return true; }
     bool ready(const Thread* t) const override { return !owner || owner == t; }
+    std::string describe() const override { return owner ? "mutex(locked)" : "mutex"; }
     void acquire(Thread* t) override { owner = t, ++count; }
 };
 
@@ -79,16 +83,23 @@ struct Semaphore : Object {
     bool waitable() const override { return true; }
     bool ready(const Thread*) const override { return count > 0; }
     void acquire(Thread*) override { --count; }
+    std::string describe() const override { return "semaphore(" + std::to_string(count) + ")"; }
 };
 
 struct AddressArbiter : Object {};
 struct ResourceLimit : Object {};
 struct Session : Object {
+    std::string describe() const override { return "session(" + service + ")"; }
     std::string service;
     ServiceHandler handler;  // per-session handler; empty = look the service up by name
     explicit Session(std::string s, ServiceHandler h = {}) : service(std::move(s)), handler(std::move(h)) {}
 };
 struct Process : Object {};
+struct MemoryBlock : Object {
+    u32 size, addr;
+    bool guest_owned;
+    MemoryBlock(u32 s, u32 a, bool g) : size(s), addr(a), guest_owned(g) {}
+};
 
 enum class State { Ready, Running, Waiting, Dead };
 
@@ -112,6 +123,7 @@ struct Thread : Object {
 
     bool waitable() const override { return true; }
     bool ready(const Thread*) const override { return state == State::Dead; }
+    std::string describe() const override { return "thread " + std::to_string(id); }
 };
 
 // ---------------------------------------------------------------- state
@@ -129,10 +141,24 @@ u32 g_next_thread_id = 1;
 std::optional<Status> g_status;
 thread_local Thread* t_self = nullptr;
 
+struct Periodic {
+    s64 period_ns;
+    Clock::time_point next;
+    std::function<void()> fn;
+};
+std::vector<Periodic> g_periodic;
+bool g_in_periodic = false;
+// Occupies the CPU while the host runs periodic callbacks so no guest thread starts.
+Thread* host_marker();
+
 constexpr u32 MAX_THREADS = core::Memory::TLS_PAGES * core::Memory::PAGE / core::Memory::TLS_SIZE;
 
 Handle add(std::shared_ptr<Object> obj) {
     const Handle h = g_next_handle++;
+    static const bool trace = std::getenv("DOT_TRACE_HANDLES");
+    if (trace)
+        std::fprintf(stderr, "kernel: handle %s = %s (thread %u, lr=%s)\n", hex(h).c_str(), obj->describe().c_str(),
+                     t_self ? t_self->id : 0, t_self ? hex(t_self->ctx.r[14]).c_str() : "-");
     g_handles[h] = std::move(obj);
     return h;
 }
@@ -163,7 +189,10 @@ void pick_next() {
 void make_ready(Thread* t) {
     t->state = State::Ready;
     if (!g_current) pick_next();
-    else if (t->priority < g_current->priority) g_preempt = true;
+    else if (t->priority < g_current->priority) {
+        g_preempt = true;
+        recomp::g_interrupt.store(1, std::memory_order_relaxed);  // reach a preemption point soon
+    }
 }
 
 // Completes a satisfiable wait (lock held). Returns true if the thread was woken.
@@ -284,9 +313,38 @@ std::shared_ptr<Thread> new_thread(u32 entry, u32 arg, u32 stack_top, s32 priori
     return t;
 }
 
+Thread* host_marker() {
+    static Thread marker;
+    marker.priority = 0x40;  // below every guest thread: any wake-up requests preemption
+    return &marker;
+}
+
+// Runs due periodic callbacks. Caller guarantees no guest thread is executing; called
+// without the kernel lock (callbacks use kernel functions).
+void run_due_periodic() {
+    std::vector<std::function<void()>> due;
+    {
+        std::lock_guard lk(g_lock);
+        if (g_in_periodic) return;
+        const auto now = Clock::now();
+        for (auto& p : g_periodic)
+            if (now >= p.next) {
+                due.push_back(p.fn);
+                p.next += std::chrono::nanoseconds(p.period_ns);
+                if (p.next < now) p.next = now + std::chrono::nanoseconds(p.period_ns);  // fell behind
+            }
+        if (due.empty()) return;
+        g_in_periodic = true;
+    }
+    for (auto& fn : due) fn();
+    std::lock_guard lk(g_lock);
+    g_in_periodic = false;
+}
+
 }  // namespace
 
 void init(core::Memory& mem) {
+    recomp::set_interrupt_handler(preemption_point);
     std::lock_guard lk(g_lock);
     g_mem = &mem;
     g_handles.clear();
@@ -345,6 +403,7 @@ void sleep_thread(s64 ns) {
 }
 
 void preemption_point() {
+    run_due_periodic();
     std::unique_lock lk(g_lock);
     if (g_preempt && t_self && g_current == t_self) {
         t_self->state = State::Ready;
@@ -377,6 +436,31 @@ Result set_thread_priority(Handle h, s32 priority) {
     for (auto& o : g_threads)
         if (o->state == State::Ready && o->priority < t_self->priority) g_preempt = true;
     return RESULT_OK;
+}
+
+std::string dump_threads() {
+    std::lock_guard lk(g_lock);
+    std::string out;
+    for (auto& t : g_threads) {
+        static const char* names[] = {"ready", "running", "waiting", "dead"};
+        char line[160];
+        std::snprintf(line, sizeof line, "  thread %u prio 0x%02X %-7s lr=0x%08X sp=0x%08X", t->id, t->priority,
+                      names[int(t->state)], t->ctx.r[14], t->ctx.r[13]);
+        out += line;
+        if (t->state == State::Waiting) {
+            if (t->arbiter_addr) out += " on arbiter address " + hex(t->arbiter_addr);
+            for (auto& o : t->wait_objects) {
+                std::string handle = "?";
+                for (auto& [h, obj] : g_handles)
+                    if (obj == o) handle = hex(h);
+                out += " " + o->describe() + "[" + handle + "]";
+            }
+            if (t->wait_objects.empty() && !t->arbiter_addr) out += " sleeping";
+            if (t->wait_all) out += " (all)";
+        }
+        out += "\n";
+    }
+    return out;
 }
 
 std::optional<Status> stopped() {
@@ -527,6 +611,71 @@ Result arbitrate_address(Handle arbiter, u32 addr, u32 type, s32 value, s64 time
     t_self->wait_objects.clear();
     t_self->arbiter_addr = addr;
     return block(lk, type >= 3 ? timeout_ns : -1);
+}
+
+// ---------------------------------------------------------------- shared memory
+
+Handle create_shared_memory(u32 size) {
+    std::lock_guard lk(g_lock);
+    return add(std::make_shared<MemoryBlock>(size, 0, false));
+}
+
+SharedMemoryInfo shared_memory(Handle h) {
+    std::lock_guard lk(g_lock);
+    auto* b = get_as<MemoryBlock>(h);
+    return b ? SharedMemoryInfo{b->size, b->addr} : SharedMemoryInfo{0, 0};
+}
+
+Result create_memory_block(u32 addr, u32 size, Handle* out) {
+    std::lock_guard lk(g_lock);
+    if (addr == 0) throw Unimplemented("svcCreateMemoryBlock with address 0 (kernel-allocated block)");
+    *out = add(std::make_shared<MemoryBlock>(size, addr, true));
+    return RESULT_OK;
+}
+
+Result map_memory_block(Handle h, u32 addr) {
+    std::lock_guard lk(g_lock);
+    if (std::getenv("DOT_TRACE_HANDLES"))
+        std::fprintf(stderr, "kernel: map memory block %s at %s\n", hex(h).c_str(), hex(addr).c_str());
+    auto* b = get_as<MemoryBlock>(h);
+    if (!b) return ERR_INVALID_HANDLE;
+    if (b->guest_owned) return RESULT_OK;  // the guest already has it at b->addr
+    const u32 size = (b->size + core::Memory::PAGE - 1) & ~(core::Memory::PAGE - 1);
+    if (!g_mem->map(addr, size)) throw Unimplemented("svcMapMemoryBlock at " + hex(addr) + " failed");
+    b->addr = addr;
+    return RESULT_OK;
+}
+
+Result unmap_memory_block(Handle h, u32 addr) {
+    std::lock_guard lk(g_lock);
+    auto* b = get_as<MemoryBlock>(h);
+    if (!b) return ERR_INVALID_HANDLE;
+    if (!b->guest_owned && b->addr == addr) b->addr = 0;  // pages stay mapped: the guest may still touch them
+    return RESULT_OK;
+}
+
+// ---------------------------------------------------------------- periodic work
+
+void add_periodic(s64 period_ns, std::function<void()> fn) {
+    std::lock_guard lk(g_lock);
+    g_periodic.push_back({period_ns, Clock::now() + std::chrono::nanoseconds(period_ns), std::move(fn)});
+}
+
+void host_tick() {
+    {
+        std::lock_guard lk(g_lock);
+        if (g_status) return;
+        if (g_current) {  // a guest thread is busy: have it stop at its next loop back-edge
+            const auto now = Clock::now();
+            for (auto& p : g_periodic)
+                if (now >= p.next) recomp::g_interrupt.store(1, std::memory_order_relaxed);
+            return;
+        }
+        g_current = host_marker();
+    }
+    run_due_periodic();
+    std::lock_guard lk(g_lock);
+    if (g_current == host_marker()) pick_next();
 }
 
 // ---------------------------------------------------------------- resource limits

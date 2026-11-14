@@ -18,14 +18,19 @@
 
 #include <filesystem>
 
+#include "core/memory.h"
+
 // Registers every HLE'd system service with hle::kernel.
 namespace hle::service {
 
-void register_all(const std::filesystem::path& game_data);
+void register_all(core::Memory& mem, const std::filesystem::path& game_data);
 
 void register_apt();
 void register_misc();
 void register_cfg();
+void register_gsp(core::Memory& mem);
+void register_hid(core::Memory& mem);
+void register_dsp(core::Memory& mem);
 void register_fs(const std::filesystem::path& game_data);
 
 }  // namespace hle::service

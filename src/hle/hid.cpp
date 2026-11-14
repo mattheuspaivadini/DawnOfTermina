@@ -19,6 +19,7 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <mutex>
 #include <utility>
 
 namespace hle::hid {
@@ -42,6 +43,7 @@ static constexpr std::pair<SDL_GamepadButton, u32> PAD[] = {
     {SDL_GAMEPAD_BUTTON_DPAD_LEFT, DLEFT}, {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, DRIGHT},
 };
 
+static std::mutex state_lock;  // Update() runs on the host main thread, readers on guest threads
 static PadStatus state;
 static SDL_Gamepad* gamepad = nullptr;
 
@@ -90,10 +92,14 @@ void Update() {
         x += axis(SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFTX));
         y -= axis(SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFTY));  // SDL Y grows downward
     }
+    std::lock_guard lk(state_lock);
     state = next_pad(state, buttons, s16(std::clamp(x, -int(CPAD_MAX), int(CPAD_MAX))),
                      s16(std::clamp(y, -int(CPAD_MAX), int(CPAD_MAX))));
 }
 
-PadStatus ReadPad() { return state; }
+PadStatus ReadPad() {
+    std::lock_guard lk(state_lock);
+    return state;
+}
 
 }  // namespace hle::hid

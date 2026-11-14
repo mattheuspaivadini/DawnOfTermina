@@ -64,6 +64,19 @@ public:
 
     static constexpr u32 tls(u32 thread_index) { return TLS_BASE + thread_index * TLS_SIZE; }
 
+    // Physical <-> virtual for GPU-visible memory (Old 3DS): VRAM and the linear heap.
+    static constexpr u32 VRAM_PA = 0x18000000, FCRAM_PA = 0x20000000;
+    static constexpr u32 pa_to_va(u32 pa) {
+        if (pa - VRAM_PA < VRAM_SIZE) return VRAM_BASE + (pa - VRAM_PA);
+        if (pa - FCRAM_PA < FCRAM_SIZE) return LINEAR_BASE + (pa - FCRAM_PA);
+        return 0;
+    }
+    static constexpr u32 va_to_pa(u32 va) {
+        if (va - VRAM_BASE < VRAM_SIZE) return VRAM_PA + (va - VRAM_BASE);
+        if (va - LINEAR_BASE < FCRAM_SIZE) return FCRAM_PA + (va - LINEAR_BASE);
+        return 0;
+    }
+
 private:
     u8* base_ = nullptr;
 };

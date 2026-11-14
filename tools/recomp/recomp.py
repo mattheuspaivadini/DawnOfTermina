@@ -64,6 +64,7 @@ class Recompiler:
         self.cache = {}
         self.entries = set()  # keys: address | 1 for Thumb
         self.seen = set()
+        self.branch_targets = set()  # keys reached by direct B: possible tail-called functions
         self.adr_pointers = []  # ADR results, vetted after the walk like data candidates
 
     def decode(self, addr, is_thumb):
@@ -83,9 +84,10 @@ class Recompiler:
             return False
         return self.decode(addr, t).kind != "trap"
 
-    def plausible_walk(self, key, limit=256):
+    def plausible_walk(self, key, limit=512):
         """Stronger check for candidates found in data: following control flow from `key`
-        must reach a return/jump within `limit` instructions without hitting a trap."""
+        must decode cleanly (no trap, no exit from .text) until it reaches a return/jump or
+        `limit` instructions have been decoded (long functions)."""
         if not self.plausible(key):
             return False
         t = bool(key & 1)
@@ -104,7 +106,7 @@ class Recompiler:
             if insn.kind in ("ret", "jump") and insn.cond == AL:
                 return True
             stack += self.successors(insn, local_only=False)
-        return not stack  # every path ended (e.g. only tail calls), nothing undecodable
+        return True  # every path ended (e.g. only tail calls) or the budget ran out cleanly
 
     def jump_table(self, insn):
         """Case targets of the two ARMCC switch idioms, bounded by an earlier `cmp rX, #N`:
@@ -115,7 +117,7 @@ class Recompiler:
             if insn.thumb or insn.cond not in (3, 9):  # LO: N cases, LS: N + 1 cases
                 continue
             bound = None
-            for back in range(1, 7):
+            for back in range(1, 17):  # the compiler interleaves independent instructions
                 p = insn.addr - 4 * back
                 if not self.image.in_text(p):
                     break
@@ -123,11 +125,22 @@ class Recompiler:
                 if prev.switch_cmp and prev.switch_cmp[0] == rm:
                     bound = prev.switch_cmp[1]
                     break
-                if prev.kind != "normal":
+                # anything that changes control flow, the flags or the index ends the search
+                if prev.kind != "normal" or "c->z =" in prev.code or "_flags(" in prev.code or \
+                        f"c->r[{rm}] =" in prev.code:
                     break
-            if bound is None or bound >= 4096:
-                continue
-            count = bound + 1 if insn.cond == 9 else bound
+            if bound is not None and bound < 4096:
+                count = bound + 1 if insn.cond == 9 else bound
+            else:  # no usable cmp (e.g. it sits before a literal pool): scan the table itself
+                count = 0
+                while count < 1024 and self.image.in_text(pc + 4 * count):
+                    word = self.image.read32(pc + 4 * count)
+                    if kind == "table" and (word & 0xFF000000) != 0xEA000000:
+                        break  # branch slots: unconditional B
+                    if kind == "abs_table" and (not self.image.in_text(word) or word & 3 or
+                                                abs(word - pc) > 0x100000):
+                        break  # absolute slots: nearby, aligned code addresses
+                    count += 1
             if kind == "table":
                 out += [pc + 4 * k for k in range(count)]
             else:  # abs_table: words at pc
@@ -172,6 +185,8 @@ class Recompiler:
                 for s in self.successors(insn, local_only=False):
                     stack.append(s)
                 new = []
+                if insn.kind == "branch":
+                    self.branch_targets.add(insn.target)
                 if insn.kind == "call" or (insn.kind == "branch" and bool(insn.target & 1) != t):
                     new.append(insn.target)
                 if insn.literal is not None:
@@ -190,8 +205,10 @@ class Recompiler:
         a, t = v & ~1, bool(v & 1)
         if v in self.entries or not self.image.in_text(a):
             return False
-        if (a, t) in self.seen or (a, not t) in self.seen:
-            return False  # lands inside code already decoded: not a function start
+        if (a, not t) in self.seen:
+            return False  # decoded in the other mode: not a function start
+        if (a, t) in self.seen and v not in self.branch_targets:
+            return False  # inside code already decoded (tail-call targets excepted)
         if (a - 2, True) in self.seen and self.decode(a - 2, True).size == 4:
             return False  # second half of a Thumb BL/BLX pair
         return self.plausible_walk(v)
@@ -289,6 +306,8 @@ class Recompiler:
         if k == "branch":
             if insn.target & ~1 in by_addr and bool(insn.target & 1) == insn.thumb and \
                     (insn.target not in self.entries or insn.target == self.current):
+                if insn.target & ~1 <= insn.addr:  # loop back-edge: let pending interrupts in
+                    return f"RECOMP_CHECK_INTERRUPT(); goto L_{insn.target & ~1:08X};"
                 return f"goto L_{insn.target & ~1:08X};"
             if insn.target in self.entries:
                 return f"return {self.name(insn.target)}(c);"

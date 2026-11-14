@@ -65,6 +65,8 @@ struct Status {
     std::string error;  // non-empty if the guest hit something unimplemented
 };
 std::optional<Status> stopped();
+// Human-readable state of every guest thread and what it waits on (diagnostics).
+std::string dump_threads();
 // Records a fatal error raised on a guest thread and stops scheduling.
 void fail(const std::string& message);
 
@@ -82,6 +84,24 @@ Result duplicate_handle(Handle h, Handle* out);
 Result wait_synchronization(Handle h, s64 timeout_ns);
 Result wait_synchronization_n(const u32* handles, u32 count, bool wait_all, s64 timeout_ns, s32* index);
 Result arbitrate_address(Handle arbiter, u32 addr, u32 type, s32 value, s64 timeout_ns);
+
+// ---- shared memory
+// A block owned by an HLE service; `addr` is 0 until the guest maps it.
+struct SharedMemoryInfo {
+    u32 size;
+    u32 addr;
+};
+Handle create_shared_memory(u32 size);
+SharedMemoryInfo shared_memory(Handle h);  // {0, 0} if not a memory block
+Result create_memory_block(u32 addr, u32 size, Handle* out);  // svc 0x1E (guest-owned memory)
+Result map_memory_block(Handle h, u32 addr);                  // svc 0x1F
+Result unmap_memory_block(Handle h, u32 addr);                // svc 0x20
+
+// ---- host-driven periodic work (VBlank, ...)
+// Callbacks run with guest execution excluded: from the host main loop while no guest
+// thread is running (host_tick), or from the current guest thread at a syscall.
+void add_periodic(s64 period_ns, std::function<void()> fn);
+void host_tick();
 
 // ---- resource limits (process commit accounting lives in hle::svc)
 Result get_resource_limit(Handle process, Handle* out);

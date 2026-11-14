@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -60,6 +61,17 @@ struct Trap : std::runtime_error {
 void set_memory(u8* guest_base);
 void set_svc_memory(core::Memory& mem);
 void set_function_table(const FuncEntry* table, u32 count);  // sorted by key
+
+// ---- asynchronous interrupts
+// Set by the host when a guest thread should stop at the next loop back-edge (pending
+// VBlank etc.); recompiled code checks it on every backward branch.
+extern std::atomic<u32> g_interrupt;
+void set_interrupt_handler(void (*handler)());
+void service_interrupt();
+#define RECOMP_CHECK_INTERRUPT() \
+    do { \
+        if (recomp::g_interrupt.load(std::memory_order_relaxed)) recomp::service_interrupt(); \
+    } while (0)
 
 // ---- control flow
 u32 call(Context* c, u32 target);  // indirect call / tail jump through the table

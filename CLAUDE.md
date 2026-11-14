@@ -137,5 +137,5 @@ python3 tools/extract_cia.py "ISO/The Legend of Zelda Majora's Mask 3D (USA).cia
 | 4 | Vulkan + tradutor PICA200 | 🟡 | **4a ✅** contexto Vulkan, apresentação, texturas, command processor. **4b parte 1 ✅** SHBIN, VS→GLSL→SPIR-V, TEV→fragment shader. **4b parte 2 ⏳** GSP, vertex fetch, pipelines de draw |
 | 5 | Entry point / `nnMain` | ✅ | crt0 transcrito até a fronteira `0x0011BECC`; srv/svc/err em HLE; 29 símbolos nomeados |
 | 6 | Recompilador estático ARM11 → C++ | ✅ | 16 mil funções compilam; boot recompilado roda o init do SDK até `svcCreateThread`; HLE do kernel por syscall/IPC |
-| 7 | Threads do guest + serviços IPC (fs, apt, gsp, hid…) até o primeiro frame | ⏳ | |
+| 7 | Threads do guest + serviços IPC até o primeiro frame | 🟡 | Threads/scheduler com preempção em back-edges; APT, ndm, fs (RomFS via `romfs.bin` a partir do nível 3 da IVFC, saves em `saves/`), cfg, gsp (VBlank, fila GX, DisplayTransfer, apresentação), hid, dsp (placa de som muda). O jogo roda o loop de render sem parar (~600 command lists/s). **Falta:** rasterizar draws PICA (Etapa 4b parte 2) — os frames ainda não mostram geometria; toque; áudio real. Diagnóstico: `DOT_STATS=1`, `DOT_TRACE_HANDLES=1`, handler de SIGSEGV com VA do guest |
 | 8+ | Subsistemas do jogo | ⏳ | |

@@ -75,6 +75,14 @@ void svc(Context* c, u32 imm) {
     case 0x17: r[1] = k::create_event(r[1]), r[0] = RESULT_OK; return;
     case 0x18: r[0] = k::signal_event(r[0]); return;
     case 0x19: r[0] = k::clear_event(r[0]); return;
+    case 0x1E: {  // CreateMemoryBlock(other perm r0, addr r1, size r2, my perm r3) -> r1 handle
+        Handle h = 0;
+        r[0] = k::create_memory_block(r[1], r[2], &h);
+        r[1] = h;
+        return;
+    }
+    case 0x1F: r[0] = k::map_memory_block(r[0], r[1]); return;
+    case 0x20: r[0] = k::unmap_memory_block(r[0], r[1]); return;
     case 0x21: r[1] = k::create_address_arbiter(), r[0] = RESULT_OK; return;
     case 0x22: r[0] = k::arbitrate_address(r[0], r[1], r[2], s32(r[3]), ns64(r[4], r[5])); return;
     case 0x23: r[0] = k::close_handle(r[0]); return;

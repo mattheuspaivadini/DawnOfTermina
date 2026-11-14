@@ -67,7 +67,7 @@ Cada função transcrita mantém o endereço virtual original em comentário (`/
 | 4 | Backend Vulkan e tradutor PICA200 | 🟡 apresentação, texturas, command lists e tradução de shaders (VS e TEV → SPIR-V) prontas; GSP e pipeline de draw em aberto |
 | 5 | Entry point (`_start` / `nnMain`) | ✅ boot do crt0 transcrito até a fronteira atual |
 | 6 | Recompilador estático automático ARM11 → C++ | ✅ boot do SDK roda recompilado até a criação de threads |
-| 7 | Threads do guest e serviços do sistema até o primeiro frame | ⏳ |
+| 7 | Threads do guest e serviços do sistema até o primeiro frame | 🟡 jogo roda o loop de renderização; falta rasterizar a geometria |
 | 8+ | Subsistemas do jogo (cenas, loop, áudio, colisão, atores, HUD) | ⏳ |
 
 ## Licença

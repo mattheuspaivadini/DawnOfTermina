@@ -23,6 +23,15 @@
 namespace recomp {
 
 u8* g_base = nullptr;
+std::atomic<u32> g_interrupt{0};
+static void (*g_interrupt_handler)() = nullptr;
+
+void set_interrupt_handler(void (*handler)()) { g_interrupt_handler = handler; }
+
+void service_interrupt() {
+    g_interrupt.store(0, std::memory_order_relaxed);
+    if (g_interrupt_handler) g_interrupt_handler();
+}
 static const FuncEntry* g_table = nullptr;
 static u32 g_count = 0;
 

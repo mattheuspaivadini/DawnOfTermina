@@ -32,6 +32,9 @@ add_library(dot_runtime STATIC
     src/hle/service/misc.cpp
     src/hle/service/fs.cpp
     src/hle/service/cfg.cpp
+    src/hle/service/gsp.cpp
+    src/hle/service/hid.cpp
+    src/hle/service/dsp.cpp
     src/recomp/runtime.cpp
     src/recomp/svc.cpp
 )

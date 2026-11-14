@@ -25,6 +25,7 @@
 #include <mutex>
 #include <utility>
 
+#include "gfx/layout.h"
 #include "hle/service/gsp.h"
 
 namespace hle::hid {
@@ -110,9 +111,10 @@ bool Initialize() {
 }
 
 bool window_to_touch(float wx, float wy, int win_w, int win_h, u16& tx, u16& ty) {
-    const float s = std::min(win_w / 400.0f, win_h / 480.0f);
-    if (s <= 0) return false;
-    const float x = (wx - (win_w - 400 * s) / 2) / s - 40, y = (wy - (win_h - 480 * s) / 2) / s - 240;
+    gfx::Rect top, bottom;
+    gfx::screen_layout(float(win_w), float(win_h), top, bottom);
+    if (bottom.w <= 0 || bottom.h <= 0) return false;
+    const float x = (wx - bottom.x) / bottom.w * 320, y = (wy - bottom.y) / bottom.h * 240;
     if (x < 0 || y < 0 || x >= 320 || y >= 240) return false;
     tx = u16(x), ty = u16(y);
     return true;

@@ -1,5 +1,7 @@
 #include "gfx/vulkan/context.h"
 
+#include "gfx/layout.h"
+
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 
@@ -349,14 +351,16 @@ bool Context::present(const ScreenImage& top, const ScreenImage& bottom, const G
     image_barrier(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                   VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
 
-    // 400x480 virtual canvas: top screen above, bottom screen centred below.
-    const float s = std::min(extent_.width / 400.0f, extent_.height / 480.0f);
-    const s32 ox = s32((extent_.width - 400 * s) / 2), oy = s32((extent_.height - 480 * s) / 2);
-    const s32 dst[2][4] = {
-        {ox, oy, ox + s32(400 * s), oy + s32(240 * s)},
-        {ox + s32(40 * s), oy + s32(240 * s), ox + s32(360 * s), oy + s32(480 * s)},
-    };
+    // A widened top screen image (renderer widescreen) switches to the widescreen layout.
+    g_top_width = gpu_top ? 240.0f * float(gpu_top->width) / float(gpu_top->height) : 400.0f;
+    Rect rects[2];
+    screen_layout(float(extent_.width), float(extent_.height), rects[0], rects[1]);
+    s32 dst[2][4];
+    for (int i = 0; i < 2; ++i)
+        dst[i][0] = s32(rects[i].x), dst[i][1] = s32(rects[i].y), dst[i][2] = s32(rects[i].x + rects[i].w),
+        dst[i][3] = s32(rects[i].y + rects[i].h);
     for (int i = 0; i < 2; ++i) {
+        if (dst[i][2] <= dst[i][0] || dst[i][3] <= dst[i][1]) continue;  // hidden overlay
         const GpuScreen* g = gpu_screens[i];
         VkImageBlit blit{};
         blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};

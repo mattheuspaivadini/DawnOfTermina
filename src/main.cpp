@@ -34,6 +34,7 @@
 #include "gfx/pica/texture.h"
 #include "gfx/vulkan/context.h"
 #include "gfx/vulkan/renderer.h"
+#include "gfx/layout.h"
 #include "hle/dsp.h"
 #include "hle/fs.h"
 #include "hle/hid.h"
@@ -135,7 +136,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     // Top screen 400x240 stacked over the 320x240 bottom screen, 2x scale.
-    SDL_Window* window = SDL_CreateWindow("DawnOfTermina", 800, 960, SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
+    // DOT_WINDOW=<w>x<h> picks the initial window size (e.g. 1920x1080 with DOT_WIDESCREEN=window).
+    int win_w = 800, win_h = 960;
+    if (const char* e = std::getenv("DOT_WINDOW")) std::sscanf(e, "%dx%d", &win_w, &win_h);
+    SDL_Window* window = SDL_CreateWindow("DawnOfTermina", std::max(win_w, 160), std::max(win_h, 120),
+                                          SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
     if (!window) {
         std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
         return 1;
@@ -170,6 +175,10 @@ int main(int argc, char** argv) {
         for (bool running = true; running;) {
             for (SDL_Event e; SDL_PollEvent(&e);)
                 if (e.type == SDL_EVENT_QUIT) running = false;
+                else if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_TAB && !e.key.repeat)
+                    gfx::g_show_bottom = !gfx::g_show_bottom;  // widescreen layout: bottom screen overlay
+                else if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_F11 && !e.key.repeat)
+                    SDL_SetWindowFullscreen(window, !(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN));
 #ifdef DOT_HAVE_RECOMP
             if (auto st = reported ? std::nullopt : hle::kernel::stopped()) {
                 reported = true;

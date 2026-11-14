@@ -303,7 +303,7 @@ void run() {
             }
         // PICA window depth = z/w * scale + offset (depth.x/.y from regs 0x4D/0x4E); Vulkan's
         // depth range is the identity, so pre-multiply by w.
-        out += R"(    gl_Position = vec4(pos.x, pos.y, pos.z * u.depth.x + pos.w * u.depth.y, pos.w);
+        out += R"(    gl_Position = vec4(pos.x, pos.y * u.depth.z, pos.z * u.depth.x + pos.w * u.depth.y, pos.w);
     primary_color = min(abs(col), vec4(1.0));
     texcoord0 = t0;
     texcoord1 = t1;

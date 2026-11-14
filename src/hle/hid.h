@@ -42,8 +42,8 @@ struct PadStatus {
     u16 touch_x = 0, touch_y = 0;  // digitizer coordinates, 0..319 x 0..239, origin top-left
 };
 
-// Maps a window point to the bottom screen of the 400x480 canvas that gfx::vulkan::Context
-// presents (same fit-and-centre layout). False if the point is outside the bottom screen.
+// Maps a window point to the bottom screen as gfx::screen_layout places it (the layout
+// Context::present uses). False if the point is outside the bottom screen.
 bool window_to_touch(float wx, float wy, int win_w, int win_h, u16& tx, u16& ty);
 
 // Pure state step: derives trigger/release and the CPAD_* direction bits.

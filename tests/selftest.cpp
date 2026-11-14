@@ -27,6 +27,7 @@
 #include "game/crt0.h"
 #include "game/guest.h"
 #include "hle/fs.h"
+#include "gfx/layout.h"
 #include "hle/hid.h"
 #include "hle/svc.h"
 
@@ -92,6 +93,14 @@ static void test_hid() {
     assert(window_to_touch(719.9f, 959.9f, 800, 960, tx, ty) && tx == 319 && ty == 239);
     assert(!window_to_touch(79, 600, 800, 960, tx, ty) && !window_to_touch(400, 479, 800, 960, tx, ty));
     assert(window_to_touch(200 + 80, 480, 1200, 960, tx, ty) && tx == 0);  // pillarboxed by 200px
+    // Widescreen layout (16:9 top screen filling 1920x1080): bottom overlay 432x324 at (1488, 756).
+    gfx::g_top_width = 240.0f * 16 / 9;
+    assert(window_to_touch(1488, 756, 1920, 1080, tx, ty) && tx == 0 && ty == 0);
+    assert(window_to_touch(1919.9f, 1079.9f, 1920, 1080, tx, ty) && tx == 319 && ty == 239);
+    assert(!window_to_touch(1400, 900, 1920, 1080, tx, ty));
+    gfx::g_show_bottom = false;
+    assert(!window_to_touch(1700, 900, 1920, 1080, tx, ty));
+    gfx::g_show_bottom = true, gfx::g_top_width = 400.0f;
 
     std::vector<ScriptEvent> ev;
     assert(parse_input_script("20:START,21.5:A,30:T160x120", ev) && ev.size() == 3);

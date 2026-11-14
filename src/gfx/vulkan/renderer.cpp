@@ -18,12 +18,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <mutex>
 #include <span>
 #include <string>
@@ -92,8 +94,8 @@ layout(location = 4) out float texcoord0_w;
 layout(location = 5) out vec4 normquat;
 layout(location = 6) out vec3 view;
 void main() {
-    // PICA window depth = z/w * scale + offset; pre-multiplied by w for Vulkan.
-    gl_Position = vec4(in_pos.x, in_pos.y, in_pos.z * u.depth.x + in_pos.w * u.depth.y, in_pos.w);
+    // PICA window depth = z/w * scale + offset; pre-multiplied by w for Vulkan. depth.z: widescreen.
+    gl_Position = vec4(in_pos.x, in_pos.y * u.depth.z, in_pos.z * u.depth.x + in_pos.w * u.depth.y, in_pos.w);
     primary_color = min(abs(in_color), vec4(1.0));
     texcoord0 = in_uv01.xy;
     texcoord1 = in_uv01.zw;
@@ -125,16 +127,18 @@ u64 hash_ram(const u8* p, size_t n) {
 }
 
 // DisplayTransfer on the GPU: colour surface -> screen-oriented image (framebuffer rows are
-// screen columns, bottom to top). a = {flip, x downscale shift, y downscale shift, source height}.
+// screen columns, bottom to top). a = {flip, x downscale shift, y downscale shift, source height},
+// b.x = source rows per output column (> 1 when a widened surface feeds a normal-width screen).
 constexpr const char* TRANSFER_CS = R"(#version 450
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform sampler2D src;
 layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
-layout(push_constant) uniform P { ivec4 a; } p;
+layout(push_constant) uniform P { ivec4 a; vec4 b; } p;
 void main() {
     const ivec2 o = ivec2(gl_GlobalInvocationID.xy), size = imageSize(dst);
     if (o.x >= size.x || o.y >= size.y) return;
-    const int row = p.a.x != 0 ? size.x - 1 - o.x : o.x;  // output framebuffer row = screen column
+    const int x = p.a.x != 0 ? size.x - 1 - o.x : o.x;  // output framebuffer row = screen column
+    const int row = int((float(x) + 0.5) * p.b.x);
     const int col = (size.y - 1 - o.y) << p.a.y;
     const int mem_row = row << p.a.z;                      // colour buffers are bottom-up
     const int nx = 1 << p.a.y, ny = 1 << p.a.z;
@@ -206,12 +210,14 @@ struct Renderer::Impl {
     // tracking layouts; barriers only order memory.
     struct Surface {
         u32 va = 0, width = 0, height = 0, format = 0;  // guest size and PICA colour format
+        u32 image_h = 0;  // image rows: height * scale, times the widescreen factor for the top screen
         Image color;
+        float sy() const { return float(image_h) / float(height); }  // image rows per guest row
         bool gpu_newer = false;  // drawn to since guest memory was last in sync
         u64 ram_hash = 0;        // guest memory when it was last in sync
     };
     struct Depth {
-        u32 width = 0, height = 0;
+        u32 width = 0, height = 0, image_h = 0;
         Image image;
     };
     struct Display {  // DisplayTransfer output, screen-oriented, scaled
@@ -250,6 +256,10 @@ struct Renderer::Impl {
     std::map<u32, Display> displays;              // by output VA
     std::map<u32, Image> scratch;                 // guest-size staging images, by width << 16 | height
     Surface* cur = nullptr;                       // current render target
+    // Widescreen: the colour buffers that feed the top screen get W times more rows (rows are
+    // the screen's horizontal axis). DOT_WIDESCREEN=<w>:<h> or "window" (follows the window).
+    float wide_aspect = 0;  // top screen aspect; 0 = off, < 0 = window
+    std::set<u32> wide_vas;
     u32 cur_depth = 0;
     VkDescriptorSetLayout xfer_set_layout = VK_NULL_HANDLE;
     VkPipelineLayout xfer_layout = VK_NULL_HANDLE;
@@ -550,7 +560,7 @@ struct Renderer::Impl {
             {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
         li.bindingCount = 2, li.pBindings = xb;
         vkCreateDescriptorSetLayout(dev, &li, nullptr, &xfer_set_layout);
-        const VkPushConstantRange xpush{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+        const VkPushConstantRange xpush{VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
         pli.setLayoutCount = 1, pli.pSetLayouts = &xfer_set_layout;
         pli.pushConstantRangeCount = 1, pli.pPushConstantRanges = &xpush;
         vkCreatePipelineLayout(dev, &pli, nullptr, &xfer_layout);
@@ -563,13 +573,20 @@ struct Renderer::Impl {
             return false;
 
         // Resolution scale: DOT_RES_SCALE=<1..8> or "native" (the window's size at startup).
+        if (const char* e = std::getenv("DOT_WIDESCREEN")) {
+            float aw = 0, ah = 0;
+            if (std::string(e) == "window") wide_aspect = -1;
+            else if (std::sscanf(e, "%f:%f", &aw, &ah) == 2 && aw > 0 && ah > 0) wide_aspect = aw / ah;
+        }
         if (const char* e = std::getenv("DOT_RES_SCALE")) {
-            if (std::string(e) == "native") {
+            if (std::string(e) == "native") {  // the top screen fills the window height in widescreen
                 const VkExtent2D ext = ctx.extent();
-                scale = std::max(1u, std::min(ext.width / 400, ext.height / 480));
+                scale = wide_aspect != 0 ? std::max(1u, ext.height / 240)
+                                         : std::max(1u, std::min(ext.width / 400, ext.height / 480));
             } else {
                 scale = u32(std::clamp(std::atoi(e), 1, 8));
             }
+            scale = std::min(scale, 8u);
         }
         anisotropy = scale > 1 ? std::min(16.0f, ctx.max_anisotropy()) : 0.0f;
         std::printf("renderer: resolution scale %ux%s\n", scale, anisotropy > 1 ? ", anisotropic filtering" : "");
@@ -671,6 +688,16 @@ struct Renderer::Impl {
             }
     }
 
+    // Horizontal widening of the top screen relative to 5:3 (1 = off).
+    float widescreen() const {
+        float a = wide_aspect;
+        if (a < 0) {
+            const VkExtent2D e = ctx.extent();
+            a = e.width && e.height ? float(e.width) / float(e.height) : 0;
+        }
+        return std::clamp(a * 3.0f / 5.0f, 1.0f, 4.0f);
+    }
+
     u32 guest_bytes(const Surface& sf) const { return sf.width * sf.height * pica::pixel::bytes_per_pixel(sf.format); }
     u64 ram_hash(const Memory& mem, const Surface& sf) const { return hash_ram(mem.host(sf.va), guest_bytes(sf)); }
 
@@ -722,7 +749,7 @@ struct Renderer::Impl {
         copy.imageExtent = {sf.width, sf.height, 1};
         vkCmdCopyBufferToImage(cmd, xfer.buf, tmp.img, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
         memory_barrier();
-        blit(tmp.img, sf.width, sf.height, sf.color.img, sf.width * scale, sf.height * scale, VK_FILTER_NEAREST);
+        blit(tmp.img, sf.width, sf.height, sf.color.img, sf.width * scale, sf.image_h, VK_FILTER_NEAREST);
         memory_barrier();
         sf.ram_hash = ram_hash(mem, sf);
         sf.gpu_newer = false;
@@ -740,7 +767,7 @@ struct Renderer::Impl {
         begin();
         const VkDeviceSize off = take(x_used, bytes);
         memory_barrier();
-        blit(sf.color.img, sf.width * scale, sf.height * scale, tmp.img, sf.width, sf.height, VK_FILTER_LINEAR);
+        blit(sf.color.img, sf.width * scale, sf.image_h, tmp.img, sf.width, sf.height, VK_FILTER_LINEAR);
         memory_barrier();
         VkBufferImageCopy copy{};
         copy.bufferOffset = off;
@@ -779,8 +806,10 @@ struct Renderer::Impl {
     // The cached surface for a colour buffer: created (from guest memory) on first use,
     // re-uploaded when guest memory changed behind the GPU's back.
     Surface& surface(Memory& mem, u32 va, u32 w, u32 h, u32 fmt) {
+        const u32 image_h = wide_vas.count(va) ? u32(std::lround(h * scale * widescreen())) : h * scale;
         auto it = surfaces.find(va);
-        if (it != surfaces.end() && (it->second.width != w || it->second.height != h || it->second.format != fmt)) {
+        if (it != surfaces.end() && (it->second.width != w || it->second.height != h || it->second.format != fmt ||
+                                     it->second.image_h != image_h)) {
             if (std::getenv("DOT_TRACE_FB"))
                 std::fprintf(stderr, "renderer: surface %08X %ux%u fmt %u reused as %ux%u fmt %u\n", va, it->second.width,
                              it->second.height, it->second.format, w, h, fmt);
@@ -794,9 +823,9 @@ struct Renderer::Impl {
         }
         Surface& sf = surfaces[va];
         if (!sf.color.img) {
-            sf.va = va, sf.width = w, sf.height = h, sf.format = fmt;
+            sf.va = va, sf.width = w, sf.height = h, sf.format = fmt, sf.image_h = image_h;
             if (std::getenv("DOT_TRACE_FB")) std::fprintf(stderr, "renderer: new surface %08X %ux%u fmt %u\n", va, w, h, fmt);
-            sf.color = make_general(w * scale, h * scale, VK_FORMAT_R8G8B8A8_UNORM,
+            sf.color = make_general(w * scale, image_h, VK_FORMAT_R8G8B8A8_UNORM,
                                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                     VK_IMAGE_ASPECT_COLOR_BIT);
@@ -818,16 +847,16 @@ struct Renderer::Impl {
         memory_barrier();
     }
 
-    Depth& depth_buffer(u32 va, u32 w, u32 h) {
+    Depth& depth_buffer(u32 va, u32 w, u32 h, u32 image_h) {
         Depth& d = depths[va];
-        if (d.image.img && (d.width != w || d.height != h)) {
+        if (d.image.img && (d.width != w || d.height != h || d.image_h != image_h)) {
             submit_and_wait();
             forget_framebuffers(~0u, va);
             destroy(d.image);
         }
         if (!d.image.img) {
-            d.width = w, d.height = h;
-            d.image = make_general(w * scale, h * scale, depth_format,
+            d.width = w, d.height = h, d.image_h = image_h;
+            d.image = make_general(w * scale, image_h, depth_format,
                                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, DS_ASPECT);
             clear_depth(d.image, va);
         }
@@ -837,13 +866,13 @@ struct Renderer::Impl {
     VkFramebuffer framebuffer(Surface& sf, u32 depth_va) {
         VkFramebuffer& fb = framebuffers[u64(sf.va) << 32 | depth_va];
         if (fb) return fb;
-        Depth& d = depth_buffer(depth_va, sf.width, sf.height);
+        Depth& d = depth_buffer(depth_va, sf.width, sf.height, sf.image_h);
         VkImageView views[2] = {sf.color.view, d.image.view};
         VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
         fi.renderPass = render_pass;
         fi.attachmentCount = 2;
         fi.pAttachments = views;
-        fi.width = sf.width * scale, fi.height = sf.height * scale, fi.layers = 1;
+        fi.width = sf.width * scale, fi.height = sf.image_h, fi.layers = 1;
         vkCreateFramebuffer(dev, &fi, nullptr, &fb);
         return fb;
     }
@@ -855,11 +884,11 @@ struct Renderer::Impl {
         const u32 fmt = regs[COLOR_FORMAT] >> 16 & 7;
         if (!color_va || !w || fmt > 4) return false;
         if (cur && cur->va == color_va && cur_depth == depth_va && cur->width == w && cur->height == h &&
-            cur->format == fmt)
+            cur->format == fmt && (!wide_vas.count(color_va) || cur->image_h == u32(std::lround(h * scale * widescreen()))))
             return true;
         cur = &surface(mem, color_va, w, h, fmt);
         cur_depth = depth_va;
-        depth_buffer(depth_va, w, h);  // may have been resized by another target
+        depth_buffer(depth_va, w, h, cur->image_h);  // may have been resized by another target
         return true;
     }
 
@@ -911,18 +940,21 @@ struct Renderer::Impl {
         const u32 hs = scaling ? 1 : 0, vs = scaling == 2 ? 1 : 0;
         const u32 out_w = (out_dim & 0xFFFF) >> hs, out_h = (out_dim >> 16) >> vs;
         if (!out_w || !out_h || (out_w << hs) > sf.width || row0 + (out_h << vs) > sf.height) return false;
-        const u32 rows_above = sf.height - row0;  // image rows down to the first transferred memory row
+        const u32 rows_above = sf.height - row0;  // guest rows down to the first transferred memory row
+        const float sy = sf.sy();
+        // The top screen (400 framebuffer rows) is widened: its source surface gets more rows from the next frame.
+        if (!dont_swizzle && out_h == 400 && widescreen() > 1.0f) wide_vas.insert(sf.va);
         if (dont_swizzle) {  // tiled -> tiled (downscaled copies used as textures): surface to surface
             if (out_fmt > 4 || out == in) return false;
             Surface& dst = surface(mem, out, out_w, out_h, out_fmt);
             // Memory row r is image row H-1-r on both sides: the copied rows are the source's last ones.
-            const s32 S = s32(scale), sh = s32(rows_above) * S, rows = s32(out_h << vs) * S;
+            const s32 S = s32(scale), sh = s32(std::lround(rows_above * sy)), rows = s32(std::lround((out_h << vs) * sy));
             VkImageBlit b{};
             b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             b.srcOffsets[0] = {0, sh - rows, 0};
             b.srcOffsets[1] = {s32(out_w << hs) * S, sh, 1};
-            b.dstOffsets[0] = {0, flip ? s32(out_h) * S : 0, 0};
-            b.dstOffsets[1] = {s32(out_w) * S, flip ? 0 : s32(out_h) * S, 1};
+            b.dstOffsets[0] = {0, flip ? s32(dst.image_h) : 0, 0};
+            b.dstOffsets[1] = {s32(out_w) * S, flip ? 0 : s32(dst.image_h), 1};
             begin();
             memory_barrier();
             vkCmdBlitImage(cmd, sf.color.img, VK_IMAGE_LAYOUT_GENERAL, dst.color.img, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
@@ -933,12 +965,15 @@ struct Renderer::Impl {
         }
         // Screen orientation: one framebuffer row (out_w pixels) is one screen column.
         Display& d = displays[out];
-        if (d.image.img && (d.width != out_h * scale || d.height != out_w * scale)) {
+        // Screen horizontal = surface rows: the top screen keeps the widened rows, others are resampled.
+        const float src_cols = out_h * sy;
+        const u32 screen_w = out_h == 400 ? u32(std::lround(src_cols)) : out_h * scale;
+        if (d.image.img && (d.width != screen_w || d.height != out_w * scale)) {
             submit_and_wait();
             destroy(d.image);
         }
         if (!d.image.img) {
-            d.width = out_h * scale, d.height = out_w * scale;
+            d.width = screen_w, d.height = out_w * scale;
             d.image = make_general(d.width, d.height, VK_FORMAT_R8G8B8A8_UNORM,
                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
         }
@@ -962,8 +997,11 @@ struct Renderer::Impl {
         memory_barrier();
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, xfer_pipe);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, xfer_layout, 0, 1, &set, 0, nullptr);
-        const s32 pc[4] = {flip, s32(hs), s32(vs), s32(rows_above * scale)};
-        vkCmdPushConstants(cmd, xfer_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+        struct {
+            s32 a[4];
+            float b[4];
+        } pc{{flip, s32(hs), s32(vs), s32(std::lround(rows_above * sy))}, {src_cols / float(screen_w), 0, 0, 0}};
+        vkCmdPushConstants(cmd, xfer_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
         vkCmdDispatch(cmd, (d.width + 7) / 8, (d.height + 7) / 8, 1);
         memory_barrier();
         submit_and_wait();  // presentation (another thread) reads the image next
@@ -1004,15 +1042,15 @@ struct Renderer::Impl {
             Surface& p = padded[t.va];
             if (p.color.img && (p.width != t.w || p.height != t.h)) submit_and_wait(), destroy(p.color);
             if (!p.color.img) {
-                p.va = t.va, p.width = t.w, p.height = t.h, p.format = sf.format;
-                p.color = make_general(t.w * scale, t.h * scale, VK_FORMAT_R8G8B8A8_UNORM,
+                p.va = t.va, p.width = t.w, p.height = t.h, p.format = sf.format, p.image_h = t.h * scale;
+                p.color = make_general(t.w * scale, p.image_h, VK_FORMAT_R8G8B8A8_UNORM,
                                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                        VK_IMAGE_ASPECT_COLOR_BIT);
             }
             const s32 S = s32(scale);
             VkImageBlit b{};
             b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            b.srcOffsets[1] = {s32(sf.width) * S, s32(sf.height) * S, 1};
+            b.srcOffsets[1] = {s32(sf.width) * S, s32(sf.image_h), 1};
             b.dstOffsets[0] = {0, s32(t.h - sf.height) * S, 0};
             b.dstOffsets[1] = {s32(t.w) * S, s32(t.h) * S, 1};
             begin();
@@ -1163,6 +1201,43 @@ struct Renderer::Impl {
         return vertex_shaders[key] = glsl.empty() ? VK_NULL_HANDLE : module(glsl, ShaderStage::Vertex);
     }
 
+    // Clip-space y factor for a draw (u.depth.z). On a widened top-screen surface every draw
+    // covering the whole screen (viewport rows 0..height) is squeezed back by 1/W, so 3D
+    // perspective gains field of view and 2D elements keep their shape, centred; orthographic
+    // draws spanning the full width (fades, full-screen composites) stay stretched to the edges.
+    // Projection is told apart by running the vertex program on the CPU for a few vertices.
+    float widescreen_clip(const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs,
+                          const std::vector<pica::VertexInput>& verts) {
+        if (cur->image_h == cur->height * scale) return 1.0f;
+        const float vh = f24_to_f32(regs[VIEWPORT_H] & 0xFFFFFF) * 2;
+        if ((regs[VIEWPORT_XY] >> 16 & 0x3FF) != 0 || std::lround(vh) != long(cur->height)) return 1.0f;
+        const float squeeze = float(cur->height * scale) / float(cur->image_h);
+        const u32 entry = regs[VS_ENTRY] & 0xFFFF;
+        auto clip_yw = [&](size_t n, float& y, float& w) {
+            pica::Vec4 out[16];
+            pica::run_vertex_shader(vs, entry, verts[n].v, out);
+            y = 0, w = 1;
+            for (u32 reg = 0; reg < 7; ++reg)
+                for (u32 c = 0; c < 4; ++c) {
+                    const u32 id = regs[OUTMAP + reg] >> (c * 8) & 0x1F;
+                    if (id == 1) y = (&out[reg].x)[c];
+                    if (id == 3) w = (&out[reg].x)[c];
+                }
+        };
+        float y, w;
+        for (size_t n = 0; n < std::min<size_t>(3, verts.size()); ++n) {
+            clip_yw(n, y, w);
+            if (std::fabs(w - 1.0f) > 1e-3f) return squeeze;  // perspective
+        }
+        if (verts.size() > 64) return squeeze;  // orthographic geometry, not a screen quad
+        float lo = 1e9f, hi = -1e9f;
+        for (size_t n = 0; n < verts.size(); ++n) {
+            clip_yw(n, y, w);
+            lo = std::min(lo, y / w), hi = std::max(hi, y / w);
+        }
+        return lo <= -0.98f && hi >= 0.98f ? 1.0f : squeeze;
+    }
+
     void draw(Memory& mem, const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs, bool indexed) {
         auto skip = [&](const char* why) {
             static std::map<std::string, bool> seen;
@@ -1235,7 +1310,8 @@ struct Renderer::Impl {
             const s32 v[4] = {s32(iv & 0xFF), s32(iv >> 8 & 0xFF), s32(s8(iv >> 16)), 0};
             std::memcpy(u + 1536 + i * 16, v, 16);
         }
-        const float depth[4] = {f24_to_f32(regs[DEPTH_SCALE] & 0xFFFFFF), f24_to_f32(regs[DEPTH_OFFSET] & 0xFFFFFF), 0, 0};
+        const float depth[4] = {f24_to_f32(regs[DEPTH_SCALE] & 0xFFFFFF), f24_to_f32(regs[DEPTH_OFFSET] & 0xFFFFFF),
+                                widescreen_clip(regs, vs, verts), 0};
         std::memcpy(u + 1600, depth, 16);
         const u32 bools = vs.bool_uniforms;
         std::memcpy(u + 1616, &bools, 4);
@@ -1282,21 +1358,22 @@ struct Renderer::Impl {
         VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         rbi.renderPass = render_pass;
         rbi.framebuffer = fb;
-        rbi.renderArea = {{0, 0}, {cur->width * scale, cur->height * scale}};
+        rbi.renderArea = {{0, 0}, {cur->width * scale, cur->image_h}};
         vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
         cur->gpu_newer = true;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         const float S = float(scale);
         const float vw = f24_to_f32(regs[VIEWPORT_W] & 0xFFFFFF) * 2, vh = f24_to_f32(regs[VIEWPORT_H] & 0xFFFFFF) * 2;
-        VkViewport viewport{float(regs[VIEWPORT_XY] & 0x3FF) * S, float(regs[VIEWPORT_XY] >> 16 & 0x3FF) * S, vw * S,
-                            vh * S, 0, 1};
+        const float SY = cur->sy();
+        VkViewport viewport{float(regs[VIEWPORT_XY] & 0x3FF) * S, float(regs[VIEWPORT_XY] >> 16 & 0x3FF) * SY, vw * S,
+                            vh * SY, 0, 1};
         vkCmdSetViewport(cmd, 0, 1, &viewport);
-        VkRect2D scissor{{0, 0}, {cur->width * scale, cur->height * scale}};
+        VkRect2D scissor{{0, 0}, {cur->width * scale, cur->image_h}};
         if ((regs[SCISSOR_MODE] & 3) == 3) {
             const s32 x1 = regs[SCISSOR_MIN] & 0x3FF, y1 = regs[SCISSOR_MIN] >> 16 & 0x3FF;
             const s32 x2 = regs[SCISSOR_MAX] & 0x3FF, y2 = regs[SCISSOR_MAX] >> 16 & 0x3FF;
-            const s32 k = s32(scale);
-            scissor = {{x1 * k, y1 * k}, {u32(std::max(0, x2 - x1 + 1) * k), u32(std::max(0, y2 - y1 + 1) * k)}};
+            const s32 k = s32(scale), ya = s32(std::floor(y1 * SY)), yb = s32(std::ceil((y2 + 1) * SY));
+            scissor = {{x1 * k, ya}, {u32(std::max(0, x2 - x1 + 1) * k), u32(std::max(0, yb - ya))}};
         }
         vkCmdSetScissor(cmd, 0, 1, &scissor);
         const u32 bc = regs[BLEND_COLOR];

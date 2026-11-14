@@ -622,14 +622,9 @@ struct Renderer::Impl {
             else if (std::sscanf(e, "%f:%f", &aw, &ah) == 2 && aw > 0 && ah > 0) wide_aspect = aw / ah;
         }
         if (const char* e = std::getenv("DOT_RES_SCALE")) {
-            if (std::string(e) == "native") {  // the top screen fills the window height in widescreen
-                const VkExtent2D ext = ctx.extent();
-                scale = wide_aspect != 0 ? std::max(1u, ext.height / 240)
-                                         : std::max(1u, std::min(ext.width / 400, ext.height / 480));
-            } else {
-                scale = u32(std::clamp(std::atoi(e), 1, 8));
-            }
-            scale = std::min(scale, 8u);
+            const VkExtent2D ext = ctx.extent();
+            scale = std::string(e) == "native" ? native_scale(ext.width, ext.height, wide_aspect != 0)
+                                               : u32(std::clamp(std::atoi(e), 1, 8));
         }
         anisotropy = scale > 1 ? std::min(16.0f, ctx.max_anisotropy()) : 0.0f;
         if (const char* e = std::getenv("DOT_FPS")) interpolate = std::atoi(e) >= 60;
@@ -1634,6 +1629,33 @@ bool Renderer::read_display(u32 va, std::vector<u32>& rgba, u32& width, u32& hei
 }
 
 u32 Renderer::scale() const { return impl_->scale; }
+
+void Renderer::set_scale(core::Memory& mem, u32 scale) {
+    std::lock_guard lk(impl_->lock);
+    Impl& m = *impl_;
+    scale = std::clamp(scale, 1u, 8u);
+    if (scale == m.scale) return;
+    for (auto& [va, sf] : m.surfaces)
+        if (sf.gpu_newer) m.readback(mem, sf);  // only the GPU has it: keep it through guest memory
+    m.submit_and_wait();
+    {
+        std::lock_guard qlk(m.ctx.queue_lock());  // the presenter's last blits may still read screen images
+        vkQueueWaitIdle(m.ctx.queue());
+    }
+    for (auto& [va, sf] : m.surfaces) m.destroy(sf.color);
+    for (auto& [va, sf] : m.padded) m.destroy(sf.color);
+    for (auto& [va, d] : m.depths) m.destroy(d.image);
+    for (auto& [va, d] : m.displays) m.destroy(d.image), m.destroy(d.interp);
+    for (auto& [key, fb] : m.framebuffers) vkDestroyFramebuffer(m.dev, fb, nullptr);
+    for (auto& [key, s] : m.samplers) vkDestroySampler(m.dev, s, nullptr);  // anisotropy follows the scale
+    m.surfaces.clear(), m.padded.clear(), m.depths.clear(), m.displays.clear(), m.framebuffers.clear(),
+        m.samplers.clear();
+    m.cur = nullptr;
+    m.frame_ops.clear(), m.prev_ops.clear(), m.key_counts.clear();  // no in-between frame across the change
+    m.scale = scale;
+    m.anisotropy = scale > 1 ? std::min(16.0f, m.ctx.max_anisotropy()) : 0.0f;
+    std::printf("renderer: resolution scale %ux\n", scale);
+}
 
 void Renderer::set_widescreen(float aspect) {
     std::lock_guard lk(impl_->lock);

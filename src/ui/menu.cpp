@@ -46,6 +46,7 @@ namespace {
 SDL_Window* g_window = nullptr;
 gfx::vulkan::Context* g_gpu = nullptr;
 gfx::vulkan::Renderer* g_renderer = nullptr;
+core::Memory* g_mem = nullptr;
 core::Config* g_cfg = nullptr;
 std::filesystem::path g_file;
 bool g_visible = false, g_ready = false;
@@ -66,10 +67,12 @@ void apply(const core::Config& c, const core::Config* prev) {
     gfx::g_single_screen = c.layout != "dual";
     hle::dsp::SetVolume(float(c.volume) / 100.0f);
     if (!prev) return;
-    if (prev->resolution != c.resolution && !c.fullscreen) {
+    if (prev->resolution != c.resolution) {
         int w = 0, h = 0;
         c.window_size(w, h);
-        SDL_SetWindowSize(g_window, w, h);
+        if (!c.fullscreen) SDL_SetWindowSize(g_window, w, h);  // the swapchain follows the resize
+        const u32 s = c.resolution == "native" ? 1 : gfx::vulkan::Renderer::native_scale(w, h, c.widescreen != "off");
+        if (g_renderer && g_mem) g_renderer->set_scale(*g_mem, s);
     }
     if (g_renderer && prev->widescreen != c.widescreen) g_renderer->set_widescreen(aspect(c.widescreen));
     if (g_renderer && prev->fps != c.fps) g_renderer->set_interpolate(c.fps >= 60);
@@ -108,7 +111,6 @@ void draw_menu() {
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
             choice("Resolution", c.resolution, {{"1080p", "1080p (1920x1080)"}, {"720p", "720p (1280x720)"}, {"native", "240p native (1x)"}});
-            ImGui::TextDisabled("Window size changes now; the render scale on the next start.");
             choice("Widescreen", c.widescreen, {{"16:9", "16:9"}, {"16:10", "16:10"}, {"21:9", "21:9"}, {"window", "Window aspect"}, {"off", "Off (5:3)"}});
             choice("Screens", c.layout, {{"single", "Single screen (bottom as overlay, Tab)"}, {"dual", "Dual screen (stacked)"}});
             ImGui::Checkbox("Fullscreen (F11)", &c.fullscreen);
@@ -348,7 +350,7 @@ bool run_setup(const std::filesystem::path& target, const std::filesystem::path&
     return result;
 }
 
-void set_renderer(gfx::vulkan::Renderer* renderer) { g_renderer = renderer; }
+void set_renderer(gfx::vulkan::Renderer* renderer, core::Memory* mem) { g_renderer = renderer, g_mem = mem; }
 
 void shutdown() {
     if (!g_ready) return;

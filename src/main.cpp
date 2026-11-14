@@ -193,7 +193,7 @@ int main(int argc, char** argv) {
         if (!renderer.init(std::filesystem::absolute(data).parent_path() / "cache"))
             return fatal("Renderer initialisation failed (see the terminal output).");
         hle::service::gsp::set_renderer(&renderer);
-        ui::set_renderer(&renderer);
+        ui::set_renderer(&renderer, &mem);
 #endif
         const std::vector<u32> top(gfx::vulkan::TOP_W * gfx::vulkan::SCREEN_H, 0xFF402010);
         const std::vector<u32> bottom = icon_screen(data / "exefs" / "icon.bin");
@@ -230,6 +230,7 @@ int main(int argc, char** argv) {
             auto pad = hle::hid::ReadPad();
             if (pad.trigger || pad.release)
                 std::printf("pad hold=%08x stick=(%d,%d)\n", pad.hold, pad.stick_x, pad.stick_y);
+            ui::frame();  // before fetching the screens: a resolution change destroys their images
 #ifdef DOT_HAVE_RECOMP
             if (std::getenv("DOT_STATS")) {  // once per second: what the guest GPU path is doing
                 static u64 frame = 0;
@@ -290,7 +291,6 @@ int main(int argc, char** argv) {
             const gfx::vulkan::GpuScreen* gpu_top_ptr = nullptr;
             const gfx::vulkan::GpuScreen* gpu_bottom_ptr = nullptr;
 #endif
-            ui::frame();
             if (!config.vsync) {  // FIFO paces the loop with vsync; without it, cap at 240 Hz
                 static auto next = std::chrono::steady_clock::now();
                 std::this_thread::sleep_until(next);

@@ -26,6 +26,9 @@ namespace gfx::vulkan {
 class Context;
 class Renderer;
 }  // namespace gfx::vulkan
+namespace core {
+class Memory;
+}
 
 // Settings menu (Dear ImGui over the final Vulkan pass, F1 or Esc) and the PC-side hotkeys:
 // Tab = bottom screen overlay, F11 = fullscreen, F2 = mouse camera (captured cursor drives
@@ -33,11 +36,12 @@ class Renderer;
 namespace ui {
 
 bool init(SDL_Window* window, gfx::vulkan::Context& gpu, core::Config& config, const std::filesystem::path& file);
-void set_renderer(gfx::vulkan::Renderer* renderer);  // null while there is none
+void set_renderer(gfx::vulkan::Renderer* renderer, core::Memory* mem);  // null while there is none
 void shutdown();
 // Returns false when the event belongs to the menu (or a hotkey) and the game must not see it.
 bool handle_event(const SDL_Event& e);
-// Builds this frame's menu (once per presented frame, before Context::present).
+// Builds this frame's menu (once per presented frame, before the screens are fetched: a
+// resolution change destroys the renderer's screen images).
 void frame();
 bool visible();
 

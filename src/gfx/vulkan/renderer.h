@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <memory>
@@ -66,8 +67,17 @@ public:
     // Reads a screen image back (DOT_DUMP_FRAMES), RGBA8 rows top first.
     bool read_display(u32 va, std::vector<u32>& rgba, u32& width, u32& height, bool interp = false);
     u32 scale() const;
-    // Runtime settings (menu): top screen aspect (0 = off, < 0 = the window's) and DOT_FPS=60
-    // frame interpolation. The resolution scale is fixed at init().
+    // DOT_RES_SCALE=native for a window of w x h: the top screen fills the window height in
+    // widescreen, else both screens stacked fit in it.
+    static u32 native_scale(u32 w, u32 h, bool widescreen) {
+        const u32 s = widescreen ? h / 240 : std::min(w / 400, h / 480);
+        return std::clamp(s, 1u, 8u);
+    }
+    // Runtime settings (menu): top screen aspect (0 = off, < 0 = the window's), DOT_FPS=60
+    // frame interpolation and the resolution scale (1-8). A new scale writes GPU-only surfaces
+    // back to guest memory and drops every cached render target; the next draws recreate them.
+    // Call it from the presenting thread before it fetches the screens (their images die here).
+    void set_scale(core::Memory& mem, u32 scale);
     void set_widescreen(float aspect);
     void set_interpolate(bool on);
 

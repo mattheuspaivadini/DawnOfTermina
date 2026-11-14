@@ -42,7 +42,12 @@ struct Context {
     u32 fpscr;
     u32 tls;         // thread-local storage base read by MRC p15, c13
     u32 excl;        // exclusive monitor armed by LDREX
+    u32 resume;      // non-zero: the next recompiled function entered jumps to this resume point
 };
+
+// entry_lr of a function entered through a resume point: its real return address is unknown,
+// so any computed jump it cannot resolve locally goes back to the resume() driver.
+constexpr u32 RESUMED = 0xFFFFFFFFu;
 
 using Fn = u32 (*)(Context*);
 struct FuncEntry {
@@ -61,6 +66,8 @@ struct Trap : std::runtime_error {
 void set_memory(u8* guest_base);
 void set_svc_memory(core::Memory& mem);
 void set_function_table(const FuncEntry* table, u32 count);  // sorted by key; O(1) lookup in call()
+// Resume points (svc sites, call return sites, loop heads) -> a function containing them, sorted.
+void set_resume_table(const FuncEntry* table, u32 count);
 
 // ---- asynchronous interrupts
 // Set by the host when a guest thread should stop at the next loop back-edge (pending
@@ -68,14 +75,22 @@ void set_function_table(const FuncEntry* table, u32 count);  // sorted by key; O
 extern std::atomic<u32> g_interrupt;
 void set_interrupt_handler(void (*handler)());
 void service_interrupt();
-#define RECOMP_CHECK_INTERRUPT() \
+// `pc` (loop head, | 1 for Thumb) goes to r15: a thread parked here resumes there (savestates).
+#define RECOMP_CHECK_INTERRUPT(pc) \
     do { \
-        if (recomp::g_interrupt.load(std::memory_order_relaxed)) recomp::service_interrupt(); \
+        if (recomp::g_interrupt.load(std::memory_order_relaxed)) { \
+            c->r[15] = (pc); \
+            recomp::service_interrupt(); \
+        } \
     } while (0)
 
 // ---- control flow
 u32 call(Context* c, u32 target);  // indirect call / tail jump through the table
 inline u32 jump(Context* c, u32 target) { return call(c, target); }
+// Continues a thread from `pc` (a resume point or a function entry, | 1 for Thumb) with the
+// registers in `c`: each frame returns to an address in guest state, entered the same way.
+// Returns when control reaches `exit_lr` (the LR the thread's entry was called with).
+void resume(Context* c, u32 pc, u32 exit_lr);
 [[noreturn]] void unimplemented(Context* c, u32 pc, const char* what);
 [[noreturn]] u32 fell_off(Context* c, u32 pc);
 void svc(Context* c, u32 imm);  // src/recomp/svc.cpp

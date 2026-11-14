@@ -28,6 +28,7 @@
 #include <deque>
 #include <mutex>
 
+#include "core/savestate.h"
 #include "hle/dsp.h"
 #include "hle/ipc.h"
 #include "hle/service/services.h"
@@ -165,6 +166,24 @@ void register_dsp(core::Memory& mem) {
     g_mem = &mem;
     kernel::register_service("dsp::DSP", dsp_command);
     kernel::add_periodic(4'888'780, audio_frame);  // 160 samples at 32728 Hz
+    kernel::register_state(
+        [](core::StateWriter& w) {
+            std::lock_guard lk(g_dsp_lock);
+            w.section("DSP ");
+            for (auto& p : g_pipes) w.vec(std::vector<u8>(p.begin(), p.end()));
+            w.put(g_semaphore_event), w.put(g_pipe_event), w.put(g_running);
+            dsp::save_state(w);
+        },
+        [](core::StateReader& r) {
+            std::lock_guard lk(g_dsp_lock);
+            r.section("DSP ");
+            for (auto& p : g_pipes) {
+                const auto v = r.vec<u8>();
+                p.assign(v.begin(), v.end());
+            }
+            r.get(g_semaphore_event), r.get(g_pipe_event), r.get(g_running);
+            dsp::load_state(r);
+        });
 }
 
 }  // namespace hle::service

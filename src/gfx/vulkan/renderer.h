@@ -71,6 +71,10 @@ public:
     // back to guest memory and drops every cached render target; the next draws recreate them.
     // Call it from the presenting thread before it fetches the screens (their images die here).
     void set_scale(core::Memory& mem, u32 scale);
+    // Savestates: write every GPU-only surface back to guest memory / forget every cached
+    // render target (guest memory was replaced). Screen images are kept until replaced.
+    void flush(core::Memory& mem);
+    void drop_targets();
     void set_widescreen(float aspect);
     void set_interpolate(bool on);
 
@@ -83,6 +87,7 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    void drop_targets_locked(bool displays);
 };
 
 }  // namespace gfx::vulkan

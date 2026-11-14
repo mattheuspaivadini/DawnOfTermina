@@ -1135,6 +1135,42 @@ struct Renderer::Impl {
     // texture-sized copy with the surface in its first memory rows (the image's last rows).
     std::map<u32, Surface> padded;
 
+    // DOT_TRACE_TEX: full state of a draw that samples a cached surface, once per (program,
+    // vertex count, textures, target), with each VS output register's range over all vertices.
+    void trace_surface_draw(const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs,
+                            const std::vector<pica::VertexInput>& verts) {
+        static std::set<std::array<u32, 6>> seen_draws;
+        const u32 entry = regs[VS_ENTRY] & 0xFFFF;
+        auto va = [&](u32 i) { return regs[TEX_CONFIG] >> i & 1 ? tex_source(regs, i).va : 0; };
+        if (!seen_draws.insert({entry, u32(verts.size()), va(0), va(1), va(2), cur->va}).second)
+            return;
+        std::fprintf(stderr, "draw: target %08X vs %04X verts %zu texcfg %08X blend %08X vp %08X %08X %08X\n", cur->va,
+                     entry, verts.size(), regs[TEX_CONFIG], regs[BLEND_FUNC], regs[VIEWPORT_W], regs[VIEWPORT_H],
+                     regs[VIEWPORT_XY]);
+        for (u32 i = 0; i < 3; ++i)
+            if (regs[TEX_CONFIG] >> i & 1) {
+                const TexSource t = tex_source(regs, i);
+                std::fprintf(stderr, "  unit %u %08X %ux%u fmt %u param %08X%s\n", i, t.va, t.w, t.h, u32(t.fmt),
+                             regs[TEX_REGS[i][1]], surfaces.count(t.va) ? " (surface)" : "");
+            }
+        for (u32 base : {0xC0u, 0xC8u, 0xD0u, 0xD8u, 0xF0u, 0xF8u})
+            std::fprintf(stderr, "  tev %03X: %08X %08X %08X %08X %08X\n", base, regs[base], regs[base + 1],
+                         regs[base + 2], regs[base + 3], regs[base + 4]);
+        float lo[7][4], hi[7][4];
+        std::fill(&lo[0][0], &lo[0][0] + 28, 1e30f), std::fill(&hi[0][0], &hi[0][0] + 28, -1e30f);
+        for (const auto& v : verts) {
+            pica::Vec4 out[16];
+            pica::run_vertex_shader(vs, entry, v.v, out);
+            for (u32 r = 0; r < 7; ++r)
+                for (u32 c = 0; c < 4; ++c)
+                    lo[r][c] = std::min(lo[r][c], (&out[r].x)[c]), hi[r][c] = std::max(hi[r][c], (&out[r].x)[c]);
+        }
+        for (u32 r = 0; r < 7; ++r)
+            if (regs[OUTMAP + r] != 0x1F1F1F1F)
+                std::fprintf(stderr, "  o%u outmap %08X x %g..%g y %g..%g z %g..%g w %g..%g\n", r, regs[OUTMAP + r],
+                             lo[r][0], hi[r][0], lo[r][1], hi[r][1], lo[r][2], hi[r][2], lo[r][3], hi[r][3]);
+    }
+
     Surface* resolve_texture(Memory& mem, const std::array<u32, pica::reg::COUNT>& regs, u32 unit) {
         const TexSource t = tex_source(regs, unit);
         if (!t.va || !t.size) return nullptr;
@@ -1200,6 +1236,26 @@ struct Renderer::Impl {
         const u64 hash = hash_words(mem.host(va), size);
         if (t.ready && t.hash == hash) return t;
         const auto rgba = pica::decode_texture({mem.host(va), size}, w, h, fmt);
+        if (static const char* dir = std::getenv("DOT_DUMP_TEX"); dir && !rgba.empty()) {
+            // Diagnostics: each texture once (by address, size, format), colour | alpha side by side.
+            static std::set<u64> dumped;
+            if (dumped.insert(key).second) {
+                char name[512];
+                std::snprintf(name, sizeof name, "%s/%08X_%ux%u_f%u_p%08X.ppm", dir, va, w, h, u32(fmt),
+                              regs[TEX_REGS[unit][1]]);
+                if (std::FILE* f = std::fopen(name, "wb")) {
+                    std::fprintf(f, "P6\n%u %u\n255\n", w * 2, h);
+                    for (u32 y = h; y-- > 0;)  // top row first
+                        for (u32 x = 0; x < w * 2; ++x) {
+                            const u32 px = rgba[size_t(y) * w + x % w];
+                            const u8 c[3] = {u8(x < w ? px : px >> 24), u8(x < w ? px >> 8 : px >> 24),
+                                             u8(x < w ? px >> 16 : px >> 24)};
+                            std::fwrite(c, 1, 3, f);
+                        }
+                    std::fclose(f);
+                }
+            }
+        }
         if (std::getenv("DOT_TRACE_DRAWS")) {
             size_t nonzero = 0;
             for (u32 px : rgba) nonzero += (px & 0xFFFFFF) != 0;
@@ -1485,6 +1541,41 @@ struct Renderer::Impl {
         for (u32 i = 0; i < 3; ++i)
             if (regs[TEX_CONFIG] >> i & 1) tex_surface[i] = resolve_texture(mem, regs, i);
         if (!cur) return skip("render target lost");  // a resolved texture replaced it
+        if (static const char* list = std::getenv("DOT_SKIP_TEX"); list) {  // diagnostics: bisect by texture
+            for (u32 i = 0; i < 3; ++i)
+                if (regs[TEX_CONFIG] >> i & 1) {
+                    char hexva[16];
+                    std::snprintf(hexva, sizeof hexva, "%08X", tex_source(regs, i).va);
+                    if (std::strstr(list, hexva)) return;
+                }
+        }
+        if (static const bool trace_light = std::getenv("DOT_TRACE_LIGHT"); trace_light && (regs[0x08F] & 1) && !(regs[0x1C6] & 1)) {
+            // Lighting structure + per-light registers, once per distinct set.
+            static std::set<std::vector<u32>> seen_light;
+            std::vector<u32> key(regs.begin() + 0x140, regs.begin() + 0x1DA);
+            if (seen_light.insert(key).second) {
+                std::fprintf(stderr, "light: cfg0 %08X cfg1 %08X max %u perm %08X abs %08X sel %08X scale %08X\n",
+                             regs[0x1C3], regs[0x1C4], regs[0x1C2] & 7, regs[0x1D9], regs[0x1D0], regs[0x1D1],
+                             regs[0x1D2]);
+                for (u32 i = 0; i <= (regs[0x1C2] & 7); ++i) {
+                    const u32 b = 0x140 + 16 * (regs[0x1D9] >> (4 * i) & 7);
+                    std::fprintf(stderr, "  light %u: pos %08X %08X spot %08X %08X cfg %08X bias %08X scale %08X\n",
+                                 regs[0x1D9] >> (4 * i) & 7, regs[b + 4], regs[b + 5], regs[b + 6], regs[b + 7],
+                                 regs[b + 9], regs[b + 10], regs[b + 11]);
+                }
+            }
+        }
+        if (static const bool trace_tex = std::getenv("DOT_TRACE_TEX"); trace_tex && (tex_surface[0] || tex_surface[1] || tex_surface[2]))
+            trace_surface_draw(regs, vs, verts);
+        if (static const char* want = std::getenv("DOT_TRACE_TEXVA"); want)  // full state of draws using a texture
+            for (u32 i = 0; i < 3; ++i)
+                if (regs[TEX_CONFIG] >> i & 1 && tex_source(regs, i).va == std::strtoul(want, nullptr, 16)) {
+                    std::fprintf(stderr, "  fog %08X light %u/%u lod %08X %08X %08X tex2uv %u\n", regs[0x0E0],
+                                 regs[0x08F] & 1, regs[0x1C6] & 1, regs[0x084], regs[0x094], regs[0x09C],
+                                 regs[0x080] >> 13 & 1);
+                    trace_surface_draw(regs, vs, verts);
+                    break;
+                }
 
         // Vertex shader on the GPU when possible, else run on the CPU with the outputs packed
         // through VS_OUTMAP for the pass-through shader.
@@ -1717,13 +1808,16 @@ bool Renderer::read_display(u32 va, std::vector<u32>& rgba, u32& width, u32& hei
 
 u32 Renderer::scale() const { return impl_->scale; }
 
-void Renderer::set_scale(core::Memory& mem, u32 scale) {
+void Renderer::flush(core::Memory& mem) {
     std::lock_guard lk(impl_->lock);
+    for (auto& [va, sf] : impl_->surfaces)
+        if (sf.gpu_newer) impl_->readback(mem, sf);  // only the GPU has it: keep it through guest memory
+    impl_->submit_and_wait();
+}
+
+// Lock held. Screen images stay unless `displays`: the presenter may be holding one.
+void Renderer::drop_targets_locked(bool displays) {
     Impl& m = *impl_;
-    scale = std::clamp(scale, 1u, 8u);
-    if (scale == m.scale) return;
-    for (auto& [va, sf] : m.surfaces)
-        if (sf.gpu_newer) m.readback(mem, sf);  // only the GPU has it: keep it through guest memory
     m.submit_and_wait();
     {
         std::lock_guard qlk(m.ctx.queue_lock());  // the presenter's last blits may still read screen images
@@ -1732,13 +1826,30 @@ void Renderer::set_scale(core::Memory& mem, u32 scale) {
     for (auto& [va, sf] : m.surfaces) m.destroy(sf.color);
     for (auto& [va, sf] : m.padded) m.destroy(sf.color);
     for (auto& [key, d] : m.depths) m.destroy(d.image);
-    for (auto& [va, d] : m.displays) m.destroy(d.image), m.destroy(d.interp);
     for (auto& [key, fb] : m.framebuffers) vkDestroyFramebuffer(m.dev, fb, nullptr);
-    for (auto& [key, s] : m.samplers) vkDestroySampler(m.dev, s, nullptr);  // anisotropy follows the scale
-    m.surfaces.clear(), m.padded.clear(), m.depths.clear(), m.displays.clear(), m.framebuffers.clear(),
-        m.samplers.clear();
+    m.surfaces.clear(), m.padded.clear(), m.depths.clear(), m.framebuffers.clear();
+    if (displays) {
+        for (auto& [va, d] : m.displays) m.destroy(d.image), m.destroy(d.interp);
+        m.displays.clear();
+    }
     m.cur = nullptr;
     m.frame_ops.clear(), m.prev_ops.clear(), m.key_counts.clear();  // no in-between frame across the change
+}
+
+void Renderer::drop_targets() {
+    std::lock_guard lk(impl_->lock);
+    drop_targets_locked(false);
+}
+
+void Renderer::set_scale(core::Memory& mem, u32 scale) {
+    scale = std::clamp(scale, 1u, 8u);
+    if (scale == this->scale()) return;
+    flush(mem);
+    std::lock_guard lk(impl_->lock);
+    Impl& m = *impl_;
+    drop_targets_locked(true);
+    for (auto& [key, s] : m.samplers) vkDestroySampler(m.dev, s, nullptr);  // anisotropy follows the scale
+    m.samplers.clear();
     m.scale = scale;
     m.anisotropy = scale > 1 ? std::min(16.0f, m.ctx.max_anisotropy()) : 0.0f;
     std::printf("renderer: resolution scale %ux\n", scale);

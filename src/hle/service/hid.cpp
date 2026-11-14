@@ -18,6 +18,7 @@
 // and touch states, refreshed periodically from the host input (hle::hid; the mouse is the stylus).
 
 #include "hle/hid.h"
+#include "core/savestate.h"
 #include "hle/ipc.h"
 #include "hle/service/services.h"
 #include "hle/svc.h"
@@ -137,6 +138,17 @@ void register_hid(core::Memory& mem) {
     g_mem = &mem;
     for (const char* name : {"hid:USER", "hid:SPVR"}) kernel::register_service(name, hid_command);
     kernel::add_periodic(4'000'000, update);  // 250 Hz, like the HID module's pad sampling
+    kernel::register_state(
+        [](core::StateWriter& w) {
+            w.section("HID ");
+            w.put(g_shared), w.put(g_pad0), w.put(g_pad1), w.put(g_accel), w.put(g_gyro), w.put(g_debug);
+            w.put(g_last_buttons), w.put(g_accel_on), w.put(g_gyro_on);
+        },
+        [](core::StateReader& r) {
+            r.section("HID ");
+            r.get(g_shared), r.get(g_pad0), r.get(g_pad1), r.get(g_accel), r.get(g_gyro), r.get(g_debug);
+            r.get(g_last_buttons), r.get(g_accel_on), r.get(g_gyro_on);
+        });
 }
 
 }  // namespace hle::service

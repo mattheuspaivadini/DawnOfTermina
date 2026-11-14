@@ -16,6 +16,8 @@
 
 #include "hle/svc.h"
 
+#include "core/savestate.h"
+
 #include <chrono>
 #include <iterator>
 #include <map>
@@ -133,12 +135,33 @@ void SleepThread(s64 ns) {
     else std::this_thread::yield();
 }
 
+static u64 tick_offset = 0;  // set by load_state
+
 u64 GetSystemTick() {
     using namespace std::chrono;
     static const auto boot = steady_clock::now();
     const auto ns = u64(double(duration_cast<nanoseconds>(steady_clock::now() - boot).count()) * TimeScale());
     constexpr u64 HZ = 268111856, NS = 1000000000;
-    return u64(ns) / NS * HZ + u64(ns) % NS * HZ / NS;  // split to avoid u64 overflow
+    return u64(ns) / NS * HZ + u64(ns) % NS * HZ / NS + tick_offset;  // split to avoid u64 overflow
+}
+
+void save_state(core::StateWriter& w) {
+    w.section("SVC ");
+    w.put(linear_next), w.put(committed), w.put(GetSystemTick());
+    w.put(u64(regions.size()));
+    for (auto& [base, info] : regions) w.put(info);
+}
+
+void load_state(core::StateReader& r) {
+    r.section("SVC ");
+    r.get(linear_next), r.get(committed);
+    const u64 tick = r.get<u64>();
+    tick_offset += tick - GetSystemTick();
+    regions.clear();
+    for (u64 n = r.get<u64>(); n--;) {
+        const MemoryInfo info = r.get<MemoryInfo>();
+        regions[info.base] = info;
+    }
 }
 
 void Break(u32 reason) {

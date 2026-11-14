@@ -30,6 +30,7 @@
 #include <mutex>
 #include <vector>
 
+#include "core/savestate.h"
 #include "hle/hid.h"
 #include "hle/ipc.h"
 #include "hle/service/services.h"
@@ -226,6 +227,19 @@ void register_ir(core::Memory& mem) {
     g_mem = &mem;
     kernel::register_service("ir:USER", ir_command);
     kernel::add_periodic(1'000'000, poll);  // 1 ms granularity; the game picks the period (16 ms)
+    kernel::register_state(
+        [](core::StateWriter& w) {
+            std::lock_guard lk(g_lock);
+            w.section("IR  ");
+            w.put(g_events), w.put(g_shared), w.put(g_recv_size), w.put(g_packets), w.put(g_begin), w.put(g_end);
+            w.put(g_count), w.put(g_connected), w.put(g_period_ms), w.put(g_next_poll);
+        },
+        [](core::StateReader& r) {
+            std::lock_guard lk(g_lock);
+            r.section("IR  ");
+            r.get(g_events), r.get(g_shared), r.get(g_recv_size), r.get(g_packets), r.get(g_begin), r.get(g_end);
+            r.get(g_count), r.get(g_connected), r.get(g_period_ms), r.get(g_next_poll);
+        });
 }
 
 }  // namespace hle::service

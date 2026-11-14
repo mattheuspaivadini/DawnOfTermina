@@ -34,6 +34,7 @@ static s64 ns64(u32 lo, u32 hi) { return s64(u64(hi) << 32 | lo); }
 void svc(Context* c, u32 imm) {
     namespace k = hle::kernel;
     u32* r = c->r;
+    k::savestate_point();  // before anything: the svc is re-run after a load
     k::preemption_point();
     switch (imm) {
     case 0x01: {  // ControlMemory(op r0, addr0 r1, addr1 r2, size r3, perm r4) -> r1 addr

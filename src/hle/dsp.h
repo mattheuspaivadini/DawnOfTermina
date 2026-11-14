@@ -98,6 +98,9 @@ void decode_adpcm(const u8* data, u32 samples, const s16 coeffs[16], AdpcmState&
 // write the voice statuses. Does not touch the frame counter (the app owns it).
 void process_frame(core::Memory& mem, s16 out[FRAME_SAMPLES * 2]);
 void reset();  // all voices off (DSP shutdown/initialize)
+// Savestates: voice state (queued buffers, decoder history, play position), master volume.
+void save_state(core::StateWriter& w);
+void load_state(core::StateReader& r);
 
 // Host output. Initialize() needs SDL_INIT_AUDIO; without a device, frames are dropped.
 void Initialize();

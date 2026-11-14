@@ -18,9 +18,14 @@
 
 #include <cstring>
 
+#include <vector>
+
 #include "core/types.h"
 
 namespace core {
+
+class StateWriter;
+class StateReader;
 
 // The whole 32-bit guest address space is reserved as one host block, so a guest VA
 // translates to a host pointer with a single add. Unmapped guest pages stay PROT_NONE
@@ -62,6 +67,10 @@ public:
     }
     template <class T> void write(u32 addr, T v) { std::memcpy(base_ + addr, &v, sizeof v); }
 
+    // Savestates: every writable mapped page (all-zero pages omitted) and the mapping itself.
+    void save_state(StateWriter& w) const;
+    void load_state(StateReader& r);
+
     static constexpr u32 tls(u32 thread_index) { return TLS_BASE + thread_index * TLS_SIZE; }
 
     // Physical <-> virtual for GPU-visible memory (Old 3DS): VRAM and the linear heap.
@@ -79,6 +88,8 @@ public:
 
 private:
     u8* base_ = nullptr;
+    std::vector<u8> pages_;  // per guest page: 0 unmapped, 1 read-only, 2 read-write
+    void mark(u32 addr, u32 size, u8 state);
 };
 
 }  // namespace core

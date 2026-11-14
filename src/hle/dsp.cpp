@@ -31,6 +31,8 @@
 #include <cstring>
 #include <vector>
 
+#include "core/savestate.h"
+
 namespace hle::dsp {
 
 namespace {
@@ -210,6 +212,26 @@ void decode_adpcm(const u8* data, u32 samples, const s16 coeffs[16], AdpcmState&
         out[n] = s16(val);
     }
     state.yn1 = s16(yn1), state.yn2 = s16(yn2);
+}
+
+void save_state(core::StateWriter& w) {
+    w.section("DSPV");
+    w.put(g_master_volume);
+    for (const Voice& v : g_voices) {
+        w.put(v.enabled), w.put(v.id_dirty), w.put(v.played), w.put(v.sync), w.put(v.id), w.put(v.previous_id);
+        w.put(v.rate), w.put(v.gain_l), w.put(v.gain_r), w.put(v.format), w.put(v.channels), w.put(v.coeffs);
+        w.put(v.adpcm), w.vec(v.queue), w.vec(v.samples), w.put(v.pos);
+    }
+}
+
+void load_state(core::StateReader& r) {
+    r.section("DSPV");
+    r.get(g_master_volume);
+    for (Voice& v : g_voices) {
+        r.get(v.enabled), r.get(v.id_dirty), r.get(v.played), r.get(v.sync), r.get(v.id), r.get(v.previous_id);
+        r.get(v.rate), r.get(v.gain_l), r.get(v.gain_r), r.get(v.format), r.get(v.channels), r.get(v.coeffs);
+        r.get(v.adpcm), v.queue = r.vec<Buffer>(), v.samples = r.vec<s16>(), r.get(v.pos);
+    }
 }
 
 void reset() {

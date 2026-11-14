@@ -38,6 +38,7 @@
 #include "gfx/vulkan/renderer.h"
 #include "hle/dsp.h"
 #include "hle/hid.h"
+#include "hle/kernel.h"
 
 namespace ui {
 
@@ -145,7 +146,7 @@ void draw_menu() {
         ImGui::EndTabBar();
     }
     ImGui::Separator();
-    ImGui::TextDisabled("F1/Esc: close   Tab: bottom screen   F11: fullscreen   F2: mouse camera");
+    ImGui::TextDisabled("F1/Esc: close   Tab: bottom screen   F11: fullscreen   F2: mouse camera   F5/F9: save/load state");
     ImGui::End();
     if (!open) set_visible(false);
     if (c.resolution != g_cfg->resolution || c.widescreen != g_cfg->widescreen || c.layout != g_cfg->layout ||
@@ -392,6 +393,12 @@ bool handle_event(const SDL_Event& e) {
     case SDLK_TAB:
         gfx::g_show_bottom = !gfx::g_show_bottom;
         return false;
+    case SDLK_F5:  // savestates live next to config.toml (and game_data/, saves/)
+        hle::kernel::request_save(g_file.parent_path() / "states" / "slot1.state");
+        return false;
+    case SDLK_F9:
+        hle::kernel::request_load(g_file.parent_path() / "states" / "slot1.state");
+        return false;
     case SDLK_F11:
         g_cfg->fullscreen = !(SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN);
         SDL_SetWindowFullscreen(g_window, g_cfg->fullscreen);
@@ -404,6 +411,11 @@ bool handle_event(const SDL_Event& e) {
 
 void frame() {
     if (!g_ready) return;
+    static std::string state_status;  // savestate result in the window title
+    if (std::string st = hle::kernel::savestate_status(); st != state_status) {
+        state_status = st;
+        SDL_SetWindowTitle(g_window, ("DawnOfTermina - " + st).c_str());
+    }
     if (!g_visible) {
         g_gpu->set_overlay(nullptr);
         return;

@@ -51,6 +51,8 @@
 namespace recomp {
 extern const FuncEntry kFunctions[];
 extern const u32 kFunctionCount;
+extern const FuncEntry kResumePoints[];
+extern const u32 kResumePointCount;
 }  // namespace recomp
 #endif
 
@@ -159,11 +161,14 @@ int main(int argc, char** argv) {
     recomp::set_memory(mem.host(0));
     recomp::set_svc_memory(mem);
     recomp::set_function_table(recomp::kFunctions, recomp::kFunctionCount);
+    recomp::set_resume_table(recomp::kResumePoints, recomp::kResumePointCount);
     hle::kernel::init(mem);
     hle::service::register_all(mem, data);
     const u8 main_priority = read_main_priority(data);
     std::printf("boot: running recompiled code (%u functions), main thread priority 0x%02X\n",
                 recomp::kFunctionCount, main_priority);
+    // DOT_LOAD_STATE=<file>: the main thread loads it at its first syscall.
+    if (const char* st = std::getenv("DOT_LOAD_STATE")) hle::kernel::request_load(st);
     hle::kernel::start_main_thread(code->text.addr, core::Memory::STACK_TOP, main_priority);
 #else
     // No recompiled code (game_data absent at configure time): run the hand-transcribed
@@ -235,6 +240,14 @@ int main(int argc, char** argv) {
                 std::printf("pad hold=%08x stick=(%d,%d)\n", pad.hold, pad.stick_x, pad.stick_y);
             ui::frame();  // before fetching the screens: a resolution change destroys their images
 #ifdef DOT_HAVE_RECOMP
+            // DOT_SAVE_STATE_AT=<guest seconds> (DOT_INPUT's clock): one automatic save to states/slot1.state.
+            if (static const char* at = std::getenv("DOT_SAVE_STATE_AT"); at) {
+                static bool saved = false;
+                if (!saved && double(hle::service::gsp::stats().vblanks) / 59.83 >= std::atof(at)) {
+                    saved = true;
+                    hle::kernel::request_save(std::filesystem::absolute(data).parent_path() / "states" / "slot1.state");
+                }
+            }
             if (std::getenv("DOT_STATS")) {  // once per second: what the guest GPU path is doing
                 static u64 frame = 0;
                 if (++frame % 60 == 0) {

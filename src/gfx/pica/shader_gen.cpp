@@ -17,6 +17,7 @@
 #include "gfx/pica/shader_gen.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <format>
 #include <optional>
 #include <set>
@@ -495,7 +496,9 @@ std::string lighting(const std::array<u32, reg::COUNT>& regs) {
 )",
                            n, b + 4, b + 5, lcfg & 1 ? "lpos" : "lpos + view", b + 6, b + 7,
                            lcfg >> 1 & 1 ? "abs(dot(light_vector, normal))" : "max(dot(light_vector, normal), 0.0)");
-        const bool spot = !(c1 >> (8 + n) & 1) && supported(SP), dist = !(c1 >> (24 + n) & 1);
+        static const std::string dbg = std::getenv("DOT_DEBUG_FS") ? std::getenv("DOT_DEBUG_FS") : "";
+        const bool spot = !(c1 >> (8 + n) & 1) && supported(SP) && dbg != "nospot",
+                   dist = !(c1 >> (24 + n) & 1) && dbg != "nodist";
         out += std::format("    float spot_atten = {};\n", spot ? lookup(SP, SP + n, lcfg) : "1.0");
         out += dist ? std::format("    float dist_atten = lut_unsigned({}, clamp(f20(lr[{}]) * length(-view - lpos) + "
                                   "f20(lr[{}]), 0.0, 1.0));\n",
@@ -553,8 +556,11 @@ layout(set = 1, binding = 2) uniform sampler2D tex2;
 layout(location = 0) out vec4 frag_color;
 layout(push_constant) uniform PicaFragment { uint tev_const[6]; uint tev_buffer_color; uint alpha_ref; uint fog_color; } pc;
 )";
-    const bool lit = lighting_enabled(regs);
-    const bool fog = (regs[TEV_BUFFER_INPUT] & 7) == 5;
+    // DOT_DEBUG_FS=nolight|nofog|nospot|nodist: diagnostics, drops one fragment term (nolight
+    // puts a flat grey in its place).
+    static const std::string dbg = std::getenv("DOT_DEBUG_FS") ? std::getenv("DOT_DEBUG_FS") : "";
+    const bool lit = lighting_enabled(regs) && dbg != "nolight";
+    const bool fog = (regs[TEV_BUFFER_INPUT] & 7) == 5 && dbg != "nofog";
     if (lit || fog) out += FRAGMENT_BUFFER_DECL;
     if (lit) out += LIGHTING_DECLS;
     out += R"(
@@ -572,6 +578,7 @@ void main() {
     vec4 const_color;
 )";
     if (lit) out += lighting(regs);
+    else if (dbg == "nolight" && lighting_enabled(regs)) out += "    primary_fragment_color = vec4(0.5, 0.5, 0.5, 1.0);\n";
 
     static const float SCALE[4] = {1.0f, 2.0f, 4.0f, 1.0f};
     for (u32 i = 0; i < 6; ++i) {

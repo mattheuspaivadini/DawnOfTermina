@@ -110,4 +110,14 @@ void CommandProcessor::write(u32 id, u32 value, u32 byte_mask) {
     }
 }
 
+void CommandProcessor::save_state(core::StateWriter& w) const {
+    w.section("PICA");
+    w.put(regs_), w.put(vs_), w.put(uniform_buf_), w.put(uniform_words_), w.put(fixed_buf_), w.put(fixed_words_);
+}
+
+void CommandProcessor::load_state(core::StateReader& r) {
+    r.section("PICA");
+    r.get(regs_), r.get(vs_), r.get(uniform_buf_), r.get(uniform_words_), r.get(fixed_buf_), r.get(fixed_words_);
+}
+
 }  // namespace gfx::pica

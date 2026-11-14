@@ -66,6 +66,7 @@ Na primeira execução é criado um `config.toml` ao lado de `game_data/` (ignor
 | F2 | câmera no mouse (captura o cursor; Esc solta) |
 | Tab | mostra/esconde a tela de baixo |
 | F11 | tela cheia |
+| F5 / F9 | salvar / carregar savestate |
 | F1 / Esc | menu de configurações |
 
 Teclas remapeáveis no menu (aba *Controls*). Controle: layout posicional da Nintendo (leste = A), analógico direito = câmera (C-stick), L3/R3 = itens I/II. Mouse: clique na tela de baixo = toque.
@@ -107,7 +108,8 @@ Cada função transcrita mantém o endereço virtual original em comentário (`/
 | 11 | 60 FPS por interpolação de quadros (`DOT_FPS=60`), sem acelerar a lógica | ✅ |
 | 12 | Hooks nativos para rotinas da libc (memcpy/memset/strlen/strcmp/sinf/cosf/atan2f) | ✅ infraestrutura; ganho medido dentro do ruído |
 | 5E | Experiência de PC: `config.toml`, menu ImGui (F1), tela única/dupla, câmera no mouse (C-stick), atalhos de toque | ✅ |
-| 13+ | Subsistemas do jogo (cenas, loop, colisão, atores, HUD) | ⏳ |
+| 13 | Savestates: F5 salva, F9 carrega (`states/slot1.state`), `DOT_LOAD_STATE=<arquivo>` no boot | ✅ |
+| 14+ | Subsistemas do jogo (cenas, loop, colisão, atores, HUD) | ⏳ |
 
 ## Licença
 

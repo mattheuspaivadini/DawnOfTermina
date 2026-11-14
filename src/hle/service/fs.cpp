@@ -30,6 +30,7 @@
 #include <string>
 #include <vector>
 
+#include "core/savestate.h"
 #include "hle/ipc.h"
 #include "hle/service/services.h"
 
@@ -59,6 +60,7 @@ struct HostFile {
     std::FILE* f = nullptr;
     u64 base = 0;  // file offset presented to the guest as offset 0
     bool writable = false;
+    std::string path;  // savestates: relative to the folder holding game_data/ and saves/
     ~HostFile() {
         if (f) std::fclose(f);
     }
@@ -68,6 +70,20 @@ std::string hex(u32 v) {
     char b[16];
     std::snprintf(b, sizeof b, "0x%08X", v);
     return b;
+}
+
+void file_command(const std::shared_ptr<HostFile>& file, core::Memory& mem, u32 base);
+
+stdfs::path state_root() { return g_saves.parent_path(); }
+
+kernel::RestoredSession file_handlers(const std::shared_ptr<HostFile>& file) {
+    return {[file](core::Memory& m, u32 b) { file_command(file, m, b); },
+            [file](core::StateWriter& w) { w.str(file->path), w.put(file->base), w.put(file->writable); }};
+}
+
+Handle file_session(const std::shared_ptr<HostFile>& file, const std::string& label) {
+    auto [handler, save] = file_handlers(file);
+    return kernel::open_session(label, std::move(handler), std::move(save), "fs:file");
 }
 
 // Session handler for one open file.
@@ -113,7 +129,7 @@ void file_command(const std::shared_ptr<HostFile>& file, core::Memory& mem, u32 
     case 0x080C:  // OpenLinkFile: another session on the same open file
         c.reply(1, 2);
         c.set(2, ipc::move_handles(1));
-        c.set(3, kernel::open_session("fs:file", [file](core::Memory& m, u32 b) { file_command(file, m, b); }));
+        c.set(3, file_session(file, "fs:file"));
         return;
     case 0x0808:  // Close
     case 0x0809:  // Flush
@@ -131,7 +147,8 @@ Handle open_file_session(const stdfs::path& path, const std::string& label, u64 
     if (!file->f) return 0;
     file->base = base;
     file->writable = writable;
-    return kernel::open_session(label, [file](core::Memory& mem, u32 base) { file_command(file, mem, base); });
+    file->path = stdfs::absolute(path).lexically_relative(stdfs::absolute(state_root())).string();
+    return file_session(file, label);
 }
 
 // Offset of the IVFC level 3 (the actual RomFS) inside romfs.bin.
@@ -217,11 +234,21 @@ std::optional<stdfs::path> resolve(core::Memory& mem, Archive* a, u32 type, u32 
 }
 
 // Session for an open directory: Read(count) returns 0x228-byte entries.
+kernel::ServiceHandler directory_handler(const stdfs::path& dir, std::shared_ptr<size_t> pos);
+kernel::StateSaver directory_saver(const std::string& rel, std::shared_ptr<size_t> pos) {
+    return [rel, pos](core::StateWriter& w) { w.str(rel), w.put(u64(*pos)); };
+}
+
 Handle open_directory_session(const stdfs::path& dir) {
+    auto pos = std::make_shared<size_t>(0);
+    const std::string rel = stdfs::absolute(dir).lexically_relative(stdfs::absolute(state_root())).string();
+    return kernel::open_session("fs:dir", directory_handler(dir, pos), directory_saver(rel, pos), "fs:dir");
+}
+
+kernel::ServiceHandler directory_handler(const stdfs::path& dir, std::shared_ptr<size_t> pos) {
     auto entries = std::make_shared<std::vector<stdfs::directory_entry>>();
     for (const auto& e : stdfs::directory_iterator(dir)) entries->push_back(e);
-    auto pos = std::make_shared<size_t>(0);
-    return kernel::open_session("fs:dir", [entries, pos](core::Memory& mem, u32 base) {
+    return [entries, pos](core::Memory& mem, u32 base) {
         ipc::Cmd c{mem, base};
         if (c.id() == 0x0801) {  // Read(count, mapped buffer desc, address) -> entries read
             const u32 count = c[1], addr = c[3];
@@ -240,7 +267,7 @@ Handle open_directory_session(const stdfs::path& dir) {
             return;
         }
         c.reply(1, 0);  // Close and anything else
-    });
+    };
 }
 
 void fs_command(core::Memory& mem, u32 base) {
@@ -403,6 +430,41 @@ void register_fs(const std::filesystem::path& game_data) {
     g_game_data = game_data;
     g_saves = stdfs::absolute(game_data).parent_path() / "saves";
     kernel::register_service("fs:USER", fs_command);
+    kernel::register_session_loader("fs:file", [](core::StateReader& r) -> kernel::RestoredSession {
+        auto file = std::make_shared<HostFile>();
+        file->path = r.str();
+        r.get(file->base), r.get(file->writable);
+        file->f = std::fopen((state_root() / file->path).c_str(), file->writable ? "r+b" : "rb");
+        if (!file->f) throw core::StateError("savestate: cannot reopen " + file->path);
+        return file_handlers(file);
+    });
+    kernel::register_session_loader("fs:dir", [](core::StateReader& r) -> kernel::RestoredSession {
+        const std::string rel = r.str();
+        auto pos = std::make_shared<size_t>(r.get<u64>());
+        return {directory_handler(state_root() / rel, pos), directory_saver(rel, pos)};
+    });
+    kernel::register_state(
+        [](core::StateWriter& w) {
+            std::lock_guard lk(g_fs_lock);
+            w.section("FS  ");
+            w.put(g_next_archive), w.put(u32(g_archives.size()));
+            for (auto& [h, a] : g_archives) {
+                w.put(h), w.put(a.id);
+                w.str(a.root.empty() ? std::string() : stdfs::absolute(a.root).lexically_relative(stdfs::absolute(state_root())).string());
+            }
+        },
+        [](core::StateReader& r) {
+            std::lock_guard lk(g_fs_lock);
+            r.section("FS  ");
+            r.get(g_next_archive);
+            g_archives.clear();
+            for (u32 n = r.get<u32>(); n--;) {
+                const u64 h = r.get<u64>();
+                const u32 id = r.get<u32>();
+                const std::string root = r.str();
+                g_archives[h] = {id, root.empty() ? stdfs::path() : state_root() / root};
+            }
+        });
 }
 
 }  // namespace hle::service

@@ -31,6 +31,7 @@
 #include "gfx/pica/pixel.h"
 #include "gfx/vulkan/context.h"
 #include "gfx/vulkan/renderer.h"
+#include "core/savestate.h"
 #include "hle/ipc.h"
 #include "hle/service/services.h"
 
@@ -372,6 +373,30 @@ void register_gsp(core::Memory& mem) {
     };
     kernel::register_service("gsp::Gpu", gsp_command);
     kernel::add_periodic(16'715'000, vblank);  // ~59.83 Hz
+    kernel::register_state(
+        [](core::StateWriter& w) {
+            settle(0, ~0u);  // GPU-side transfers and surfaces back into guest memory
+            if (auto* r = g_renderer.load()) r->flush(*g_mem);
+            w.section("GSP ");
+            {
+                std::lock_guard lk(g_fb_lock);
+                w.put(g_fb);
+            }
+            w.put(g_shared), w.put(g_event), w.put(g_vblanks.load());
+            g_pica.save_state(w);
+        },
+        [](core::StateReader& r) {
+            r.section("GSP ");
+            {
+                std::lock_guard lk(g_fb_lock);
+                r.get(g_fb);
+            }
+            r.get(g_shared), r.get(g_event);
+            g_vblanks = r.get<u64>();  // DOT_INPUT times stay those of the original run
+            g_pica.load_state(r);
+            g_gpu_transfers.clear();
+            if (auto* rr = g_renderer.load()) rr->drop_targets();
+        });
 }
 
 namespace gsp {

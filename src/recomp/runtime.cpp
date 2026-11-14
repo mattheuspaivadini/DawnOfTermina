@@ -49,6 +49,10 @@ void set_function_table(const FuncEntry* table, u32 count) {
     for (u32 i = 0; i < count; ++i) g_slots[(table[i].key - g_lo) >> 1] = i + 1;
 }
 
+static const FuncEntry* g_resume = nullptr;
+static u32 g_resume_count = 0;
+void set_resume_table(const FuncEntry* table, u32 count) { g_resume = table, g_resume_count = count; }
+
 static std::string hex(u32 v) {
     char b[16];
     std::snprintf(b, sizeof b, "0x%08X", v);
@@ -63,6 +67,19 @@ u32 call(Context* c, u32 target) {
         throw Trap(target, "indirect call/jump to " + hex(target) + " which is not a recompiled function entry "
                            "(add it to tools/recomp/extra_entries.txt if it is real code); LR=" + hex(c->r[14]));
     return g_table[i - 1].fn(c);
+}
+
+void resume(Context* c, u32 pc, u32 exit_lr) {
+    while ((pc ^ exit_lr) & ~1u) {
+        const FuncEntry* end = g_resume + g_resume_count;
+        const FuncEntry* it = std::lower_bound(g_resume, end, pc, [](const FuncEntry& e, u32 k) { return e.key < k; });
+        if (it != end && it->key == pc) {
+            c->resume = pc;
+            pc = it->fn(c);
+        } else {
+            pc = call(c, pc);  // a function entry (tail jump out of a resumed frame)
+        }
+    }
 }
 
 void unimplemented(Context*, u32 pc, const char* what) {

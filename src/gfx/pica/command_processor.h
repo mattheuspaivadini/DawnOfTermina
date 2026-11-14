@@ -4,6 +4,7 @@
 #include <functional>
 #include <span>
 
+#include "core/savestate.h"
 #include "core/types.h"
 
 namespace gfx::pica {
@@ -67,6 +68,9 @@ public:
 
     const std::array<u32, reg::COUNT>& regs() const { return regs_; }
     const ShaderState& vs() const { return vs_; }
+    // Savestates: registers, shader state and the partially written upload FIFOs.
+    void save_state(core::StateWriter& w) const;
+    void load_state(core::StateReader& r);
 
 private:
     std::array<u32, reg::COUNT> regs_{};

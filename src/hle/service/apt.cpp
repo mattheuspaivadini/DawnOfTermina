@@ -22,6 +22,7 @@
 #include <mutex>
 #include <vector>
 
+#include "core/savestate.h"
 #include "hle/ipc.h"
 #include "hle/service/services.h"
 
@@ -169,6 +170,21 @@ void handle(core::Memory& mem, u32 base, const char* name) {
 void register_apt() {
     for (const char* name : {"APT:U", "APT:A", "APT:S"})
         kernel::register_service(name, [name](core::Memory& mem, u32 cmd) { handle(mem, cmd, name); });
+    kernel::register_state(
+        [](core::StateWriter& w) {
+            std::lock_guard lk(g_apt_lock);
+            w.section("APT ");
+            w.put(g_lock_handle), w.put(g_notification_event), w.put(g_parameter_event), w.put(g_attributes);
+            w.put(u32(g_parameters.size()));
+            for (auto& p : g_parameters) w.put(p.sender), w.put(p.signal), w.vec(p.buffer), w.put(p.object);
+        },
+        [](core::StateReader& r) {
+            std::lock_guard lk(g_apt_lock);
+            r.section("APT ");
+            r.get(g_lock_handle), r.get(g_notification_event), r.get(g_parameter_event), r.get(g_attributes);
+            g_parameters.resize(r.get<u32>());
+            for (auto& p : g_parameters) r.get(p.sender), r.get(p.signal), p.buffer = r.vec<u8>(), r.get(p.object);
+        });
 }
 
 }  // namespace hle::service

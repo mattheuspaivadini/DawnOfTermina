@@ -35,3 +35,4 @@ cache/
 
 # Local user settings (written by the game)
 config.toml
+states/

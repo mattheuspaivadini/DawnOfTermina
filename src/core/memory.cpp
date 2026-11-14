@@ -16,6 +16,10 @@
 
 #include "core/memory.h"
 
+#include <algorithm>
+
+#include "core/savestate.h"
+
 #include <signal.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -70,19 +74,69 @@ Memory::Memory() {
 
 Memory::~Memory() { munmap(base_, SPACE); }
 
+void Memory::mark(u32 addr, u32 size, u8 state) {
+    if (pages_.empty()) pages_.assign(SPACE / PAGE, 0);
+    std::fill_n(pages_.begin() + addr / PAGE, size / PAGE, state);
+}
+
 bool Memory::map(u32 addr, u32 size) {
-    return aligned(addr, size) && mprotect(base_ + addr, size, PROT_READ | PROT_WRITE) == 0;
+    if (!aligned(addr, size) || mprotect(base_ + addr, size, PROT_READ | PROT_WRITE) != 0) return false;
+    mark(addr, size, 2);
+    return true;
 }
 
 bool Memory::unmap(u32 addr, u32 size) {
     // MADV_DONTNEED drops the pages so a later map() sees zeroes again.
-    return aligned(addr, size) && madvise(base_ + addr, size, MADV_DONTNEED) == 0 &&
-           mprotect(base_ + addr, size, PROT_NONE) == 0;
+    if (!aligned(addr, size) || madvise(base_ + addr, size, MADV_DONTNEED) != 0 ||
+        mprotect(base_ + addr, size, PROT_NONE) != 0)
+        return false;
+    mark(addr, size, 0);
+    return true;
 }
 
 bool Memory::protect(u32 addr, u32 size, bool writable) {
-    return aligned(addr, size) &&
-           mprotect(base_ + addr, size, writable ? PROT_READ | PROT_WRITE : PROT_READ) == 0;
+    if (!aligned(addr, size) || mprotect(base_ + addr, size, writable ? PROT_READ | PROT_WRITE : PROT_READ) != 0)
+        return false;
+    mark(addr, size, writable ? 2 : 1);
+    return true;
+}
+
+// Read-only pages (code, rodata) come from the loader and are the same on every boot.
+void Memory::save_state(StateWriter& w) const {
+    w.section("MEM ");
+    w.vec(pages_);
+    static const u8 zero[PAGE] = {};
+    for (u32 p = 0; p < pages_.size(); ++p)
+        if (pages_[p] == 2 && std::memcmp(base_ + u64(p) * PAGE, zero, PAGE)) {
+            w.put(p);
+            w.bytes(base_ + u64(p) * PAGE, PAGE);
+        }
+    w.put(~0u);
+}
+
+void Memory::load_state(StateReader& r) {
+    r.section("MEM ");
+    const std::vector<u8> want = r.vec<u8>();
+    if (want.size() != SPACE / PAGE) throw StateError("savestate: bad page map");
+    for (u32 p = 0; p < want.size();) {  // runs of pages whose state changes
+        u32 q = p;
+        while (q < want.size() && want[q] == want[p] && pages_[q] != want[q]) ++q;
+        if (q == p) {
+            ++p;
+            continue;
+        }
+        const u32 addr = p * PAGE, size = (q - p) * PAGE;
+        if (want[p] == 0 ? !unmap(addr, size) : want[p] == 1 ? !(map(addr, size) && protect(addr, size, false))
+                                                           : !map(addr, size))
+            throw StateError("savestate: cannot map guest pages");
+        p = q;
+    }
+    for (u32 p = 0; p < pages_.size(); ++p)
+        if (pages_[p] == 2) std::memset(base_ + u64(p) * PAGE, 0, PAGE);
+    for (u32 p; (p = r.get<u32>()) != ~0u;) {
+        if (p >= pages_.size() || pages_[p] != 2) throw StateError("savestate: page data for an unmapped page");
+        r.bytes(base_ + u64(p) * PAGE, PAGE);
+    }
 }
 
 }  // namespace core

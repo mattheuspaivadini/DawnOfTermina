@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <filesystem>
 #include <functional>
 #include <optional>
 #include <stdexcept>
@@ -121,5 +122,26 @@ Handle open_session(const std::string& name, ServiceHandler handler);
 
 // The calling guest thread's CPU context (for the svc dispatcher).
 recomp::Context& current_context();
+
+// ---- savestates
+// Host state outside guest memory registers a saver/loader pair at service init; they run in
+// registration order with no guest thread executing and the kernel lock released.
+using StateSaver = std::function<void(core::StateWriter&)>;
+using StateLoader = std::function<void(core::StateReader&)>;
+void register_state(StateSaver save, StateLoader load);
+// A session whose handler has its own state (an open file): `save` writes what `kind`'s
+// loader needs to rebuild the handler.
+Handle open_session(const std::string& name, ServiceHandler handler, StateSaver save, const std::string& kind);
+struct RestoredSession {
+    ServiceHandler handler;
+    StateSaver save;  // so the session can be saved again
+};
+void register_session_loader(const std::string& kind, std::function<RestoredSession(core::StateReader&)> load);
+// Requests are carried out by the guest thread holding the CPU at its next syscall (all others
+// are parked then); a load replaces every guest thread. Callable from any host thread.
+void request_save(const std::filesystem::path& file);
+void request_load(const std::filesystem::path& file);
+void savestate_point();  // top of every svc
+std::string savestate_status();  // last result, for the UI (empty = nothing yet)
 
 }  // namespace hle::kernel

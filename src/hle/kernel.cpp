@@ -29,6 +29,10 @@
 #include <thread>
 #include <vector>
 
+#include <atomic>
+#include <fstream>
+
+#include "core/savestate.h"
 #include "hle/svc.h"
 #include "recomp/runtime.h"
 
@@ -93,6 +97,8 @@ struct Session : Object {
     std::string describe() const override { return "session(" + service + ")"; }
     std::string service;
     ServiceHandler handler;  // per-session handler; empty = look the service up by name
+    StateSaver saver;        // savestates: rebuilds `handler` through the `kind` loader
+    std::string kind;
     explicit Session(std::string s, ServiceHandler h = {}) : service(std::move(s)), handler(std::move(h)) {}
 };
 struct Process : Object {};
@@ -103,6 +109,8 @@ struct MemoryBlock : Object {
 };
 
 enum class State { Ready, Running, Waiting, Dead };
+// Where a thread that is not running gave up the CPU: decides where a savestate resumes it.
+enum class Park { Fresh, Preempt, Wait, Create };
 
 struct Thread : Object {
     u32 id;
@@ -113,6 +121,10 @@ struct Thread : Object {
     std::thread host;
     u64 last_run = 0;  // round robin among equal priorities
     const char* host_where = "starting";  // diagnostics: what the host thread is doing
+    u32 entry = 0;
+    Park park = Park::Fresh;
+    u32 arbiter_type = 0;
+    bool abandoned = false;  // replaced by a savestate load: the host thread unwinds and ends
 
     // wait state
     std::vector<std::shared_ptr<Object>> wait_objects;
@@ -236,12 +248,14 @@ void switch_away(std::unique_lock<std::mutex>& lk, Thread* self) {
     if (self->state == State::Dead) return;
     self->host_where = "waiting for the baton";
     while (g_current != self) {
+        if (self->abandoned) throw ThreadExit{};
         if (g_status) {  // guest stopped: park this thread forever
             self->cv.wait(lk);
             continue;
         }
         if (self->state == State::Waiting && self->has_deadline) {
-            if (self->cv.wait_until(lk, self->deadline) == std::cv_status::timeout && self->state == State::Waiting) {
+            if (self->cv.wait_until(lk, self->deadline) == std::cv_status::timeout && self->state == State::Waiting &&
+                !self->abandoned) {
                 self->wait_objects.clear();
                 self->arbiter_addr = 0;
                 self->wait_result = ERR_TIMEOUT;
@@ -260,6 +274,7 @@ void switch_away(std::unique_lock<std::mutex>& lk, Thread* self) {
 Result block(std::unique_lock<std::mutex>& lk, s64 timeout_ns) {
     Thread* self = t_self;
     self->state = State::Waiting;
+    self->park = Park::Wait;
     self->has_deadline = timeout_ns >= 0;
     if (self->has_deadline) self->deadline = Clock::now() + std::chrono::nanoseconds(s64(timeout_ns / svc::TimeScale()));
     switch_away(lk, self);
@@ -279,17 +294,22 @@ void finish_thread() {
     if (g_current == self) pick_next();
 }
 
-void thread_main(Thread* self, u32 entry) {
+// `resume_pc` non-zero: a thread restored by a savestate continues there (recomp::resume).
+void thread_main(Thread* self, u32 entry, u32 resume_pc) {
     t_self = self;
     pthread_setname_np(pthread_self(), "guest");  // lets profilers and /proc tell guest CPU time apart
     {
         std::unique_lock lk(g_lock);
-        while (g_current != self) self->cv.wait(lk);
+        while (g_current != self) {
+            if (self->abandoned) return;
+            self->cv.wait(lk);
+        }
         self->state = State::Running;
         self->host_where = "guest code";
     }
     try {
-        recomp::call(&self->ctx, entry);
+        if (resume_pc) recomp::resume(&self->ctx, resume_pc, 0);
+        else recomp::call(&self->ctx, entry);
         exit_thread();  // returning from the entry point ends the thread
     } catch (const recomp::Trap& t) {
         char where[96];
@@ -301,6 +321,7 @@ void thread_main(Thread* self, u32 entry) {
         std::snprintf(where, sizeof where, " [thread %u, lr=0x%08X]", self->id, self->ctx.r[14]);
         fail(std::string("HLE: ") + u.what() + where);
     } catch (const ThreadExit&) {
+        if (self->abandoned) return;
     }
     park_forever();
 }
@@ -308,6 +329,7 @@ void thread_main(Thread* self, u32 entry) {
 std::shared_ptr<Thread> new_thread(u32 entry, u32 arg, u32 stack_top, s32 priority) {
     auto t = std::make_shared<Thread>();
     t->id = g_next_thread_id++;
+    t->entry = entry;
     t->priority = priority;
     t->ctx.r[0] = arg;
     t->ctx.r[13] = stack_top;
@@ -315,7 +337,7 @@ std::shared_ptr<Thread> new_thread(u32 entry, u32 arg, u32 stack_top, s32 priori
     t->ctx.fpscr = 0x03C00000;  // RunFast: flush-to-zero + default NaN, round to nearest
     g_mem->write<u32>(t->ctx.tls, 0);
     g_threads.push_back(t);
-    t->host = std::thread(thread_main, t.get(), entry);
+    t->host = std::thread(thread_main, t.get(), entry, 0u);
     t->host.detach();
     return t;
 }
@@ -378,6 +400,7 @@ Result create_thread(u32 entry, u32 arg, u32 stack_top, s32 priority, s32, Handl
     *out = add(t);
     if (priority < t_self->priority) {  // a higher-priority thread runs immediately
         t_self->state = State::Ready;
+        t_self->park = Park::Create;
         switch_away(lk, t_self);
     }
     return RESULT_OK;
@@ -404,6 +427,7 @@ void sleep_thread(s64 ns) {
     std::unique_lock lk(g_lock);
     if (ns <= 0) {  // yield
         t_self->state = State::Ready;
+        t_self->park = Park::Preempt;  // re-running the yield is harmless
         switch_away(lk, t_self);
         return;
     }
@@ -416,6 +440,7 @@ void preemption_point() {
     std::unique_lock lk(g_lock);
     if (g_preempt && t_self && g_current == t_self) {
         t_self->state = State::Ready;
+        t_self->park = Park::Preempt;
         switch_away(lk, t_self);
     }
 }
@@ -621,6 +646,7 @@ Result arbitrate_address(Handle arbiter, u32 addr, u32 type, s32 value, s64 time
     if (type == 2 || type == 4) g_mem->write<u32>(addr, u32(cur - 1));
     t_self->wait_objects.clear();
     t_self->arbiter_addr = addr;
+    t_self->arbiter_type = type;
     return block(lk, type >= 3 ? timeout_ns : -1);
 }
 
@@ -733,6 +759,13 @@ Handle open_session(const std::string& name, ServiceHandler handler) {
     return add(std::make_shared<Session>(name, std::move(handler)));
 }
 
+Handle open_session(const std::string& name, ServiceHandler handler, StateSaver save, const std::string& kind) {
+    std::lock_guard lk(g_lock);
+    auto s = std::make_shared<Session>(name, std::move(handler));
+    s->saver = std::move(save), s->kind = kind;
+    return add(s);
+}
+
 Result connect_to_port(const std::string& name, Handle* out) {
     {
         std::lock_guard lk(g_lock);
@@ -778,6 +811,342 @@ Result send_sync_request(Handle session) {
         i += 1 + words;
     }
     return RESULT_OK;
+}
+
+// ---------------------------------------------------------------- savestates
+//
+// A thread's host stack is never saved: all guest registers are in its Context and every
+// guest return address is in guest memory, so recomp::resume rebuilds the call chain from a
+// resume point (svc site, call return site, loop head). Each parked thread resumes where its
+// park reason says (thread_resume_pc); the thread that takes the snapshot re-runs its svc.
+
+namespace {
+
+constexpr u32 STATE_MAGIC = 0x54534F44, STATE_VERSION = 1;  // "DOST"
+
+struct StateHooks {
+    StateSaver save;
+    StateLoader load;
+};
+std::vector<StateHooks> g_state_hooks;
+std::map<std::string, std::function<RestoredSession(core::StateReader&)>> g_session_loaders;
+std::vector<std::shared_ptr<Thread>> g_abandoned;  // their host threads may still be unwinding
+
+std::mutex g_request_lock;
+std::atomic<bool> g_request_pending{false};
+bool g_request_load = false;
+std::filesystem::path g_request_file;
+std::string g_state_status;
+
+void set_status(const std::string& s) {
+    std::fprintf(stderr, "savestate: %s\n", s.c_str());
+    std::lock_guard lk(g_request_lock);
+    g_state_status = s;
+}
+
+// A save that has to wait reports it once per reason (window title).
+void set_waiting(const std::string& why) {
+    static std::string last;
+    if (why != last) last = why, set_status("save waiting: " + why);
+}
+
+enum ObjType : u8 { O_EVENT, O_MUTEX, O_SEMAPHORE, O_ARBITER, O_LIMIT, O_SESSION, O_PROCESS, O_BLOCK, O_THREAD };
+
+// Where `t` (not the caller) continues after a load, with its registers adjusted in `ctx`.
+// Returns false if it cannot be resumed right now (the save is retried at the next svc).
+bool thread_resume_pc(const Thread& t, recomp::Context& ctx, u32& pc) {
+    ctx = t.ctx;
+    const u32 at = ctx.r[15], thumb = at & 1, addr = at & ~1u;
+    const u32 after = (addr + (thumb ? 2 : 4)) | thumb;
+    switch (t.park) {
+    case Park::Fresh: pc = t.entry; return true;
+    case Park::Preempt: pc = at; return true;  // loop head or svc entry: registers are as they were there
+    case Park::Create: return false;           // creator yielded inside CreateThread: outputs not known yet
+    case Park::Wait: break;
+    }
+    const u32 imm = thumb ? g_mem->read<u16>(addr) & 0xFF : g_mem->read<u32>(addr) & 0xFF;
+    if (t.state == State::Waiting) {
+        if (t.arbiter_addr && (t.arbiter_type == 2 || t.arbiter_type == 4)) {  // already decremented
+            ctx.r[0] = RESULT_OK, pc = after;  // spurious wake-up: the SDK re-checks the value
+            return true;
+        }
+        pc = at;  // nothing acquired yet: wait again
+        return true;
+    }
+    // Woken (or timed out) but not running yet: finish the svc as it would have.
+    switch (imm) {
+    case 0x0A: break;
+    case 0x22: case 0x24: ctx.r[0] = t.wait_result; break;
+    case 0x25: ctx.r[0] = t.wait_result, ctx.r[1] = u32(t.wait_index); break;
+    default: return false;
+    }
+    pc = after;
+    return true;
+}
+
+// Kernel section (lock held). Objects are written once each, then the handle table and
+// thread list refer to them by index.
+bool save_kernel(core::StateWriter& w, std::string& why) {
+    std::map<const Object*, u32> index;
+    std::vector<std::shared_ptr<Object>> objects;
+    auto id = [&](const std::shared_ptr<Object>& o) {
+        auto [it, added] = index.try_emplace(o.get(), u32(objects.size()));
+        if (added) objects.push_back(o);
+        return it->second;
+    };
+    for (auto& t : g_threads) id(t);
+    for (auto& [h, o] : g_handles) id(o);
+
+    w.section("KERN");
+    w.put(g_next_handle), w.put(g_next_thread_id), w.put(g_run_counter);
+    w.put(u32(objects.size()));
+    for (auto& o : objects) {
+        if (auto* e = dynamic_cast<Event*>(o.get())) {
+            w.put(O_EVENT), w.put(e->reset_type), w.put(e->signaled);
+        } else if (auto* m = dynamic_cast<Mutex*>(o.get())) {
+            w.put(O_MUTEX), w.put(m->owner ? m->owner->id : 0u), w.put(m->count);
+        } else if (auto* sem = dynamic_cast<Semaphore*>(o.get())) {
+            w.put(O_SEMAPHORE), w.put(sem->count), w.put(sem->max);
+        } else if (dynamic_cast<AddressArbiter*>(o.get())) {
+            w.put(O_ARBITER);
+        } else if (dynamic_cast<ResourceLimit*>(o.get())) {
+            w.put(O_LIMIT);
+        } else if (auto* ses = dynamic_cast<Session*>(o.get())) {
+            if (ses->handler && !ses->saver) {
+                why = "session '" + ses->service + "' has state that cannot be saved";
+                return false;
+            }
+            w.put(O_SESSION), w.str(ses->service), w.str(ses->kind);
+            if (ses->saver) ses->saver(w);
+        } else if (dynamic_cast<Process*>(o.get())) {
+            w.put(O_PROCESS);
+        } else if (auto* b = dynamic_cast<MemoryBlock*>(o.get())) {
+            w.put(O_BLOCK), w.put(b->size), w.put(b->addr), w.put(b->guest_owned);
+        } else if (auto* t = dynamic_cast<Thread*>(o.get())) {
+            recomp::Context ctx;
+            u32 pc = 0;
+            const bool dead = t->state == State::Dead;
+            if (t == t_self) ctx = t->ctx, pc = t->ctx.r[15];  // re-runs the svc it is entering
+            else if (!dead && !thread_resume_pc(*t, ctx, pc)) {
+                why = "thread " + std::to_string(t->id) + " is busy in a syscall";
+                return false;
+            }
+            ctx.resume = 0;
+            w.put(O_THREAD), w.put(t->id), w.put(t->priority), w.put(dead), w.put(t->last_run), w.put(t->entry);
+            w.put(ctx), w.put(pc);
+        } else {
+            why = "unknown kernel object " + o->describe();
+            return false;
+        }
+    }
+    w.put(u32(g_handles.size()));
+    for (auto& [h, o] : g_handles) w.put(h), w.put(index.at(o.get()));
+    w.put(u32(g_threads.size()));
+    for (auto& t : g_threads) w.put(index.at(t.get()));
+    return true;
+}
+
+// Replaces every kernel object and thread (lock held). Old threads are abandoned; the new
+// ones are started parked and run once the caller hands the CPU over.
+void load_kernel(core::StateReader& r, std::vector<std::pair<std::shared_ptr<Thread>, u32>>& start) {
+    r.section("KERN");
+    r.get(g_next_handle), r.get(g_next_thread_id), r.get(g_run_counter);
+    std::vector<std::shared_ptr<Object>> objects(r.get<u32>());
+    std::vector<std::pair<Mutex*, u32>> owners;
+    for (auto& o : objects) {
+        switch (r.get<u8>()) {
+        case O_EVENT: {
+            auto e = std::make_shared<Event>(r.get<u32>());
+            r.get(e->signaled);
+            o = e;
+            break;
+        }
+        case O_MUTEX: {
+            auto m = std::make_shared<Mutex>();
+            owners.emplace_back(m.get(), r.get<u32>());
+            r.get(m->count);
+            o = m;
+            break;
+        }
+        case O_SEMAPHORE: {
+            const s32 count = r.get<s32>(), max = r.get<s32>();
+            o = std::make_shared<Semaphore>(count, max);
+            break;
+        }
+        case O_ARBITER: o = std::make_shared<AddressArbiter>(); break;
+        case O_LIMIT: o = std::make_shared<ResourceLimit>(); break;
+        case O_SESSION: {
+            auto ses = std::make_shared<Session>(r.str());
+            ses->kind = r.str();
+            if (!ses->kind.empty()) {
+                auto it = g_session_loaders.find(ses->kind);
+                if (it == g_session_loaders.end()) throw core::StateError("no loader for session kind " + ses->kind);
+                auto [handler, save] = it->second(r);
+                ses->handler = std::move(handler), ses->saver = std::move(save);
+            }
+            o = ses;
+            break;
+        }
+        case O_PROCESS: o = std::make_shared<Process>(); break;
+        case O_BLOCK: {
+            const u32 size = r.get<u32>(), addr = r.get<u32>();
+            o = std::make_shared<MemoryBlock>(size, addr, r.get<bool>());
+            break;
+        }
+        case O_THREAD: {
+            auto t = std::make_shared<Thread>();
+            r.get(t->id), r.get(t->priority);
+            const bool dead = r.get<bool>();
+            r.get(t->last_run), r.get(t->entry), r.get(t->ctx);
+            const u32 pc = r.get<u32>();
+            t->state = dead ? State::Dead : State::Ready;
+            if (!dead) start.emplace_back(t, pc);
+            o = t;
+            break;
+        }
+        default: throw core::StateError("bad kernel object type");
+        }
+    }
+    std::map<Handle, std::shared_ptr<Object>> handles;
+    for (u32 n = r.get<u32>(); n--;) {
+        const Handle h = r.get<Handle>();
+        handles[h] = objects.at(r.get<u32>());
+    }
+    std::vector<std::shared_ptr<Thread>> threads;
+    for (u32 n = r.get<u32>(); n--;) threads.push_back(std::dynamic_pointer_cast<Thread>(objects.at(r.get<u32>())));
+    for (auto [m, owner] : owners)
+        for (auto& t : threads)
+            if (owner && t->id == owner) m->owner = t.get();
+
+    for (auto& t : g_threads) t->abandoned = true, g_abandoned.push_back(t);
+    g_handles = std::move(handles);
+    g_threads = std::move(threads);
+    g_preempt = false;
+}
+
+bool do_save(const std::filesystem::path& file) {
+    {
+        std::lock_guard lk(g_lock);
+        for (auto& t : g_threads)
+            if (t.get() != t_self && t->state == State::Ready && t->park == Park::Create) {
+                set_waiting("thread " + std::to_string(t->id) + " is creating a thread");
+                return false;  // retry
+            }
+    }
+    core::StateWriter w;
+    w.put(STATE_MAGIC), w.put(STATE_VERSION);
+    // Services first: the GPU one writes rendered surfaces back to guest memory.
+    for (auto& h : g_state_hooks) h.save(w);
+    std::string why;
+    {
+        std::lock_guard lk(g_lock);
+        if (!save_kernel(w, why)) {
+            if (why.find("busy") != std::string::npos) {
+                set_waiting(why);
+                return false;  // retry at the next svc
+            }
+            set_status("save failed: " + why);
+            return true;
+        }
+    }
+    svc::save_state(w);
+    g_mem->save_state(w);
+    std::filesystem::create_directories(file.parent_path());
+    const auto tmp = std::filesystem::path(file).concat(".tmp");
+    std::ofstream out(tmp, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(w.data.data()), std::streamsize(w.data.size()));
+    out.close();
+    if (!out) {
+        set_status("save failed: cannot write " + tmp.string());
+        return true;
+    }
+    std::filesystem::rename(tmp, file);
+    set_status("saved " + file.string() + " (" + std::to_string(w.data.size() >> 20) + " MB)");
+    return true;
+}
+
+// Returns only on failure (state left untouched where possible); on success the calling
+// thread ends and the restored threads take over.
+void do_load(const std::filesystem::path& file) {
+    std::ifstream in(file, std::ios::binary);
+    if (!in) {
+        set_status("load failed: cannot open " + file.string());
+        return;
+    }
+    core::StateReader r(std::vector<u8>((std::istreambuf_iterator<char>(in)), {}));
+    if (r.data.size() < 8 || r.get<u32>() != STATE_MAGIC || r.get<u32>() != STATE_VERSION) {
+        set_status("load failed: " + file.string() + " is not a savestate of this version");
+        return;
+    }
+    std::vector<std::pair<std::shared_ptr<Thread>, u32>> start;
+    try {
+        for (auto& h : g_state_hooks) h.load(r);
+        std::lock_guard lk(g_lock);
+        load_kernel(r, start);
+    } catch (const std::exception& e) {
+        // shortcut: a failure after the services loaded leaves a mixed state; validate the file first if this happens.
+        set_status(std::string("load failed: ") + e.what());
+        return;
+    }
+    svc::load_state(r);
+    g_mem->load_state(r);
+    {
+        std::lock_guard lk(g_lock);
+        for (auto& [t, pc] : start) {
+            t->park = Park::Preempt;
+            t->host = std::thread(thread_main, t.get(), t->entry, pc ? pc : 1u);  // never 0: 0 means "fresh start"
+            t->host.detach();
+        }
+        for (auto& t : g_abandoned) t->cv.notify_all();
+        g_current = nullptr;
+        pick_next();
+    }
+    set_status("loaded " + file.string());
+    throw ThreadExit{};  // this host thread belonged to the old process image
+}
+
+}  // namespace
+
+void register_state(StateSaver save, StateLoader load) { g_state_hooks.push_back({std::move(save), std::move(load)}); }
+
+void register_session_loader(const std::string& kind, std::function<RestoredSession(core::StateReader&)> load) {
+    g_session_loaders[kind] = std::move(load);
+}
+
+void request_save(const std::filesystem::path& file) {
+    {
+        std::lock_guard lk(g_request_lock);
+        g_request_load = false, g_request_file = file;
+        g_request_pending = true;
+    }
+    set_status("saving...");
+}
+
+void request_load(const std::filesystem::path& file) {
+    std::lock_guard lk(g_request_lock);
+    g_request_load = true, g_request_file = file;
+    g_request_pending = true;
+}
+
+std::string savestate_status() {
+    std::lock_guard lk(g_request_lock);
+    return g_state_status;
+}
+
+void savestate_point() {
+    if (!g_request_pending.load(std::memory_order_relaxed)) return;
+    bool load;
+    std::filesystem::path file;
+    {
+        std::lock_guard lk(g_request_lock);
+        load = g_request_load, file = g_request_file;
+    }
+    if (load) {
+        g_request_pending = false;
+        do_load(file);
+    } else if (do_save(file)) {
+        g_request_pending = false;
+    }
 }
 
 }  // namespace hle::kernel

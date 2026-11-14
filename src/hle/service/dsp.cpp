@@ -17,14 +17,24 @@
 // dsp::DSP — control protocol of the audio DSP: the component "loads", the audio pipe hands
 // out the shared-structure addresses on Initialize, and every audio frame (160 samples at
 // 32728 Hz) runs the HLE firmware (hle/dsp.cpp) and raises the pipe interrupt.
+//
+// The audio clock is its own host thread, not a kernel periodic: periodics only run between
+// guest instructions, so a guest thread busy in a long HLE call (GSP command lists, frame
+// interpolation waiting on the GPU) used to starve the mixer and the output underran. The
+// real DSP also runs concurrently with the ARM11; the shared regions are built for that.
+
+#include <SDL3/SDL_thread.h>
 
 #include <algorithm>
+#include <chrono>
 #include <deque>
 #include <mutex>
+#include <thread>
 
 #include "hle/dsp.h"
 #include "hle/ipc.h"
 #include "hle/service/services.h"
+#include "hle/svc.h"
 
 namespace hle::service {
 
@@ -51,6 +61,19 @@ void audio_frame() {
     }
     dsp::output(samples, dsp::FRAME_SAMPLES);
     if (ev) kernel::signal_event(ev);
+}
+
+// One frame every 160/32728 s of monotonic time (scaled by DOT_SPEED), whatever the guest does.
+void audio_thread() {
+    SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_HIGH);  // best effort
+    using Clock = std::chrono::steady_clock;
+    const auto period = std::chrono::nanoseconds(s64(1e9 * dsp::FRAME_SAMPLES / dsp::SAMPLE_RATE / svc::TimeScale()));
+    for (auto next = Clock::now();;) {
+        next += period;
+        std::this_thread::sleep_until(next);
+        audio_frame();
+        if (Clock::now() - next > std::chrono::milliseconds(100)) next = Clock::now();  // host was suspended
+    }
 }
 
 void dsp_command(core::Memory& mem, u32 base) {
@@ -91,6 +114,8 @@ void dsp_command(core::Memory& mem, u32 base) {
                 for (u16 off : dsp::STRUCT_OFFSET) push16(u16(dsp::REGION0_WORD + off / 2));
                 if (state == 0) dsp::reset();
                 g_running = true;
+                static std::once_flag started;  // started here, not at registration: tests never get a thread
+                std::call_once(started, [] { std::thread(audio_thread).detach(); });
             } else if (state == 1 || state == 3) {  // Shutdown / Sleep
                 g_running = false;
             }
@@ -158,7 +183,6 @@ void dsp_command(core::Memory& mem, u32 base) {
 void register_dsp(core::Memory& mem) {
     g_mem = &mem;
     kernel::register_service("dsp::DSP", dsp_command);
-    kernel::add_periodic(4'888'000, audio_frame);  // 160 samples at 32728 Hz
 }
 
 }  // namespace hle::service

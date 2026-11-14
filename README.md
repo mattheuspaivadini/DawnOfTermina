@@ -46,7 +46,7 @@ cmake --build build
 
 ### Configuração e controles
 
-Na primeira execução é criado um `config.toml` ao lado de `game_data/` (ignorado pelo Git) com: **1080p**, widescreen **16:9**, **tela única** (a tela de baixo vira uma sobreposição), VSync e **60 FPS** (quadros intermediários interpolados; a lógica do jogo continua a 30 Hz). Tudo pode ser mudado em jogo no menu (**F1** ou **Esc**) e é salvo na hora; a escala de renderização (resolução interna) vale a partir da próxima execução.
+Na primeira execução é criado um `config.toml` ao lado de `game_data/` (ignorado pelo Git) com: **1080p**, widescreen **16:9**, **tela única** (a tela de baixo vira uma sobreposição), VSync e **30 FPS**. O modo **60 FPS** (quadros intermediários interpolados; a lógica do jogo continua a 30 Hz) renderiza o dobro na GPU: ative no menu se ela tiver folga na resolução escolhida. Tudo pode ser mudado em jogo no menu (**F1** ou **Esc**) e é salvo na hora; a escala de renderização (resolução interna) vale a partir da próxima execução.
 
 | Tecla | Ação |
 |---|---|

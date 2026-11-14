@@ -274,7 +274,14 @@ void output(const s16* samples, u32 frames) {
     if (!s) return;
     // Faster-than-real-time guest (DOT_SPEED, catch-up bursts): drop instead of piling up latency.
     constexpr int MAX_QUEUED = SAMPLE_RATE * 4 / 8;  // 125 ms of S16 stereo
-    if (SDL_GetAudioStreamQueued(s) > MAX_QUEUED) return;
+    const int queued = SDL_GetAudioStreamQueued(s);
+    if (queued > MAX_QUEUED) return;
+    // Start or underrun: lead the device by ~30 ms of silence. It pulls blocks larger than one
+    // 4.9 ms frame, so a queue only one frame deep runs dry between our frames and crackles.
+    if (queued < int(frames * 4)) {
+        static const std::vector<s16> lead(SAMPLE_RATE * 30 / 1000 * 2, 0);
+        SDL_PutAudioStreamData(s, lead.data(), int(lead.size() * 2));
+    }
     SDL_PutAudioStreamData(s, samples, int(frames * 4));
 }
 

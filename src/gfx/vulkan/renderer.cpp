@@ -243,6 +243,7 @@ struct Renderer::Impl {
         Image interp;              // frame interpolation: the in-between frame shown before `image`
         bool interp_fresh = false;  // `interp` goes with the current `image`
         std::chrono::steady_clock::time_point ready;  // when `image` and `interp` were both done
+        std::chrono::steady_clock::duration period{std::chrono::microseconds(33'430)};  // between real frames
         u32 width = 0, height = 0, bytes = 0;
         u64 ram_hash = 0;  // guest memory at the output when the transfer ran
     };
@@ -1313,8 +1314,13 @@ struct Renderer::Impl {
             }
             replaying = false;
             ++interp_frames;
+            const auto now = std::chrono::steady_clock::now();
             for (auto& [va, d] : displays)
-                if (d.interp_fresh) d.ready = std::chrono::steady_clock::now();
+                if (d.interp_fresh) {
+                    d.period = std::clamp<std::chrono::steady_clock::duration>(now - d.ready, std::chrono::microseconds(16'715),
+                                                                                std::chrono::milliseconds(100));
+                    d.ready = now;
+                }
         } else {
             ++interp_skipped;
         }
@@ -1592,10 +1598,10 @@ bool Renderer::display(core::Memory& mem, u32 va, GpuScreen& out, bool consume) 
     if (it == impl_->displays.end() || !it->second.image.img) return false;
     Impl::Display& d = it->second;
     if (hash_ram(mem.host(va), d.bytes) != d.ram_hash) return false;  // the CPU wrote the framebuffer since
-    // The in-between frame stays up for one 60 Hz period after both were ready, then the real
-    // one: even pacing at any monitor refresh (shortcut: assumes DOT_SPEED=1).
+    // The in-between frame stays up for half the time between real frames, then the real one:
+    // even pacing at any monitor refresh, also when the game drops to 20 or 15 frames/s.
     if (consume && d.interp_fresh) {
-        if (std::chrono::steady_clock::now() - d.ready < std::chrono::microseconds(16'715)) {
+        if (std::chrono::steady_clock::now() - d.ready < d.period / 2) {
             out = {d.interp.img, d.width, d.height};
             return true;
         }

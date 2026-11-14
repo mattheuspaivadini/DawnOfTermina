@@ -32,7 +32,7 @@ struct Config {
     std::string layout = "single";     // single (top screen fills the window) | dual
     bool fullscreen = false;
     bool vsync = true;
-    int fps = 60;                      // 30 (native) or 60 (frame interpolation)
+    int fps = 30;                      // 30 (native) or 60 (frame interpolation; needs GPU headroom)
     // [audio]
     int volume = 100;                  // percent
     // [input]

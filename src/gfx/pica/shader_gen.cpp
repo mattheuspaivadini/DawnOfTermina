@@ -18,6 +18,7 @@
 
 #include <cstdio>
 #include <format>
+#include <optional>
 #include <set>
 #include <vector>
 
@@ -89,8 +90,6 @@ struct Translator {
         }
     }
 
-    static std::string bool_uniform(u32 w) { return std::format("((u.b >> {}u) & 1u) != 0u", bits(w, 22, 4)); }
-
     // Arithmetic instruction (formats 1, 1i, 1c, 5, 5i). Returns false if unsupported.
     bool arith(u32 w, std::string* error) {
         const u32 op = w >> 26;
@@ -152,120 +151,105 @@ struct Translator {
         return true;
     }
 
-    static std::string push(const std::string& final_, const std::string& ret, const std::string& rep,
-                            const std::string& inc, const std::string& loop) {
-        return std::format("        if (sp < 16) {{ stk_final[sp] = {}; stk_ret[sp] = {}; stk_rep[sp] = {}; "
-                           "stk_inc[sp] = {}; stk_loop[sp] = {}; ++sp; }}\n",
-                           final_, ret, rep, inc, loop);
+    // Structured emission of [pc, final) with the bool/int uniforms known: static branches
+    // are resolved, CALLs inlined, LOOPs become counted for-loops (BREAK/BREAKC = break),
+    // IFC/CALLC become ifs, JMPC an if/else over the rest of the frame (forward jumps only).
+    // Returns false (with `error`) for flow it cannot structure.
+    // `ended`: an END was reached on every path through this range.
+    size_t budget = 32768;  // emitted instructions, bounds CALL inlining
+    bool emit(u32 pc, u32 final, int loops, bool& ended, std::string* error) {
+        const u32 n = u32(s.code.size());
+        ended = false;
+        while (pc != final) {
+            if (pc >= n || pc > final || budget-- == 0) return *error = "unstructured or oversized control flow", false;
+            const u32 w = s.code[pc], op = w >> 26;
+            const u32 dst = bits(w, 10, 12), num = bits(w, 0, 8);
+            auto buniform = [&] { return bool(s.bools >> bits(w, 22, 4) & 1); };
+            auto nested = [&](u32 from, u32 to, int l) {  // returns ended, or nullopt on failure
+                bool e = false;
+                return emit(from, to, l, e, error) ? std::optional<bool>(e) : std::nullopt;
+            };
+            ++pc;
+            switch (op) {
+            case NOP: break;
+            case END: body += "        return;\n"; ended = true; return true;
+            case BREAK:
+                if (!loops) return *error = "BREAK outside a loop", false;
+                body += "        break;\n";
+                return true;  // the rest of this range is dead
+            case BREAKC:
+                if (!loops) return *error = "BREAKC outside a loop", false;
+                body += std::format("        if ({}) break;\n", cond(w));
+                break;
+            case CALL: case CALLU: case CALLC: {
+                if (op == CALLU && !buniform()) break;
+                if (op == CALLC) body += std::format("        if ({}) {{\n", cond(w));
+                const auto e = nested(dst, dst + num, loops);
+                if (!e) return false;
+                if (op == CALLC) body += "        }\n";
+                else if (*e) return ended = true, true;
+                break;
+            }
+            case IFU: {
+                const auto e = buniform() ? nested(pc, dst, loops) : nested(dst, dst + num, loops);
+                if (!e) return false;
+                if (*e) return ended = true, true;
+                pc = dst + num;
+                break;
+            }
+            case IFC: {
+                body += std::format("        if ({}) {{\n", cond(w));
+                const auto a = nested(pc, dst, loops);
+                if (!a) return false;
+                body += "        } else {\n";
+                const auto b = nested(dst, dst + num, loops);
+                if (!b) return false;
+                body += "        }\n";
+                if (*a && *b) return ended = true, true;
+                pc = dst + num;
+                break;
+            }
+            case LOOP: {
+                const u32 iu = s.ints[bits(w, 22, 2)];
+                body += std::format("        aL = {};\n        for (int k{} = 0; k{} <= {}; ++k{}) {{\n", iu >> 8 & 0xFF,
+                                    pc, pc, iu & 0xFF, pc);
+                if (!nested(pc, dst + 1, loops + 1)) return false;
+                body += std::format("        aL += {};\n        }}\n", int(s8(iu >> 16)));
+                pc = dst + 1;
+                break;
+            }
+            case JMPU:
+            case JMPC:
+                if (op == JMPU && buniform() == bool(num & 1)) break;  // not taken
+                if (dst < pc || dst > final)
+                    return *error = std::format("backward or out-of-frame jump at {} to {} (frame ends at {})", pc - 1,
+                                                dst, final),
+                           false;
+                if (op == JMPC) {  // both paths continue to the end of the frame (tail duplicated)
+                    body += std::format("        if ({}) {{\n", cond(w));
+                    const auto a = nested(dst, final, loops);
+                    if (!a) return false;
+                    body += "        } else {\n";
+                    const auto b = nested(pc, final, loops);
+                    if (!b) return false;
+                    body += "        }\n";
+                    ended = *a && *b;
+                    return true;
+                }
+                pc = dst;
+                break;
+            case EMIT: case SETEMIT: return *error = "geometry shader opcodes (EMIT/SETEMIT) are not supported", false;
+            case LITP: return *error = "LITP is not supported", false;
+            default:
+                if (!arith(w, error)) return false;
+            }
+        }
+        return true;
     }
 
     std::string run(std::string* error) {
-        const u32 n = u32(s.code.size());
-        // Walk the code reachable from the entry point (blobs are shared between the
-        // programs of a SHBIN, e.g. a VS next to a GS) and collect block leaders: every
-        // address control flow can land on or where a CALL/IF/LOOP frame ends.
-        std::set<u32> reachable, leaders = {s.entry};
-        std::vector<u32> work = {s.entry};
-        auto add = [&](u32 pc) {
-            if (pc < n && reachable.insert(pc).second) work.push_back(pc);
-        };
-        reachable.insert(s.entry);
-        while (!work.empty()) {
-            const u32 pc = work.back();
-            work.pop_back();
-            const u32 w = s.code[pc], op = w >> 26;
-            const u32 dst = bits(w, 10, 12), num = bits(w, 0, 8);
-            switch (op) {
-            case CALL: case CALLC: case CALLU: case IFU: case IFC:
-                leaders.insert({dst, dst + num, pc + 1});
-                add(dst), add(dst + num), add(pc + 1);
-                break;
-            case LOOP:
-                leaders.insert({pc + 1, dst + 1});
-                add(pc + 1), add(dst + 1);
-                break;
-            case JMPC: case JMPU:
-                leaders.insert({dst, pc + 1});
-                add(dst), add(pc + 1);
-                break;
-            case END: case BREAK: leaders.insert(pc + 1); break;
-            case BREAKC: leaders.insert(pc + 1), add(pc + 1); break;
-            case EMIT: case SETEMIT:
-                *error = "geometry shader opcodes (EMIT/SETEMIT) are not supported";
-                return {};
-            case LITP:
-                *error = "LITP is not supported";
-                return {};
-            default: add(pc + 1); break;
-            }
-        }
-        for (u32 pc : reachable)
-            if (!reachable.count(pc - 1)) leaders.insert(pc);  // start of a reachable run
-
-        for (auto it = leaders.begin(); it != leaders.end() && *it < n; ++it) {
-            const u32 start = *it;
-            if (!reachable.count(start)) continue;
-            const u32 stop = std::next(it) == leaders.end() ? n : std::min(*std::next(it), n);
-            body += std::format("    case {}:\n", start);
-            bool terminated = false;
-            for (u32 pc = start; pc < stop && !terminated; ++pc) {
-                const u32 w = s.code[pc], op = w >> 26;
-                const u32 dst = bits(w, 10, 12), num = bits(w, 0, 8);
-                const std::string next = std::to_string(pc + 1);
-                switch (op) {
-                case NOP: break;
-                case END: body += "        running = false; break;\n"; terminated = true; break;
-                case BREAK:  // leave the innermost loop
-                    body += "        if (sp > 0) { pc = stk_ret[sp - 1]; --sp; } else { running = false; } break;\n";
-                    terminated = true;
-                    break;
-                case BREAKC:
-                    body += std::format("        if ({}) {{ if (sp > 0) {{ pc = stk_ret[sp - 1]; --sp; }} else {{ running = false; }} break; }}\n",
-                                        cond(w));
-                    body += std::format("        pc = {}; break;\n", next);
-                    terminated = true;
-                    break;
-                case CALL: case CALLC: case CALLU: {
-                    const std::string c = op == CALL ? "true" : op == CALLC ? cond(w) : bool_uniform(w);
-                    body += std::format("        if ({}) {{\n", c);
-                    body += push(std::to_string(dst + num), next, "0", "0", "0");
-                    body += std::format("        pc = {}; }} else pc = {};\n        break;\n", dst, next);
-                    terminated = true;
-                    break;
-                }
-                case IFU: case IFC: {
-                    const std::string c = op == IFC ? cond(w) : bool_uniform(w);
-                    body += std::format("        if ({}) {{\n", c);
-                    body += push(std::to_string(dst), std::to_string(dst + num), "0", "0", "0");
-                    body += std::format("        pc = {}; }} else {{\n", next);
-                    body += push(std::to_string(dst + num), std::to_string(dst + num), "0", "0", "0");
-                    body += std::format("        pc = {}; }}\n        break;\n", dst);
-                    terminated = true;
-                    break;
-                }
-                case LOOP: {
-                    const u32 id = bits(w, 22, 2);
-                    body += std::format("        aL = u.i[{}].y;\n", id);
-                    body += push(std::to_string(dst + 1), std::to_string(dst + 1), std::format("u.i[{}].x", id),
-                                 std::format("u.i[{}].z", id), next);
-                    body += std::format("        pc = {}; break;\n", next);
-                    terminated = true;
-                    break;
-                }
-                case JMPC: case JMPU: {
-                    const std::string c = op == JMPC ? cond(w)
-                                                     : std::format("(((u.b >> {}u) & 1u) != 0u) != {}",
-                                                                   bits(w, 22, 4), (num & 1) ? "true" : "false");
-                    body += std::format("        pc = ({}) ? {} : {}; break;\n", c, dst, next);
-                    terminated = true;
-                    break;
-                }
-                default:
-                    if (!arith(w, error)) return {};
-                }
-            }
-            if (!terminated) body += std::format("        pc = {}; break;\n", stop);
-        }
+        bool ended = false;
+        if (!emit(s.entry, ~0u, 0, ended, error)) return {};
 
         std::string out = "#version 450\n";
         for (u32 r : inputs_read) out += std::format("layout(location = {}) in vec4 vs_in{};\n", r, r);
@@ -292,31 +276,17 @@ vec4 dst_op(vec4 a, vec4 b) { return vec4(1.0, a.y * b.y, a.z, b.w); }
 vec4 max_op(vec4 a, vec4 b) { return mix(b, a, greaterThan(a, b)); }
 vec4 min_op(vec4 a, vec4 b) { return mix(b, a, lessThan(a, b)); }
 
-void main() {
-    vec4 v[16];
-    vec4 r[16];
-    vec4 o[16];
-    for (int k = 0; k < 16; ++k) { v[k] = vec4(0.0); r[k] = vec4(0.0); o[k] = vec4(0.0); }
+vec4 v[16], r[16], o[16];
+ivec2 a0 = ivec2(0);
+int aL = 0;
+bvec2 cc = bvec2(false);
+
+void run() {
 )";
-        for (u32 r : inputs_read) out += std::format("    v[{}] = vs_in{};\n", r, r);
-        out += std::format(R"(    ivec2 a0 = ivec2(0);
-    int aL = 0;
-    bvec2 cc = bvec2(false);
-    int stk_final[16], stk_ret[16], stk_rep[16], stk_inc[16], stk_loop[16];
-    int sp = 0;
-    int pc = {};
-    bool running = true;
-    // Dispatcher: one case per basic block; CALL/IF/LOOP frames end at stk_final.
-    for (int guard = 0; running && guard < 65536; ++guard) {{
-        while (sp > 0 && pc == stk_final[sp - 1]) {{
-            aL += stk_inc[sp - 1];
-            if (stk_rep[sp - 1]-- == 0) {{ pc = stk_ret[sp - 1]; --sp; }}
-            else pc = stk_loop[sp - 1];
-        }}
-        switch (pc) {{
-)", s.entry);
         out += body;
-        out += "    default: running = false; break;\n    }\n    }\n\n";
+        out += "}\n\nvoid main() {\n    for (int k = 0; k < 16; ++k) { v[k] = vec4(0.0); r[k] = vec4(0.0); o[k] = vec4(0.0); }\n";
+        for (u32 r : inputs_read) out += std::format("    v[{}] = vs_in{};\n", r, r);
+        out += "    run();\n";
 
         // Pack o0..o6 into the fixed varyings according to VS_OUTMAP.
         out += "    vec4 pos = vec4(0.0, 0.0, 0.0, 1.0);\n    vec4 col = vec4(0.0);\n"
@@ -334,7 +304,7 @@ void main() {
         // PICA window depth = z/w * scale + offset (depth.x/.y from regs 0x4D/0x4E); Vulkan's
         // depth range is the identity, so pre-multiply by w.
         out += R"(    gl_Position = vec4(pos.x, pos.y, pos.z * u.depth.x + pos.w * u.depth.y, pos.w);
-    primary_color = col;
+    primary_color = min(abs(col), vec4(1.0));
     texcoord0 = t0;
     texcoord1 = t1;
     texcoord2 = t2;

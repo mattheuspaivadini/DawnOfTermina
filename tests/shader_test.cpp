@@ -69,6 +69,18 @@ static void test_synthetic_vs() {
     assert(err.empty() && flow_glsl.find("u.c[clamp(0 + aL, 0, 95)]") != std::string::npos);
     assert(compiles(flow_glsl, ShaderStage::Vertex));
 
+    // Specialised: b0 set, i0 = 3 iterations (x = 2), aL from 5 step 1.
+    VsSource spec{flow, desc, 0, OUTMAP, 1, {2 | 5 << 8 | 1 << 16, 0, 0, 0}};
+    const std::string spec_glsl = generate_vertex_shader(spec, &err);
+    assert(spec_glsl.find("aL = 5;") != std::string::npos && spec_glsl.find("<= 2;") != std::string::npos);
+    assert(spec_glsl.find("switch") == std::string::npos && compiles(spec_glsl, ShaderStage::Vertex));
+
+    // Flow that cannot be structured is refused (the renderer then runs the CPU interpreter).
+    const std::vector<u32> back = {0x21u << 26, 0x2Du << 26 | 0 << 10 | 1, 0x22u << 26};  // NOP ; JMPU (b0 != 1) -> 0
+    assert(generate_vertex_shader({back, desc, 0, OUTMAP}, &err).empty() && err.find("jump") != std::string::npos);
+    const std::vector<u32> brk = {0x20u << 26, 0x22u << 26};  // BREAK outside a loop
+    assert(generate_vertex_shader({brk, desc, 0, OUTMAP}, &err).empty());
+
     const std::vector<u32> gs = {0x2Au << 26, 0x22u << 26};  // EMIT ; END
     assert(generate_vertex_shader({gs, desc, 0, OUTMAP}, &err).empty() && err.find("geometry") != std::string::npos);
 }
@@ -132,14 +144,17 @@ static void test_game_shaders(const stdfs::path& data) {
         for (const auto& prog : shbin->programs) {
             std::string err;
             const auto outmap = outmap_from_outputs(prog);
-            const std::string glsl = generate_vertex_shader({shbin->code, shbin->swizzles, prog.main, outmap}, &err);
             if (prog.type == ShaderProgram::GEOMETRY) {
-                assert(glsl.empty());
+                assert(generate_vertex_shader({shbin->code, shbin->swizzles, prog.main, outmap}, &err).empty());
                 ++gs;
                 continue;
             }
-            if (glsl.empty()) std::fprintf(stderr, "%s: %s\n", entry.path().filename().c_str(), err.c_str());
-            assert(!glsl.empty() && compiles(glsl, ShaderStage::Vertex));
+            for (u16 bools : {u16(0), u16(0xFFFF)}) {  // every bool-uniform branch both ways
+                const std::string glsl =
+                    generate_vertex_shader({shbin->code, shbin->swizzles, prog.main, outmap, bools}, &err);
+                if (glsl.empty()) std::fprintf(stderr, "%s: %s\n", entry.path().filename().c_str(), err.c_str());
+                assert(!glsl.empty() && compiles(glsl, ShaderStage::Vertex));
+            }
             ++vs;
         }
     }

@@ -184,6 +184,7 @@ struct Renderer::Impl {
     std::map<u32, VkSampler> samplers;
     std::map<u64, VkShaderModule> modules;
     VkShaderModule pass_vs = VK_NULL_HANDLE;
+    std::map<u64, VkShaderModule> vertex_shaders;  // by program + bool/int uniforms; null = CPU fallback
     std::map<u64, VkPipeline> pipelines;
     std::map<u32, float> depth_clears;  // last MemoryFill value per address, normalised
     std::mutex lock;  // draw/flush may come from different guest threads
@@ -593,12 +594,16 @@ struct Renderer::Impl {
                      "main", nullptr};
         stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs,
                      "main", nullptr};
-        VkVertexInputBindingDescription binding{0, sizeof(ShadedVertex), VK_VERTEX_INPUT_RATE_VERTEX};
-        VkVertexInputAttributeDescription attrs[6];
-        for (u32 i = 0; i < 6; ++i) attrs[i] = {i, 0, VK_FORMAT_R32G32B32A32_SFLOAT, i * 16};
+        // GPU vertex shaders read the raw inputs v0..v15; the pass-through one a ShadedVertex.
+        const bool raw = vs != pass_vs;
+        const u32 nattr = raw ? 16 : 6;
+        VkVertexInputBindingDescription binding{
+            0, raw ? u32(sizeof(pica::VertexInput)) : u32(sizeof(ShadedVertex)), VK_VERTEX_INPUT_RATE_VERTEX};
+        VkVertexInputAttributeDescription attrs[16];
+        for (u32 i = 0; i < nattr; ++i) attrs[i] = {i, 0, VK_FORMAT_R32G32B32A32_SFLOAT, i * 16};
         VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
         vi.vertexBindingDescriptionCount = 1, vi.pVertexBindingDescriptions = &binding;
-        vi.vertexAttributeDescriptionCount = 6, vi.pVertexAttributeDescriptions = attrs;
+        vi.vertexAttributeDescriptionCount = nattr, vi.pVertexAttributeDescriptions = attrs;
         VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
         ia.topology = topo == 1   ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
                       : topo == 2 ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN
@@ -646,6 +651,20 @@ struct Renderer::Impl {
         return p;
     }
 
+    // The draw's vertex program as a GPU shader specialised on the bool/int uniforms, or null
+    // when it cannot be structured (then it runs on the CPU).
+    VkShaderModule vertex_shader(const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs, u32 entry) {
+        u64 key = fnv(vs.code.data(), sizeof vs.code, fnv(vs.swizzle.data(), sizeof vs.swizzle));
+        key = fnv(&regs[OUTMAP], 7 * 4, fnv(vs.int_uniforms.data(), 16, fnv(&vs.bool_uniforms, 2, fnv(&entry, 4, key))));
+        auto it = vertex_shaders.find(key);
+        if (it != vertex_shaders.end()) return it->second;
+        std::string err;
+        const std::string glsl = pica::generate_vertex_shader(
+            {vs.code, vs.swizzle, entry, {&regs[OUTMAP], 7}, vs.bool_uniforms, vs.int_uniforms}, &err);
+        if (glsl.empty()) std::fprintf(stderr, "renderer: vertex program %u on the CPU: %s\n", entry, err.c_str());
+        return vertex_shaders[key] = glsl.empty() ? VK_NULL_HANDLE : module(glsl, ShaderStage::Vertex);
+    }
+
     void draw(Memory& mem, const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs, bool indexed) {
         auto skip = [&](const char* why) {
             static std::map<std::string, bool> seen;
@@ -657,10 +676,12 @@ struct Renderer::Impl {
         std::vector<pica::VertexInput> verts;
         if (!pica::load_vertices(mem, regs, vs, indexed, verts) || verts.empty()) return skip("vertex fetch");
 
-        // Vertex shader: run on the CPU, outputs packed through VS_OUTMAP.
+        // Vertex shader on the GPU when possible, else run on the CPU with the outputs packed
+        // through VS_OUTMAP for the pass-through shader.
         const u32 entry = regs[VS_ENTRY] & 0xFFFF;
-        std::vector<ShadedVertex> shaded(verts.size());
-        {
+        const VkShaderModule gpu_vs = vertex_shader(regs, vs, entry);
+        std::vector<ShadedVertex> shaded(gpu_vs ? 0 : verts.size());
+        if (!gpu_vs) {
             ShadedVertex sv{};
             float* const p = sv.pos;  // indices into the packed vertex, by semantic id
             const int offs[0x18] = {0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 8, 9, 10, 11, 14, -1, 20, 21, 22, -1, 12, 13};
@@ -678,7 +699,7 @@ struct Renderer::Impl {
             }
         }
         if (!pass_vs) pass_vs = module(PASS_VS, ShaderStage::Vertex);
-        const VkShaderModule vmod = pass_vs;
+        const VkShaderModule vmod = gpu_vs ? gpu_vs : pass_vs;
         const VkShaderModule fmod = module(pica::generate_fragment_shader(regs), ShaderStage::Fragment);
         if (!vmod || !fmod) return skip("shader compile");
         const VkPipeline pipe = pipeline(vmod, fmod, regs);
@@ -686,7 +707,8 @@ struct Renderer::Impl {
 
         // Room in this batch: vertices, uniforms, lighting, staging (texture uploads are
         // bounded by the units' full sizes, the target upload by its size).
-        const VkDeviceSize vbytes = shaded.size() * sizeof(ShadedVertex);
+        const void* const vdata = gpu_vs ? static_cast<const void*>(verts.data()) : shaded.data();
+        const VkDeviceSize vbytes = gpu_vs ? verts.size() * sizeof(pica::VertexInput) : shaded.size() * sizeof(ShadedVertex);
         VkDeviceSize xbytes = target.fresh ? align(VkDeviceSize(target.width) * target.height * 4) : 0;
         for (u32 i = 0; i < 3; ++i)
             if (regs[TEX_CONFIG] >> i & 1) {
@@ -703,7 +725,7 @@ struct Renderer::Impl {
 
         // Vertex data and uniforms.
         const VkDeviceSize voff = take(vb_used, vbytes), uoff = take(ub_used, UBO_SIZE);
-        std::memcpy(vbuf.ptr + voff, shaded.data(), vbytes);
+        std::memcpy(vbuf.ptr + voff, vdata, vbytes);
         u8* u = ubuf.ptr + uoff;
         std::memcpy(u, vs.float_uniforms.data(), 96 * 16);
         for (u32 i = 0; i < 4; ++i) {

@@ -39,10 +39,14 @@ struct VsSource {
     std::span<const u32> swizzles;  // operand descriptors (VS_SWIZZLE_DATA)
     u32 entry;                      // main offset in words
     std::span<const u32> outmap;    // VS_OUTMAP registers 0x50..0x56 (7 values)
+    u16 bools = 0;                  // b0..b15 and i0..i3 at draw time: baked into the shader
+    std::array<u32, 4> ints{};
 };
 
-// Returns GLSL, or an empty string with `error` set for unsupported programs
-// (geometry-only opcodes, LITP).
+// Returns GLSL specialised for `bools`/`ints` as structured code (no dispatcher loop, which
+// Mesa takes minutes to compile), or an empty string with `error` set for programs it cannot
+// structure (backward jumps, BREAK outside a loop, geometry-only opcodes, LITP); the caller
+// then runs the program on the CPU (shader_interp.h).
 std::string generate_vertex_shader(const VsSource& src, std::string* error);
 
 // Fragment shader for the TEV combiner / alpha-test state in the register file.

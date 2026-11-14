@@ -1,0 +1,31 @@
+# Proprietary game data — bring-your-own-ROM, NEVER commit
+*.cia
+*.3ds
+*.cci
+*.cxi
+*.ncch
+*.app
+*.bin
+*.elf
+*.axf
+*.hop
+*.hopper
+ISO/
+input/
+game_data/
+romfs/
+exefs/
+
+# Build
+build/
+build-*/
+cmake-build-*/
+compile_commands.json
+.cache/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+__pycache__/

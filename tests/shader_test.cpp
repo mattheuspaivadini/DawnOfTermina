@@ -97,6 +97,23 @@ static void test_fragment() {
         regs[0xC2] = op | op << 16;
         assert(compiles(generate_fragment_shader(regs), ShaderStage::Fragment));
     }
+
+    // Fragment lighting: every LUT configuration, 3 lights (spot, distance attenuation,
+    // geometric factors, two-sided), normal map from texture 1, Fresnel into both alphas.
+    regs[0x8F] = 1;
+    regs[0x1C2] = 2;
+    regs[0x1D9] = 0x210;
+    regs[0x140 + 0x10 + 9] = 0xE;  // light 1: two-sided + both geometric factors
+    regs[0x1D1] = 0x05432105;      // CP input for D0, every other input once
+    regs[0x1D0] = 0x2;             // D0 signed, others abs
+    for (u32 cfg : {0u, 1u, 2u, 3u, 4u, 5u, 6u, 8u}) {
+        regs[0x1C3] = cfg << 4 | 3 << 2 | 1 << 22 | 1u << 28 | 1 << 27;
+        const std::string lit = generate_fragment_shader(regs);
+        assert(lit.find("primary_fragment_color = clamp(diffuse_sum") != std::string::npos);
+        assert(compiles(lit, ShaderStage::Fragment));
+    }
+    regs[0x1C6] = 1;  // disabled again
+    assert(generate_fragment_shader(regs).find("diffuse_sum") == std::string::npos);
 }
 
 // The game's own shader binaries: every vertex program must translate and compile.

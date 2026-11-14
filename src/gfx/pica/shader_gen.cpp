@@ -417,6 +417,144 @@ std::string combine(u32 op, const std::string& T, const std::string& a, const st
     }
 }
 
+// ---------------------------------------------------------------- fragment lighting
+//
+// Structure (enabled lights, LUT inputs/scales, configuration) is baked into the shader;
+// light colours, positions and the LUTs are read at runtime from the PicaLighting buffer,
+// which holds raw registers 0x140..0x1C0 and ShaderState::light_lut. Follows the hardware
+// model documented by Citra (PICA200 lighting).
+
+constexpr u32 LIGHTING_ENABLE = 0x08F, LIGHT0 = 0x140, LIGHT_MAX_INDEX = 0x1C2, LIGHT_CONFIG0 = 0x1C3,
+              LIGHT_CONFIG1 = 0x1C4, LIGHTING_DISABLE = 0x1C6, LUT_ABS = 0x1D0, LUT_SELECT = 0x1D1,
+              LUT_SCALE = 0x1D2, LIGHT_PERMUTATION = 0x1D9;
+
+constexpr const char* LIGHTING_DECLS = R"(layout(std430, set = 0, binding = 1) readonly buffer PicaLighting { uint lr[0x90]; uint lut[24 * 256]; };
+vec3 light_color(uint r) { return vec3((r >> 20) & 0x3FFu, (r >> 10) & 0x3FFu, r & 0x3FFu) / 255.0; }
+float f16(uint v) { return unpackHalf2x16(v & 0xFFFFu).x; }
+float f20(uint v) {  // 1.7.12 float
+    if ((v & 0x7FFFFu) == 0u) return 0.0;
+    float m = ldexp(1.0 + float(v & 0xFFFu) / 4096.0, int((v >> 12) & 0x7Fu) - 63);
+    return (v & 0x80000u) != 0u ? -m : m;
+}
+float lut_entry(int t, int i, float delta) {
+    uint e = lut[t * 256 + i];
+    return float(e & 0xFFFu) / 4095.0 + float(bitfieldExtract(int(e), 12, 12)) / 2047.0 * delta;
+}
+float lut_unsigned(int t, float pos) {
+    int i = int(clamp(floor(pos * 256.0), 0.0, 255.0));
+    return lut_entry(t, i, pos * 256.0 - float(i));
+}
+float lut_signed(int t, float pos) {
+    int i = int(clamp(floor(pos * 128.0), -128.0, 127.0));
+    return lut_entry(t, i & 255, pos * 128.0 - float(i));
+}
+vec3 quaternion_rotate(vec4 q, vec3 v) { return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v); }
+)";
+
+bool lighting_enabled(const std::array<u32, reg::COUNT>& regs) {
+    return (regs[LIGHTING_ENABLE] & 1) && !(regs[LIGHTING_DISABLE] & 1);
+}
+
+// Computes primary/secondary_fragment_color (declared by the caller).
+// shortcut: no shadow maps (shadow bits ignored); add when a scene renders shadows.
+std::string lighting(const std::array<u32, reg::COUNT>& regs) {
+    const u32 c0 = regs[LIGHT_CONFIG0], c1 = regs[LIGHT_CONFIG1], cfg = c0 >> 4 & 0xF;
+    // LUT ids and their nibble in LUT_ABS/SELECT/SCALE.
+    enum { D0 = 0, D1 = 1, FR = 3, RB = 4, RG = 5, RR = 6, SP = 8 };
+    auto shift = [](int t) { return t == D0 ? 0 : t == D1 ? 4 : t == SP ? 8 : t == FR ? 12 : t == RB ? 16 : t == RG ? 20 : 24; };
+    auto supported = [&](int t) {  // tables each LIGHT_CONFIG0 configuration provides (Config7 = 8)
+        switch (t) {
+        case D0: return cfg != 1;
+        case D1: return cfg != 0 && cfg != 1 && cfg != 5;
+        case FR: return cfg != 0 && cfg != 2 && cfg != 4;
+        case RR: return cfg != 3;
+        case RG: case RB: return cfg == 4 || cfg == 5 || cfg == 8;
+        default: return cfg != 2 && cfg != 3;  // SP
+        }
+    };
+    auto enabled = [&](int t) {  // global LUT disable bits in LIGHT_CONFIG1 (SP is per light)
+        const int bit = t == D0 ? 16 : t == D1 ? 17 : t == FR ? 19 : t == RR ? 20 : t == RG ? 21 : 22;
+        return supported(t) && !(c1 >> bit & 1);
+    };
+    // Scaled LUT lookup of table `t` (sampler `sampler`) for the light whose config is `lcfg`.
+    auto lookup = [&](int t, int sampler, u32 lcfg) {
+        static const char* INPUT[] = {"dot(normal, normalize(half_vector))", "dot(normalize(view), normalize(half_vector))",
+                                      "dot(normal, normalize(view))", "dot(light_vector, normal)",
+                                      "dot(light_vector, spot_dir)"};
+        static const float SCALE[8] = {1, 2, 4, 8, 1, 1, 0.25f, 0.5f};
+        const u32 sh = shift(t), in = regs[LUT_SELECT] >> sh & 7;
+        std::string index = in < 5 ? INPUT[in]
+                            : in == 5 && cfg == 8
+                                ? "dot(normalize(half_vector) - normal * dot(normal, normalize(half_vector)), tangent)"
+                                : "0.0";
+        const bool abs = !(regs[LUT_ABS] >> (sh + 1) & 1);
+        const std::string value = abs ? std::format("lut_unsigned({}, {}({}{}))", sampler, lcfg >> 1 & 1 ? "abs" : "max",
+                                                    index, lcfg >> 1 & 1 ? "" : ", 0.0")
+                                      : std::format("lut_signed({}, {})", sampler, index);
+        return std::format("({:.4f} * {})", SCALE[regs[LUT_SCALE] >> sh & 7], value);
+    };
+
+    std::string out = R"(    vec3 surface_normal = vec3(0.0, 0.0, 1.0), surface_tangent = vec3(1.0, 0.0, 0.0);
+)";
+    const u32 bump_mode = c0 >> 28 & 3, bump_tex = std::min<u32>(c0 >> 22 & 3, 2);
+    if (bump_mode == 1 || bump_mode == 2) {  // normal map / tangent map from a texture unit
+        const char* v = bump_mode == 1 ? "surface_normal" : "surface_tangent";
+        out += std::format("    {} = 2.0 * tex_color{}.rgb - 1.0;\n", v, bump_tex);
+        if (!(c0 >> 30 & 1)) out += std::format("    {0}.z = sqrt(max(1.0 - dot({0}.xy, {0}.xy), 0.0));\n", v);
+    }
+    out += R"(    vec4 nq = normalize(normquat);
+    vec3 normal = quaternion_rotate(nq, surface_normal);
+    vec3 tangent = quaternion_rotate(nq, surface_tangent);
+    vec4 diffuse_sum = vec4(0.0, 0.0, 0.0, 1.0), specular_sum = vec4(0.0, 0.0, 0.0, 1.0);
+    vec3 light_vector, spot_dir, half_vector, refl_value;
+)";
+    const u32 count = (regs[LIGHT_MAX_INDEX] & 7) + 1;
+    for (u32 i = 0; i < count; ++i) {
+        const u32 n = regs[LIGHT_PERMUTATION] >> (4 * i) & 7, b = n * 16, lcfg = regs[LIGHT0 + b + 9];
+        out += std::format(R"(    {{  // light {0}
+    vec3 lpos = vec3(f16(lr[{1}]), f16(lr[{1}] >> 16), f16(lr[{2}]));
+    light_vector = normalize({3});
+    spot_dir = vec3(bitfieldExtract(int(lr[{4}]), 0, 13), bitfieldExtract(int(lr[{4}]), 16, 13),
+                    bitfieldExtract(int(lr[{5}]), 0, 13)) / 2047.0;
+    half_vector = normalize(view) + light_vector;
+    float dot_product = {6};
+    float geo_factor = dot(half_vector, half_vector);
+    geo_factor = geo_factor == 0.0 ? 0.0 : min(dot_product / geo_factor, 1.0);
+)",
+                           n, b + 4, b + 5, lcfg & 1 ? "lpos" : "lpos + view", b + 6, b + 7,
+                           lcfg >> 1 & 1 ? "abs(dot(light_vector, normal))" : "max(dot(light_vector, normal), 0.0)");
+        const bool spot = !(c1 >> (8 + n) & 1) && supported(SP), dist = !(c1 >> (24 + n) & 1);
+        out += std::format("    float spot_atten = {};\n", spot ? lookup(SP, SP + n, lcfg) : "1.0");
+        out += dist ? std::format("    float dist_atten = lut_unsigned({}, clamp(f20(lr[{}]) * length(-view - lpos) + "
+                                  "f20(lr[{}]), 0.0, 1.0));\n",
+                                  16 + n, b + 11, b + 10)
+                    : "    float dist_atten = 1.0;\n";
+        out += std::format("    vec3 specular_0 = {} * light_color(lr[{}]){};\n", enabled(D0) ? lookup(D0, D0, lcfg) : "1.0",
+                           b, lcfg >> 2 & 1 ? " * geo_factor" : "");
+        out += std::format("    refl_value.r = {};\n", enabled(RR) ? lookup(RR, RR, lcfg) : "1.0");
+        out += std::format("    refl_value.g = {};\n", enabled(RG) ? lookup(RG, RG, lcfg) : "refl_value.r");
+        out += std::format("    refl_value.b = {};\n", enabled(RB) ? lookup(RB, RB, lcfg) : "refl_value.r");
+        out += std::format("    vec3 specular_1 = {} * refl_value * light_color(lr[{}]){};\n",
+                           enabled(D1) ? lookup(D1, D1, lcfg) : "1.0", b + 1, lcfg >> 3 & 1 ? " * geo_factor" : "");
+        if (enabled(FR)) {  // Fresnel replaces alpha; the last light's value wins
+            const std::string fr = lookup(FR, FR, lcfg);
+            if (c0 >> 2 & 1) out += std::format("    diffuse_sum.a = {};\n", fr);
+            if (c0 >> 3 & 1) out += std::format("    specular_sum.a = {};\n", fr);
+        }
+        out += std::format(R"(    float clamp_highlights = {};
+    diffuse_sum.rgb += (light_color(lr[{}]) * dot_product + light_color(lr[{}])) * dist_atten * spot_atten;
+    specular_sum.rgb += (specular_0 + specular_1) * clamp_highlights * dist_atten * spot_atten;
+    }}
+)",
+                           c0 >> 27 & 1 ? "dot(light_vector, normal) <= 0.0 ? 0.0 : 1.0" : "1.0", b + 2, b + 3);
+    }
+    out += R"(    diffuse_sum.rgb += light_color(lr[0x80]);
+    primary_fragment_color = clamp(diffuse_sum, 0.0, 1.0);
+    secondary_fragment_color = clamp(specular_sum, 0.0, 1.0);
+)";
+    return out;
+}
+
 }  // namespace
 
 std::string generate_fragment_shader(const std::array<u32, reg::COUNT>& regs) {
@@ -432,7 +570,10 @@ layout(set = 1, binding = 0) uniform sampler2D tex0;
 layout(set = 1, binding = 1) uniform sampler2D tex1;
 layout(set = 1, binding = 2) uniform sampler2D tex2;
 layout(location = 0) out vec4 frag_color;
-
+)";
+    const bool lit = lighting_enabled(regs);
+    if (lit) out += LIGHTING_DECLS;
+    out += R"(
 void main() {
     vec4 tex_color0 = texture(tex0, texcoord0);
     vec4 tex_color1 = texture(tex1, texcoord1);
@@ -448,6 +589,7 @@ void main() {
     vec4 const_color;
 )",
                        (buf & 0xFF) / 255.0, (buf >> 8 & 0xFF) / 255.0, (buf >> 16 & 0xFF) / 255.0, (buf >> 24) / 255.0);
+    if (lit) out += lighting(regs);
 
     static const float SCALE[4] = {1.0f, 2.0f, 4.0f, 1.0f};
     for (u32 i = 0; i < 6; ++i) {

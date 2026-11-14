@@ -52,6 +52,8 @@ constexpr u32 PRIMITIVE_CONFIG = 0x25E, VS_ENTRY = 0x2BA;
 constexpr u32 TEX_REGS[3][4] = {{0x082, 0x083, 0x085, 0x08E}, {0x092, 0x093, 0x095, 0x096}, {0x09A, 0x09B, 0x09D, 0x09E}};
 
 constexpr u32 UBO_SIZE = 96 * 16 + 4 * 16 + 16 + 16;
+constexpr u32 LIGHT_REGS = 0x140, LIGHT_REG_WORDS = 0x90;  // fragment lighting buffer, see shader_gen.h
+constexpr u32 LIGHT_BUF_SIZE = (LIGHT_REG_WORDS + 24 * 256) * 4;
 
 // A vertex after the (CPU-run) PICA vertex shader, packed by output semantic.
 struct ShadedVertex {
@@ -169,7 +171,7 @@ struct Renderer::Impl {
     VkDescriptorSetLayout set_layouts[2]{};
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
-    Buffer vbuf, ubuf, xfer;
+    Buffer vbuf, ubuf, lbuf, xfer;
     Target target;
     Texture dummy;
     std::map<u64, Texture> textures;  // by (va, size, format)
@@ -320,12 +322,14 @@ struct Renderer::Impl {
         rpi.pSubpasses = &sub;
         if (!check(vkCreateRenderPass(dev, &rpi, nullptr, &render_pass), "vkCreateRenderPass")) return false;
 
-        VkDescriptorSetLayoutBinding ubo{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+        const VkDescriptorSetLayoutBinding bufs[2] = {
+            {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
         VkDescriptorSetLayoutBinding tex[3];
         for (u32 i = 0; i < 3; ++i)
             tex[i] = {i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        li.bindingCount = 1, li.pBindings = &ubo;
+        li.bindingCount = 2, li.pBindings = bufs;
         vkCreateDescriptorSetLayout(dev, &li, nullptr, &set_layouts[0]);
         li.bindingCount = 3, li.pBindings = tex;
         vkCreateDescriptorSetLayout(dev, &li, nullptr, &set_layouts[1]);
@@ -333,16 +337,18 @@ struct Renderer::Impl {
         pli.setLayoutCount = 2;
         pli.pSetLayouts = set_layouts;
         vkCreatePipelineLayout(dev, &pli, nullptr, &pipeline_layout);
-        VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4},
-                                         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 12}};
+        VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4},
+                                         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 12},
+                                         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}};
         VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         dpi.maxSets = 4;
-        dpi.poolSizeCount = 2;
+        dpi.poolSizeCount = 3;
         dpi.pPoolSizes = sizes;
         vkCreateDescriptorPool(dev, &dpi, nullptr, &desc_pool);
 
         ensure(vbuf, 1 << 20, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
         ensure(ubuf, UBO_SIZE, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+        ensure(lbuf, LIGHT_BUF_SIZE, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         ensure(xfer, 1 << 20, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 
         // 1x1 white texture for disabled units.
@@ -662,6 +668,8 @@ struct Renderer::Impl {
         std::memcpy(u + 1600, depth, 16);
         const u32 bools = vs.bool_uniforms;
         std::memcpy(u + 1616, &bools, 4);
+        std::memcpy(lbuf.ptr, &regs[LIGHT_REGS], LIGHT_REG_WORDS * 4);
+        std::memcpy(lbuf.ptr + LIGHT_REG_WORDS * 4, vs.light_lut.data(), sizeof(vs.light_lut));
 
         begin();
         // Texture uploads (before the render pass).
@@ -695,16 +703,18 @@ struct Renderer::Impl {
         dai.descriptorSetCount = 2;
         dai.pSetLayouts = set_layouts;
         vkAllocateDescriptorSets(dev, &dai, sets);
-        VkDescriptorBufferInfo bi{ubuf.buf, 0, UBO_SIZE};
+        const VkDescriptorBufferInfo bi[2] = {{ubuf.buf, 0, UBO_SIZE}, {lbuf.buf, 0, LIGHT_BUF_SIZE}};
         VkDescriptorImageInfo ii[3];
         for (u32 i = 0; i < 3; ++i)
             ii[i] = {sampler(regs[TEX_REGS[i][1]]), tex[i]->image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        VkWriteDescriptorSet w[2]{};
+        VkWriteDescriptorSet w[3]{};
         w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                nullptr, &bi, nullptr};
+                nullptr, &bi[0], nullptr};
+        w[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                nullptr, &bi[1], nullptr};
         w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets[1], 0, 0, 3,
                 VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ii, nullptr, nullptr};
-        vkUpdateDescriptorSets(dev, 2, w, 0, nullptr);
+        vkUpdateDescriptorSets(dev, 3, w, 0, nullptr);
 
         VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         rbi.renderPass = render_pass;

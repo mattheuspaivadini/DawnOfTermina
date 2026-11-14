@@ -142,7 +142,7 @@ int main(int argc, char** argv) {
         if (!gpu.init(window)) return 1;
 #ifdef DOT_HAVE_RECOMP
         gfx::vulkan::Renderer renderer(gpu);
-        if (!renderer.init()) return 1;
+        if (!renderer.init(std::filesystem::absolute(data).parent_path() / "cache")) return 1;
         hle::service::gsp::set_renderer(&renderer);
 #endif
         const std::vector<u32> top(gfx::vulkan::TOP_W * gfx::vulkan::SCREEN_H, 0xFF402010);
@@ -182,11 +182,12 @@ int main(int argc, char** argv) {
                     last_vblanks = st.vblanks;
                     const auto rs = renderer.stats();
                     std::printf("gsp: vblanks %llu, command lists %llu, draws %llu, fills %llu, transfers %llu | "
-                                "rendered %llu, skipped %llu, pipelines %llu, flushes %llu\n",
+                                "rendered %llu, skipped %llu, pipelines %llu, shaders %llu, flushes %llu\n",
                                 (unsigned long long)st.vblanks, (unsigned long long)st.command_lists,
                                 (unsigned long long)st.draws, (unsigned long long)st.memory_fills,
                                 (unsigned long long)st.display_transfers, (unsigned long long)rs.draws,
                                 (unsigned long long)rs.skipped, (unsigned long long)rs.pipelines,
+                                (unsigned long long)rs.shaders,
                                 (unsigned long long)rs.flushes);
                 }
             }

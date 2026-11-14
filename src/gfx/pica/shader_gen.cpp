@@ -527,6 +527,14 @@ std::string lighting(const std::array<u32, reg::COUNT>& regs) {
 
 }  // namespace
 
+std::array<u32, FRAGMENT_PUSH_WORDS> fragment_push_constants(const std::array<u32, reg::COUNT>& regs) {
+    std::array<u32, FRAGMENT_PUSH_WORDS> pc{};
+    for (u32 i = 0; i < 6; ++i) pc[i] = regs[TEV_STAGE_REGS[i] + 3];
+    pc[6] = regs[TEV_BUFFER_COLOR];
+    pc[7] = regs[ALPHA_TEST] >> 8 & 0xFF;
+    return pc;
+}
+
 std::string generate_fragment_shader(const std::array<u32, reg::COUNT>& regs) {
     std::string out = R"(#version 450
 layout(location = 0) in vec4 primary_color;
@@ -540,6 +548,7 @@ layout(set = 1, binding = 0) uniform sampler2D tex0;
 layout(set = 1, binding = 1) uniform sampler2D tex1;
 layout(set = 1, binding = 2) uniform sampler2D tex2;
 layout(location = 0) out vec4 frag_color;
+layout(push_constant) uniform PicaFragment { uint tev_const[6]; uint tev_buffer_color; uint alpha_ref; } pc;
 )";
     const bool lit = lighting_enabled(regs);
     if (lit) out += LIGHTING_DECLS;
@@ -550,26 +559,22 @@ void main() {
 )";
     // TEXUNIT_CONFIG bit 13: texture 2 samples texcoord1 instead of texcoord2.
     out += std::format("    vec4 tex_color2 = texture(tex2, {});\n", regs[0x80] >> 13 & 1 ? "texcoord1" : "texcoord2");
-    const u32 buf = regs[TEV_BUFFER_COLOR];
-    out += std::format(R"(    vec4 primary_fragment_color = vec4(0.0);
+    out += R"(    vec4 primary_fragment_color = vec4(0.0);
     vec4 secondary_fragment_color = vec4(0.0);
     vec4 combiner_buffer = vec4(0.0);
-    vec4 next_combiner_buffer = vec4({:.6f}, {:.6f}, {:.6f}, {:.6f});
+    vec4 next_combiner_buffer = unpackUnorm4x8(pc.tev_buffer_color);
     vec4 last_tex_env_out = vec4(0.0);
     vec4 const_color;
-)",
-                       (buf & 0xFF) / 255.0, (buf >> 8 & 0xFF) / 255.0, (buf >> 16 & 0xFF) / 255.0, (buf >> 24) / 255.0);
+)";
     if (lit) out += lighting(regs);
 
     static const float SCALE[4] = {1.0f, 2.0f, 4.0f, 1.0f};
     for (u32 i = 0; i < 6; ++i) {
         const u32 base = TEV_STAGE_REGS[i];
-        const u32 srcs = regs[base], ops = regs[base + 1], comb = regs[base + 2], cst = regs[base + 3],
-                  scale = regs[base + 4];
+        const u32 srcs = regs[base], ops = regs[base + 1], comb = regs[base + 2], scale = regs[base + 4];
         const u32 color_op = comb & 0xF, alpha_op = comb >> 16 & 0xF;
         out += std::format("    // TEV stage {}\n    {{\n", i);
-        out += std::format("    const_color = vec4({:.6f}, {:.6f}, {:.6f}, {:.6f});\n", (cst & 0xFF) / 255.0,
-                           (cst >> 8 & 0xFF) / 255.0, (cst >> 16 & 0xFF) / 255.0, (cst >> 24) / 255.0);
+        out += std::format("    const_color = unpackUnorm4x8(pc.tev_const[{}]);\n", i);
         std::string ca[3], aa[3];
         for (u32 k = 0; k < 3; ++k) {
             ca[k] = color_operand(ops >> (4 * k) & 0xF, tev_source(srcs >> (4 * k) & 0xF));
@@ -597,7 +602,7 @@ void main() {
         const u32 func = at >> 4 & 7;
         if (func == 0) out += "    discard;\n";
         else if (func > 1)
-            out += std::format("    if (!(int(last_tex_env_out.a * 255.0) {} {})) discard;\n", keep[func], at >> 8 & 0xFF);
+            out += std::format("    if (!(int(last_tex_env_out.a * 255.0) {} int(pc.alpha_ref))) discard;\n", keep[func]);
     }
     out += "    frag_color = last_tex_env_out;\n}\n";
     return out;

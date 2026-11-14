@@ -20,6 +20,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <span>
@@ -190,6 +192,17 @@ struct Renderer::Impl {
     std::mutex lock;  // draw/flush may come from different guest threads
     Stats stats{};
 
+    // On-disk caches so a scene compiles its shaders once, not once per run: SPIR-V by GLSL
+    // hash (skips glslang) and the driver's VkPipelineCache. Saved at most every 10 s while
+    // new entries appear (the process is often killed rather than closed) and on shutdown.
+    // shortcut: entries are never evicted; delete the cache directory if it grows too big.
+    std::filesystem::path cache_dir;
+    VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
+    std::map<u64, std::vector<u32>> spirv_cache;
+    bool cache_dirty = false;
+    std::chrono::steady_clock::time_point cache_saved = std::chrono::steady_clock::now();
+    static constexpr u32 SPIRV_CACHE_MAGIC = 0x31565053;  // "SPV1"
+
     explicit Impl(Context& c) : ctx(c) {}
 
     u32 memory_type(u32 bits, VkMemoryPropertyFlags props) {
@@ -308,8 +321,76 @@ struct Renderer::Impl {
         last_light.clear();
     }
 
-    bool init() {
+    static std::vector<u8> read_file(const std::filesystem::path& p) {
+        std::ifstream f(p, std::ios::binary);
+        return {std::istreambuf_iterator<char>(f), {}};
+    }
+
+    void load_caches() {
+        const auto pc = read_file(cache_dir / "pipeline_cache.bin");
+        VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        ci.initialDataSize = pc.size(), ci.pInitialData = pc.data();  // the driver rejects foreign data itself
+        if (vkCreatePipelineCache(dev, &ci, nullptr, &pipeline_cache) != VK_SUCCESS) {
+            ci.initialDataSize = 0;
+            vkCreatePipelineCache(dev, &ci, nullptr, &pipeline_cache);
+        }
+        // spirv_cache.bin: magic, then { u64 key; u32 words; u32 code[words] }...
+        const auto sc = read_file(cache_dir / "spirv_cache.bin");
+        size_t at = 4;
+        u32 magic = 0;
+        if (sc.size() >= 4) std::memcpy(&magic, sc.data(), 4);
+        while (magic == SPIRV_CACHE_MAGIC && at + 12 <= sc.size()) {
+            u64 key;
+            u32 words;
+            std::memcpy(&key, &sc[at], 8), std::memcpy(&words, &sc[at + 8], 4);
+            at += 12;
+            if (words > (sc.size() - at) / 4) break;  // truncated file: keep what was complete
+            auto& code = spirv_cache[key];
+            code.resize(words);
+            std::memcpy(code.data(), &sc[at], size_t(words) * 4);
+            at += size_t(words) * 4;
+        }
+    }
+
+    // Writes to a temporary file first so a kill mid-save cannot leave a corrupt cache.
+    static void write_file(const std::filesystem::path& p, const std::vector<u8>& data) {
+        const auto tmp = std::filesystem::path(p) += ".tmp";
+        {
+            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            f.write(reinterpret_cast<const char*>(data.data()), std::streamsize(data.size()));
+            if (!f) return;
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmp, p, ec);
+    }
+
+    void save_caches() {
+        if (!cache_dirty || cache_dir.empty()) return;
+        cache_dirty = false;
+        cache_saved = std::chrono::steady_clock::now();
+        std::error_code ec;
+        std::filesystem::create_directories(cache_dir, ec);
+        size_t size = 0;
+        vkGetPipelineCacheData(dev, pipeline_cache, &size, nullptr);
+        std::vector<u8> data(size);
+        if (vkGetPipelineCacheData(dev, pipeline_cache, &size, data.data()) == VK_SUCCESS)
+            write_file(cache_dir / "pipeline_cache.bin", data);
+        data.assign(4, 0);
+        std::memcpy(data.data(), &SPIRV_CACHE_MAGIC, 4);
+        for (const auto& [key, code] : spirv_cache) {
+            const u32 words = u32(code.size());
+            const size_t at = data.size();
+            data.resize(at + 12 + code.size() * 4);
+            std::memcpy(&data[at], &key, 8), std::memcpy(&data[at + 8], &words, 4);
+            std::memcpy(&data[at + 12], code.data(), code.size() * 4);
+        }
+        write_file(cache_dir / "spirv_cache.bin", data);
+    }
+
+    bool init(const std::filesystem::path& dir) {
         dev = ctx.device(), gpu = ctx.gpu();
+        cache_dir = dir;
+        load_caches();
         VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         pci.queueFamilyIndex = ctx.queue_family();
@@ -363,6 +444,8 @@ struct Renderer::Impl {
         VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pli.setLayoutCount = 2;
         pli.pSetLayouts = set_layouts;
+        const VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, pica::FRAGMENT_PUSH_WORDS * 4};
+        pli.pushConstantRangeCount = 1, pli.pPushConstantRanges = &push;
         vkCreatePipelineLayout(dev, &pli, nullptr, &pipeline_layout);
         VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_BATCH_DRAWS},
                                          {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * MAX_BATCH_DRAWS},
@@ -407,10 +490,15 @@ struct Renderer::Impl {
         auto it = modules.find(key);
         if (it != modules.end()) return it->second;
         std::string log;
-        const auto spv = compile_glsl(glsl, stage, &log);
+        auto& spv = spirv_cache[key];
+        if (spv.empty()) {
+            spv = compile_glsl(glsl, stage, &log);
+            cache_dirty = !spv.empty();
+            ++stats.shaders;
+            if (std::getenv("DOT_TRACE_SHADERS") && stage == ShaderStage::Fragment)
+                std::fprintf(stderr, "---- new fragment shader ----\n%s\n", glsl.c_str());
+        }
         VkShaderModule m = VK_NULL_HANDLE;
-        if (std::getenv("DOT_TRACE_SHADERS") && stage == ShaderStage::Fragment)
-            std::fprintf(stderr, "---- new fragment shader ----\n%s\n", glsl.c_str());
         if (spv.empty()) {
             std::fprintf(stderr, "renderer: shader compile failed:\n%s\n", log.c_str());
         } else {
@@ -515,6 +603,7 @@ struct Renderer::Impl {
         }
         submit_and_wait();  // nothing may still use the target or this batch's buffers
         drop_target();
+        if (cache_dirty && std::chrono::steady_clock::now() - cache_saved > std::chrono::seconds(10)) save_caches();
     }
 
     bool bind_target(Memory& mem, const std::array<u32, pica::reg::COUNT>& regs) {
@@ -645,9 +734,10 @@ struct Renderer::Impl {
         pi.pColorBlendState = &cbs, pi.pDynamicState = &dy;
         pi.layout = pipeline_layout, pi.renderPass = render_pass;
         VkPipeline p = VK_NULL_HANDLE;
-        check(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &pi, nullptr, &p), "vkCreateGraphicsPipelines");
+        check(vkCreateGraphicsPipelines(dev, pipeline_cache, 1, &pi, nullptr, &p), "vkCreateGraphicsPipelines");
         pipelines[key] = p;
         ++stats.pipelines;
+        cache_dirty = true;
         return p;
     }
 
@@ -814,6 +904,8 @@ struct Renderer::Impl {
         const u32 bc = regs[BLEND_COLOR];
         const float consts[4] = {(bc & 0xFF) / 255.f, (bc >> 8 & 0xFF) / 255.f, (bc >> 16 & 0xFF) / 255.f, (bc >> 24) / 255.f};
         vkCmdSetBlendConstants(cmd, consts);
+        const auto push = pica::fragment_push_constants(regs);
+        vkCmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof push, push.data());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 2, sets, 0, nullptr);
         vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf.buf, &voff);
         vkCmdDraw(cmd, u32(verts.size()), 1, 0, 0);
@@ -825,8 +917,11 @@ struct Renderer::Impl {
 };
 
 Renderer::Renderer(Context& ctx) : impl_(std::make_unique<Impl>(ctx)) {}
-Renderer::~Renderer() = default;
-bool Renderer::init() { return impl_->init(); }
+Renderer::~Renderer() {
+    std::lock_guard lk(impl_->lock);
+    impl_->save_caches();
+}
+bool Renderer::init(const std::filesystem::path& cache_dir) { return impl_->init(cache_dir); }
 
 template <class F> static void timed(const char* what, F&& f) {
     const auto t0 = std::chrono::steady_clock::now();

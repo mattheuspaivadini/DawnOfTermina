@@ -17,6 +17,7 @@
 #pragma once
 
 #include <array>
+#include <filesystem>
 #include <memory>
 
 #include "core/memory.h"
@@ -36,7 +37,8 @@ class Renderer {
 public:
     explicit Renderer(Context& ctx);
     ~Renderer();
-    bool init();
+    // `cache_dir` holds the on-disk shader/pipeline caches (created on first save).
+    bool init(const std::filesystem::path& cache_dir);
 
     void draw(core::Memory& mem, const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs,
               bool indexed);
@@ -46,7 +48,7 @@ public:
     void memory_fill(u32 start_va, u32 end_va, u32 value, u32 width_mode);
 
     struct Stats {
-        u64 draws, skipped, pipelines, flushes;
+        u64 draws, skipped, pipelines, flushes, shaders;  // shaders = GLSL compiled (not from the disk cache)
     };
     Stats stats() const;
 

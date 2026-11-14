@@ -100,7 +100,12 @@ static void test_fragment() {
     regs[0xE0] = 0x1 << 8 | 0x1 << 12;
     regs[0x104] = 1 | 7 << 4 | 128 << 8;
     const std::string fs = generate_fragment_shader(regs);
-    assert(fs.find(">= 128") != std::string::npos);
+    assert(fs.find(">= int(pc.alpha_ref)") != std::string::npos);
+    // Per-draw constants are push constants, not shader text: changing them keeps the shader.
+    const auto pc = fragment_push_constants(regs);
+    assert(pc[0] == 0x80FF8040 && pc[7] == 128);
+    regs[0xC3] = 0x12345678, regs[0x104] = 1 | 7 << 4 | 7 << 8;
+    assert(generate_fragment_shader(regs) == fs);
     assert(fs.find("next_combiner_buffer.rgb = last_tex_env_out.rgb;") != std::string::npos);
     assert(compiles(fs, ShaderStage::Fragment));
 

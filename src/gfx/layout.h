@@ -35,6 +35,12 @@ inline std::atomic<bool> g_show_bottom{true};
 // Dual: both screens stacked, the classic 3DS view.
 inline std::atomic<bool> g_single_screen{true};
 
+// Render scale for a w x h window (DOT_RES_SCALE=native and the config presets): the top
+// screen fills the window height in widescreen, else both screens stacked fit in it.
+inline unsigned native_scale(unsigned w, unsigned h, bool widescreen) {
+    return std::clamp(widescreen ? h / 240 : std::min(w / 400, h / 480), 1u, 8u);
+}
+
 // Single: the top screen (any width) fills the window keeping its aspect; the bottom screen
 // is an overlay in the bottom-right corner, 30% of the window height (empty rect when
 // hidden). Dual: top above, bottom centred below, scaled to fit.

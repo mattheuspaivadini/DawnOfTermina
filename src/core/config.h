@@ -41,6 +41,7 @@ struct Config {
 
     // Window size and DOT_RES_SCALE for `resolution`.
     void window_size(int& w, int& h) const;
+    unsigned render_scale() const;  // internal resolution scale for the preset: 1080p 4x, 720p 3x, native 1x
 };
 
 // Missing file or keys keep the defaults. Unknown keys are ignored.

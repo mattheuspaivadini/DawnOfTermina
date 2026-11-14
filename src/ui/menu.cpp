@@ -71,8 +71,7 @@ void apply(const core::Config& c, const core::Config* prev) {
         int w = 0, h = 0;
         c.window_size(w, h);
         if (!c.fullscreen) SDL_SetWindowSize(g_window, w, h);  // the swapchain follows the resize
-        const u32 s = c.resolution == "native" ? 1 : gfx::vulkan::Renderer::native_scale(w, h, c.widescreen != "off");
-        if (g_renderer && g_mem) g_renderer->set_scale(*g_mem, s);
+        if (g_renderer && g_mem) g_renderer->set_scale(*g_mem, c.render_scale());
     }
     if (g_renderer && prev->widescreen != c.widescreen) g_renderer->set_widescreen(aspect(c.widescreen));
     if (g_renderer && prev->fps != c.fps) g_renderer->set_interpolate(c.fps >= 60);

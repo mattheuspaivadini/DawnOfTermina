@@ -32,6 +32,7 @@
 #include <string>
 #include <vector>
 
+#include "gfx/layout.h"
 #include "gfx/pica/pixel.h"
 #include "gfx/pica/shader_gen.h"
 #include "gfx/pica/shader_interp.h"
@@ -269,11 +270,30 @@ struct Renderer::Impl {
     u32 batch_draws = 0;
     VkDeviceSize vb_used = 0, ub_used = 0, lb_used = 0, x_used = 0, lb_last = 0;
     std::vector<u32> last_light;  // lighting data at lb_last, to skip re-uploading it
+    // CPU/GPU pipelining: a batch the CPU needs nothing back from is submitted without waiting
+    // (submit()) and recording goes on with the next of three resource sets; only readbacks
+    // and resource destruction wait (submit_and_wait()). Waiting on every submit serialised
+    // the guest thread with the GPU: ~35% of its time at 3x with interpolation, 300 waits/s.
+    // Ordering needs no CPU wait: one queue, and every batch and the presenter start with
+    // full memory barriers, which cover all earlier submissions.
+    struct Slot {
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        VkDescriptorPool desc_pool = VK_NULL_HANDLE;
+        Buffer vbuf, ubuf, lbuf, xfer;
+        bool pending = false;  // submitted, the GPU may still use it
+    };
+    std::array<Slot, 3> ring;  // ring[cur_slot] holds the open batch's set while it is in flight
+    u32 cur_slot = 0;
     u32 scale = 1;
     float anisotropy = 0;
     bool always_readback = std::getenv("DOT_READBACK") != nullptr;
     std::map<u32, Surface> surfaces;              // by colour buffer VA
-    std::map<u32, Depth> depths;                  // by depth buffer VA
+    // By depth buffer VA and image size. Two colour targets of different sizes share one depth
+    // address in a frame; one image per VA was recreated (with a full GPU wait) on every
+    // switch, ~100 times a second. shortcut: sizes no longer used stay allocated until the
+    // scale changes, fine for the handful the game uses; evict if that grows.
+    std::map<std::array<u32, 4>, Depth> depths;
     std::map<u64, VkFramebuffer> framebuffers;    // by colour VA << 32 | depth VA
     std::map<u32, Display> displays;              // by output VA
     std::map<u32, Image> scratch;                 // guest-size staging images, by width << 16 | height
@@ -434,9 +454,7 @@ struct Renderer::Impl {
         vkBeginCommandBuffer(cmd, &bi);
     }
 
-    // Submits the open batch (if any), waits for it and recycles the per-batch resources.
-    void submit_and_wait() {
-        if (!recording) return;
+    void submit_open() {
         recording = false;
         vkEndCommandBuffer(cmd);
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -447,10 +465,39 @@ struct Renderer::Impl {
             std::lock_guard qlk(ctx.queue_lock());
             check(vkQueueSubmit(ctx.queue(), 1, &si, fence), "vkQueueSubmit");
         }
-        vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX);
+        ring[cur_slot] = {cmd, fence, desc_pool, vbuf, ubuf, lbuf, xfer, true};
+    }
+
+    void wait(Slot& sl) {
+        if (!sl.pending) return;
+        vkWaitForFences(dev, 1, &sl.fence, VK_TRUE, UINT64_MAX);
+        sl.pending = false;
+    }
+
+    void reset_batch() {
         vkResetDescriptorPool(dev, desc_pool, 0);
         batch_draws = 0, vb_used = ub_used = lb_used = x_used = 0;
         last_light.clear();
+    }
+
+    // Submits the open batch (if any) and records on into the next resource set.
+    void submit() {
+        if (!recording) return;
+        submit_open();
+        cur_slot = (cur_slot + 1) % ring.size();
+        Slot& sl = ring[cur_slot];
+        wait(sl);
+        cmd = sl.cmd, fence = sl.fence, desc_pool = sl.desc_pool;
+        vbuf = sl.vbuf, ubuf = sl.ubuf, lbuf = sl.lbuf, xfer = sl.xfer;
+        reset_batch();
+    }
+
+    // Submits the open batch (if any) and waits until the GPU is done with everything submitted.
+    void submit_and_wait() {
+        const bool had = recording;
+        if (had) submit_open();
+        for (Slot& sl : ring) wait(sl);
+        if (had) reset_batch();
     }
 
     static std::vector<u8> read_file(const std::filesystem::path& p) {
@@ -592,10 +639,23 @@ struct Renderer::Impl {
         dpi.pPoolSizes = sizes;
         vkCreateDescriptorPool(dev, &dpi, nullptr, &desc_pool);
 
-        ensure(vbuf, 8 << 20, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        // Vertices go as 16 vec4 attributes (256 bytes each): 8 MB filled ~10 times per frame at
+        // 60 FPS (the replay doubles it), and every fill cost a submit.
+        ensure(vbuf, 64 << 20, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
         ensure(ubuf, MAX_BATCH_DRAWS * align(UBO_SIZE), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
         ensure(lbuf, 64 * align(LIGHT_BUF_SIZE), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         ensure(xfer, 16 << 20, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        ring[0] = {cmd, fence, desc_pool, vbuf, ubuf, lbuf, xfer, false};
+        for (u32 i = 1; i < ring.size(); ++i) {
+            Slot& sl = ring[i];
+            vkAllocateCommandBuffers(dev, &cai, &sl.cmd);
+            vkCreateFence(dev, &fci, nullptr, &sl.fence);
+            vkCreateDescriptorPool(dev, &dpi, nullptr, &sl.desc_pool);
+            ensure(sl.vbuf, vbuf.size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+            ensure(sl.ubuf, ubuf.size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+            ensure(sl.lbuf, lbuf.size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            ensure(sl.xfer, xfer.size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        }
 
         // DisplayTransfer compute pipeline.
         const VkDescriptorSetLayoutBinding xb[2] = {
@@ -623,7 +683,7 @@ struct Renderer::Impl {
         }
         if (const char* e = std::getenv("DOT_RES_SCALE")) {
             const VkExtent2D ext = ctx.extent();
-            scale = std::string(e) == "native" ? native_scale(ext.width, ext.height, wide_aspect != 0)
+            scale = std::string(e) == "native" ? gfx::native_scale(ext.width, ext.height, wide_aspect != 0)
                                                : u32(std::clamp(std::atoi(e), 1, 8));
         }
         anisotropy = scale > 1 ? std::min(16.0f, ctx.max_anisotropy()) : 0.0f;
@@ -775,7 +835,7 @@ struct Renderer::Impl {
     // Guest memory -> surface (scaled up). Records into the open batch.
     void upload(const Memory& mem, Surface& sf) {
         const VkDeviceSize bytes = VkDeviceSize(sf.width) * sf.height * 4;
-        if (x_used + align(bytes) > xfer.size) submit_and_wait();
+        if (x_used + align(bytes) > xfer.size) submit();
         ensure(xfer, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         Image& tmp = scratch_image(sf.width, sf.height);
         begin();
@@ -800,7 +860,7 @@ struct Renderer::Impl {
         if (std::getenv("DOT_TRACE_FB"))
             std::fprintf(stderr, "renderer: readback %ux%u fmt %u at %08X\n", sf.width, sf.height, sf.format, sf.va);
         const VkDeviceSize bytes = VkDeviceSize(sf.width) * sf.height * 4;
-        if (x_used + align(bytes) > xfer.size) submit_and_wait();
+        if (x_used + align(bytes) > xfer.size) submit();
         ensure(xfer, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         Image& tmp = scratch_image(sf.width, sf.height);
         begin();
@@ -887,12 +947,7 @@ struct Renderer::Impl {
     }
 
     Depth& depth_buffer(u32 va, u32 w, u32 h, u32 image_h) {
-        Depth& d = depths[va];
-        if (d.image.img && (d.width != w || d.height != h || d.image_h != image_h)) {
-            submit_and_wait();
-            forget_framebuffers(~0u, va);
-            destroy(d.image);
-        }
+        Depth& d = depths[{va, w, h, image_h}];
         if (!d.image.img) {
             d.width = w, d.height = h, d.image_h = image_h;
             d.image = make_general(w * scale, image_h, depth_format,
@@ -941,8 +996,8 @@ struct Renderer::Impl {
     }
 
     void fill(Memory& mem, u32 start, u32 end) {
-        for (auto& [va, d] : depths)
-            if (va == start) clear_depth(d.image, va);
+        for (auto& [key, d] : depths)
+            if (key[0] == start) clear_depth(d.image, start);
         auto it = surfaces.find(start);
         if (it == surfaces.end() || start + guest_bytes(it->second) > end) return;
         Surface& sf = it->second;
@@ -1026,7 +1081,7 @@ struct Renderer::Impl {
         VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         dai.descriptorPool = desc_pool, dai.descriptorSetCount = 1, dai.pSetLayouts = &xfer_set_layout;
         if (vkAllocateDescriptorSets(dev, &dai, &set) != VK_SUCCESS) {
-            submit_and_wait();
+            submit();
             begin();
             vkAllocateDescriptorSets(dev, &dai, &set);
         }
@@ -1048,7 +1103,7 @@ struct Renderer::Impl {
         vkCmdPushConstants(cmd, xfer_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
         vkCmdDispatch(cmd, (d.width + 7) / 8, (d.height + 7) / 8, 1);
         memory_barrier();
-        submit_and_wait();  // presentation (another thread) reads the image next
+        submit();  // the presenter's blit is queued after it (barrier, same queue): no CPU wait
         if (replaying) {
             d.interp_fresh = true;
             return true;
@@ -1280,10 +1335,31 @@ struct Renderer::Impl {
         for (const Op& op : prev_ops)
             if (op.kind == Op::Draw) prev[op.key] = &op;
         u32 draws = 0, matched = 0;
-        for (const Op& op : frame_ops)
-            if (op.kind == Op::Draw) ++draws, matched += prev.count(op.key);
-        // A camera cut or scene change matches few draws: show the real frame twice instead.
-        if (draws && matched * 2 >= draws) {
+        std::vector<float> change;  // per matched draw: relative change of its float uniforms
+        for (const Op& op : frame_ops) {
+            if (op.kind != Op::Draw) continue;
+            ++draws;
+            auto it = prev.find(op.key);
+            if (it == prev.end()) continue;
+            ++matched;
+            double num = 0, den = 0;
+            static_assert(sizeof(pica::Vec4) == 16);
+            const float* a = &it->second->vs->float_uniforms[0].x;
+            const float* b = &op.vs->float_uniforms[0].x;
+            for (u32 i = 0; i < 96 * 4; ++i)
+                if (std::isfinite(a[i]) && std::isfinite(b[i])) num += std::fabs(a[i] - b[i]), den += std::fabs(a[i]) + std::fabs(b[i]);
+            change.push_back(den > 0 ? float(num / den) : 0.0f);
+        }
+        // A scene change matches few draws. A camera cut matches most of them (same objects, new
+        // camera), but their matrices jump: measured median change 0.05-0.93 at cuts against
+        // 0.0001 (p90 0.0013, fast pans < 0.02) between ordinary frames. Averaging across a cut
+        // put characters where neither frame has them. Either way: show the real frame twice.
+        bool cut = false;
+        if (!change.empty()) {
+            std::nth_element(change.begin(), change.begin() + change.size() / 2, change.end());
+            cut = change[change.size() / 2] > 0.025f;
+        }
+        if (draws && matched * 2 >= draws && !cut) {
             replaying = true;
             pica::ShaderState vs;
             for (const Op& op : frame_ops) {
@@ -1441,7 +1517,7 @@ struct Renderer::Impl {
         if (batch_draws == MAX_BATCH_DRAWS || vb_used + align(vbytes) > vbuf.size ||
             ub_used + align(UBO_SIZE) > ubuf.size || lb_used + align(LIGHT_BUF_SIZE) > lbuf.size ||
             x_used + xbytes > xfer.size)
-            submit_and_wait();
+            submit();
         ensure(vbuf, vbytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);  // grows only right after a submit
         ensure(xfer, xbytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         ++batch_draws;
@@ -1644,7 +1720,7 @@ void Renderer::set_scale(core::Memory& mem, u32 scale) {
     }
     for (auto& [va, sf] : m.surfaces) m.destroy(sf.color);
     for (auto& [va, sf] : m.padded) m.destroy(sf.color);
-    for (auto& [va, d] : m.depths) m.destroy(d.image);
+    for (auto& [key, d] : m.depths) m.destroy(d.image);
     for (auto& [va, d] : m.displays) m.destroy(d.image), m.destroy(d.interp);
     for (auto& [key, fb] : m.framebuffers) vkDestroyFramebuffer(m.dev, fb, nullptr);
     for (auto& [key, s] : m.samplers) vkDestroySampler(m.dev, s, nullptr);  // anisotropy follows the scale

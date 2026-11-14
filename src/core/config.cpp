@@ -16,6 +16,8 @@
 
 #include "core/config.h"
 
+#include "gfx/layout.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
@@ -27,6 +29,15 @@ void Config::window_size(int& w, int& h) const {
     if (resolution == "720p") w = 1280, h = 720;
     else if (resolution == "native") w = 800, h = 480;
     else w = 1920, h = 1080;
+}
+
+// From the preset, not the real window: in fullscreen that is the monitor, and a 1080p
+// monitor turned "720p" into a 4x (1080p) internal resolution.
+unsigned Config::render_scale() const {
+    if (resolution == "native") return 1;
+    int w = 0, h = 0;
+    window_size(w, h);
+    return gfx::native_scale(unsigned(w), unsigned(h), widescreen != "off");
 }
 
 static std::string trim(std::string s) {
@@ -105,7 +116,7 @@ void apply_env_defaults(const Config& c) {
     c.window_size(w, h);
     const std::string win = std::to_string(w) + "x" + std::to_string(h);
     setenv("DOT_WINDOW", win.c_str(), 0);
-    setenv("DOT_RES_SCALE", c.resolution == "native" ? "1" : "native", 0);
+    setenv("DOT_RES_SCALE", std::to_string(c.render_scale()).c_str(), 0);
     if (c.widescreen != "off") setenv("DOT_WIDESCREEN", c.widescreen.c_str(), 0);
     setenv("DOT_FPS", c.fps >= 60 ? "60" : "30", 0);
 }

@@ -335,17 +335,13 @@ void run_due_periodic() {
         if (g_in_periodic) return;
         const auto now = Clock::now();
         // Periods missed while a guest thread sat in a long HLE call are replayed, not dropped:
-        // each VBlank queues its own GSP interrupt, so the game keeps counting 59.83 per second.
-        constexpr int MAX_CATCH_UP = 8;  // ~134 ms of VBlanks; longer stalls (debugger, suspend) are dropped
-        for (auto& p : g_periodic)
-            for (int n = 0; now >= p.next; ++n) {
-                if (n == MAX_CATCH_UP) {
-                    p.next = now + std::chrono::nanoseconds(p.period_ns);
-                    break;
-                }
-                due.push_back(p.fn);
-                p.next += std::chrono::nanoseconds(p.period_ns);
-            }
+        // each VBlank queues its own GSP interrupt (the game keeps counting 59.83 per second) and
+        // each audio frame reaches the output.
+        constexpr auto MAX_LAG = std::chrono::milliseconds(150);  // longer stalls (debugger, suspend) are dropped
+        for (auto& p : g_periodic) {
+            if (now - p.next > MAX_LAG) p.next = now - MAX_LAG;
+            for (; now >= p.next; p.next += std::chrono::nanoseconds(p.period_ns)) due.push_back(p.fn);
+        }
         if (due.empty()) return;
         g_in_periodic = true;
     }

@@ -17,6 +17,7 @@
 #undef NDEBUG
 #include <cassert>
 
+#include "recomp/hooks.h"
 #include "recomp/runtime.h"
 
 using namespace recomp;
@@ -71,4 +72,40 @@ void test_recomp_runtime() {
     assert(vfp_to_int(&c, 1e20, false, true) == 0xFFFFFFFF);
     set_fd(&c, 3, 1.5);
     assert(fd(&c, 3) == 1.5 && c.s[7] == 0x3FF80000);
+
+    // Native hooks (src/recomp/hooks.cpp): guest VA = offset into a host buffer here.
+    u8* const saved_base = g_base;
+    alignas(4) static u8 mem[64];
+    set_memory(mem);
+    c = {};
+    c.r[14] = 0x00123457;
+    std::memcpy(mem, "abcdefgh", 9);
+    c.r[0] = 16, c.r[1] = 0, c.r[2] = 9;
+    assert(hooks::aeabi_memcpy(&c) == 0x00123457 && std::strcmp((char*)mem + 16, "abcdefgh") == 0);
+    c.r[0] = 32, c.r[1] = 3, c.r[2] = 0x1AB;  // __aeabi_memset(dst, n, c): value is the low byte of r2
+    assert(hooks::aeabi_memset(&c) == 0x00123457 && mem[32] == 0xAB && mem[34] == 0xAB && mem[35] == 0);
+    c.r[0] = 32, c.r[1] = 2;
+    hooks::aeabi_memclr(&c);
+    assert(mem[33] == 0 && mem[34] == 0xAB);
+    c.r[0] = 16, c.r[1] = 0, c.r[2] = 4;  // swapped arguments (src, dst): copy 16 -> 0
+    std::memcpy(mem + 16, "wxyz", 4);
+    hooks::memcpy_src_dst(&c);
+    assert(std::memcmp(mem, "wxyzefgh", 8) == 0);
+    c.r[0] = 16;
+    hooks::strlen(&c);
+    assert(c.r[0] == 8);
+    c.r[0] = 0, c.r[1] = 16;
+    hooks::strcmp(&c);
+    assert(c.r[0] == 0);
+    mem[3] = 'a';
+    c.r[0] = 0, c.r[1] = 16;
+    hooks::strcmp(&c);
+    assert(s32(c.r[0]) < 0);
+    set_fs(&c, 0, 1.0f), set_fs(&c, 1, 1.0f);
+    hooks::atan2f(&c);
+    assert(std::fabs(fs(&c, 0) - 0.7853982f) < 1e-6f);
+    set_fs(&c, 0, 0.0f);
+    hooks::cosf(&c);
+    assert(fs(&c, 0) == 1.0f);
+    set_memory(saved_base);
 }

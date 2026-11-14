@@ -25,6 +25,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
 #include <thread>
 #include <vector>
 
@@ -280,6 +281,7 @@ void finish_thread() {
 
 void thread_main(Thread* self, u32 entry) {
     t_self = self;
+    pthread_setname_np(pthread_self(), "guest");  // lets profilers and /proc tell guest CPU time apart
     {
         std::unique_lock lk(g_lock);
         while (g_current != self) self->cv.wait(lk);

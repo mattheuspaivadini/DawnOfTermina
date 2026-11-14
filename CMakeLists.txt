@@ -43,6 +43,7 @@ add_library(dot_runtime STATIC
     src/hle/service/gsp.cpp
     src/hle/service/hid.cpp
     src/hle/service/dsp.cpp
+    src/recomp/hooks.cpp
     src/recomp/runtime.cpp
     src/recomp/svc.cpp
 )
@@ -76,11 +77,12 @@ if(EXISTS "${DOT_GAME_DATA}/exefs/code.bin")
         COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tools/recomp/recomp.py" "${DOT_GAME_DATA}" "${gen}"
                 --chunks ${DOT_RECOMP_CHUNKS}
         DEPENDS ${recomp_tool} "${DOT_GAME_DATA}/exefs/code.bin" "${DOT_GAME_DATA}/exheader.bin"
-                "${CMAKE_SOURCE_DIR}/tools/recomp/extra_entries.txt"
+                "${CMAKE_SOURCE_DIR}/tools/recomp/extra_entries.txt" "${CMAKE_SOURCE_DIR}/tools/recomp/hooks.txt"
         COMMENT "Recompiling code.bin (ARM11 -> C++)"
         VERBATIM)
     add_library(dot_game STATIC ${gen_sources})
     target_include_directories(dot_game PRIVATE src "${gen}")
+    target_link_libraries(dot_game PRIVATE dot_runtime)  # native hooks (src/recomp/hooks.cpp)
     # Generated code: VFP MAC must not be fused; guest memory is accessed through u8*.
     target_compile_options(dot_game PRIVATE -O1 -w -ffp-contract=off -fno-strict-aliasing)
     target_link_libraries(dawnoftermina PRIVATE dot_game)

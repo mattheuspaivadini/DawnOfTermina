@@ -7,7 +7,7 @@
 0x00300c70,GetCLibLocaleState,T returns 0x007c934c
 0x00137ac4,GetCtypeTable,T
 0x001066a4,GetCaseTable,T
-0x00302e3c,strcmp,H host strcmp
+0x00302e3c,strcmp,H native hook (src/recomp/hooks.cpp); first-differing-byte difference
 0x001521d4,nn_srv_Initialize,H connect "srv:" with retry + RegisterClient
 0x0011d890,svcConnectToPort,H svc 0x2d
 0x0010893c,nn_srv_RegisterClient,H IPC 0x00010002
@@ -52,3 +52,15 @@
 0x0015d20c,EndingScene_Init,? loads Joker.Main.Ending.gar; frame step 1 (60 fps), max lag 8 -- the only 60 fps mode
 0x00170680,EndingScene_Destroy,? restores frame step 2 (30 fps), max lag 16
 0x0010677c,MainLoop_Frame,? one game frame: update, top/bottom render, GfxManager_SwapAndWait(0x402)
+0x00300154,__aeabi_memcpy,H native hook; forward copy, aligned case branches to __aeabi_memcpy4
+0x00300144,memcpy_src_dst,H native hook; swaps r0/r1 (src, dst, n) then falls into __aeabi_memcpy
+0x001f28e8,__aeabi_memcpy4,H native hook; word-aligned memcpy (ldm/stm 32 bytes)
+0x0014c364,__aeabi_memmove4,H native hook; word-aligned memmove, backward copy when overlapping
+0x00137ed4,__aeabi_memset,H native hook; (dst, n, c) replicates the byte then joins __aeabi_memclr at 0x16e640
+0x0016e63c,__aeabi_memclr,H native hook; (dst, n)
+0x00300338,__aeabi_memclr4,H native hook; word-aligned
+0x003028e0,strlen,H native hook; word-at-a-time with uqsub8
+0x0022a3ac,sinf,H native hook; hard-float s0 -> s0, errno on inf via 0x10065e
+0x0022a234,cosf,H native hook; hard-float s0 -> s0
+0x001e4f78,atan2f,H native hook; atan2f(y = s0, x = s1) -> s0
+0x0016506c,nn_gsp_TriggerCmdReqQueue,? GSP IPC 0x000C0000 (svc 0x32); ~20% of guest-thread samples are the HLE handler (gsp_command) behind it

@@ -103,6 +103,13 @@ Decisão do usuário (2026-11-14): **tradutor automático ARM11 → C++** para o
 - **Estado do boot recompilado:** passa por todo o crt0/SDK init (locale, `srv:` por IPC, heap/device memory, objeto da MainThread, stdio com callbacks Thumb) e **para em `svcCreateThread` (0x08)** — entry `0x0012A15C`, prioridade 0x18, chamado de LR `0x0016236C`.
 - O crt0 transcrito à mão (Etapa 5) segue como referência e é usado só quando o build não tem `game_data`.
 
+## Hooks nativos (Etapa 12)
+
+- `tools/recomp/hooks.txt` (`<VA> <nome>`) → o recompilador emite `func_<VA>` como `return recomp::hooks::<nome>(c);` (declarados em `src/recomp/hooks.h`, implementados em `hooks.cpp`). Chamadas diretas, tail calls e a tabela indireta passam pelo hook. VA que não é entrada descoberta = erro no build. O hook só reproduz o contrato AAPCS (r0/s0 de resultado, memória escrita, retorna o LR de entrada).
+- Hooks atuais (RVCT, achados no Hopper; nomes no `symbols.csv`): `__aeabi_memcpy` `0x300154`, `memcpy_src_dst` `0x300144` (r0/r1 trocados), `__aeabi_memcpy4` `0x1F28E8`, `__aeabi_memmove4` `0x14C364`, `__aeabi_memset` `0x137ED4` (dst, n, c), `__aeabi_memclr` `0x16E63C`, `__aeabi_memclr4` `0x300338`, `strlen` `0x3028E0`, `strcmp` `0x302E3C`, `sinf` `0x22A3AC`, `cosf` `0x22A234`, `atan2f` `0x1E4F78` (hard-float: s0/s1 → s0). `sqrtf` não existe como função (511 `vsqrt` inline). Leitura de arquivo não foi hookada: o `fs` já é HLE por IPC e não aparece no perfil.
+- **Medição** (abertura → cutscene da Lost Woods, 150 s, roteiro padrão, CPU das threads `guest` ÷ VBlanks): sem hooks 2,42 / 2,51 / 2,56 ms por VBlank; com hooks 2,54 / 2,56. **Diferença dentro do ruído.** Perfil por amostragem (gdb, 201 amostras com a thread do jogo ativa): memcpy ≈1%; **~23% é o handler HLE do `TriggerCmdReqQueue` do GSP** (`gsp_command`: processamento das command lists/renderer na thread do jogo, chamado de `0x16506C`), ~5% `recomp::call` (busca binária na tabela de 17 mil entradas a cada chamada indireta). São esses os alvos para reduzir CPU de verdade.
+- Threads do guest se chamam `guest` (`pthread_setname_np`): somar `utime+stime` de `/proc/<pid>/task/*` com esse nome dá a CPU do jogo; o perfil por gdb filtra por esse nome.
+
 ## HLE do kernel (nível syscall/IPC)
 
 Com o binário todo recompilado, o próprio SDK roda e fala com os serviços por `svcSendSyncRequest` (command buffer em TLS+0x80). **A fronteira do HLE agora é o kernel**, como num emulador; as APIs C++ de `src/hle/{fs,hid,dsp}` passam a ser backends dos handlers IPC.
@@ -190,4 +197,5 @@ python3 tools/extract_cia.py "ISO/The Legend of Zelda Majora's Mask 3D (USA).cia
 | 9 | Resolução nativa: cache de framebuffers na GPU, sem readback por quadro | ✅ | `DOT_RES_SCALE` 1–8/`native`; DisplayTransfer/MemoryFill/render-to-texture na GPU; sem MSAA |
 | 10 | Widescreen (16:9, 16:10, 21:9 ou proporção da janela) | ✅ | FOV horizontal ampliado na tela de cima; HUD centralizado; fades esticados |
 | 11 | 60 FPS: interpolação de quadros no renderer | ✅ | lógica a 30 Hz intocada (frame step `0x6A3A14`); uniforms do VS interpolados; `DOT_FPS=60` |
-| 12+ | Subsistemas do jogo | ⏳ | |
+| 12 | Hooks nativos para rotinas quentes da libc | ✅ | 12 hooks (`tools/recomp/hooks.txt`); ganho de CPU não mensurável (libc ≈1% das amostras); ver "Hooks nativos" |
+| 13+ | Subsistemas do jogo | ⏳ | |

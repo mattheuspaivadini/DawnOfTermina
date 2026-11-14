@@ -28,7 +28,7 @@
 // Varying interface shared by both stages (fixed locations):
 //   0 vec4 primary_color, 1 vec2 texcoord0, 2 vec2 texcoord1, 3 vec2 texcoord2,
 //   4 float texcoord0_w, 5 vec4 normquat, 6 vec3 view
-// VS uniforms: set 0 binding 0, std140 { vec4 c[96]; ivec4 i[4]; uint b; }
+// VS uniforms: set 0 binding 0, std140 { vec4 c[96]; ivec4 i[4]; vec4 depth (scale, offset); uint b; }
 // FS textures: set 1 bindings 0..2 (sampler2D tex0..tex2).
 namespace gfx::pica {
 

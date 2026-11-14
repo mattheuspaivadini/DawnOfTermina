@@ -284,7 +284,10 @@ bool Context::present(const ScreenImage& top, const ScreenImage& bottom) {
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(window_, &w, &h);
     if (u32(w) != extent_.width || u32(h) != extent_.height || !swapchain_) {
-        vkDeviceWaitIdle(device_);
+        {
+            std::lock_guard qlk(queue_lock_);
+            vkQueueWaitIdle(queue_);
+        }
         if (!create_swapchain()) return false;
         if (!swapchain_) return true;  // minimised
     }
@@ -368,6 +371,7 @@ bool Context::present(const ScreenImage& top, const ScreenImage& bottom) {
     si.pCommandBuffers = &cmd;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &render_done_[idx];
+    std::lock_guard qlk(queue_lock_);
     if (!check(vkQueueSubmit(queue_, 1, &si, frame_fence_), "vkQueueSubmit")) return false;
 
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};

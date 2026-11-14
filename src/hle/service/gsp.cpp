@@ -22,10 +22,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 
 #include "gfx/pica/command_processor.h"
+#include "gfx/pica/pixel.h"
+#include "gfx/vulkan/renderer.h"
 #include "hle/ipc.h"
 #include "hle/service/services.h"
 
@@ -49,6 +52,7 @@ std::mutex g_fb_lock;  // guards g_fb (read by the host main thread)
 Framebuffer g_fb[2];
 Handle g_shared = 0, g_event = 0;
 gfx::pica::CommandProcessor g_pica;
+std::atomic<gfx::vulkan::Renderer*> g_renderer{nullptr};
 std::atomic<u64> g_vblanks{0}, g_lists{0}, g_draws{0}, g_fills{0}, g_transfers{0};
 
 u32 shared_base() { return kernel::shared_memory(g_shared).addr; }
@@ -68,9 +72,14 @@ void signal_interrupt(Interrupt id) {
 
 void set_framebuffer(int screen, u32 info) {
     // FrameBufferInfo: active fb, left addr (PA), right addr, stride, format, shown fb, -
+    if (std::getenv("DOT_TRACE_FB"))
+        std::fprintf(stderr, "gsp: screen %d framebuffer pa %08X stride %u format %u\n", screen,
+                     g_mem->read<u32>(info + 4), g_mem->read<u32>(info + 12), g_mem->read<u32>(info + 16));
     std::lock_guard lk(g_fb_lock);
-    g_fb[screen] = {Memory::pa_to_va(g_mem->read<u32>(info + 4)), g_mem->read<u32>(info + 12),
-                    g_mem->read<u32>(info + 16) & 7};
+    // The guest passes virtual addresses here (the GSP module converts them for the LCD).
+    const u32 addr = g_mem->read<u32>(info + 4);
+    const u32 va = Memory::va_to_pa(addr) ? addr : Memory::pa_to_va(addr);
+    g_fb[screen] = {va, g_mem->read<u32>(info + 12), g_mem->read<u32>(info + 16) & 7};
 }
 
 // Latches framebuffer updates the guest queued in shared memory, then interrupts.
@@ -90,41 +99,7 @@ void vblank() {
     signal_interrupt(PDC1);
 }
 
-// ---- pixel formats shared by framebuffers and display transfers
-// 0 RGBA8, 1 RGB8, 2 RGB565, 3 RGB5A1, 4 RGBA4
-u32 bytes_per_pixel(u32 fmt) { return fmt == 0 ? 4 : fmt == 1 ? 3 : 2; }
-
-struct Rgba {
-    u32 r, g, b, a;
-};
-
-Rgba decode(u32 fmt, const u8* p) {
-    const u32 v = p[0] | p[1] << 8;
-    switch (fmt) {
-    case 0: return {p[3], p[2], p[1], p[0]};
-    case 1: return {p[2], p[1], p[0], 255};
-    case 2: return {(v >> 11) * 255 / 31, (v >> 5 & 63) * 255 / 63, (v & 31) * 255 / 31, 255};
-    case 3: return {(v >> 11) * 255 / 31, (v >> 6 & 31) * 255 / 31, (v >> 1 & 31) * 255 / 31, (v & 1) * 255};
-    default: return {(v >> 12) * 17, (v >> 8 & 15) * 17, (v >> 4 & 15) * 17, (v & 15) * 17};
-    }
-}
-
-void encode(u32 fmt, Rgba c, u8* p) {
-    u32 v;
-    switch (fmt) {
-    case 0: p[0] = u8(c.a), p[1] = u8(c.b), p[2] = u8(c.g), p[3] = u8(c.r); return;
-    case 1: p[0] = u8(c.b), p[1] = u8(c.g), p[2] = u8(c.r); return;
-    case 2: v = (c.r * 31 / 255) << 11 | (c.g * 63 / 255) << 5 | c.b * 31 / 255; break;
-    case 3: v = (c.r * 31 / 255) << 11 | (c.g * 31 / 255) << 6 | (c.b * 31 / 255) << 1 | (c.a > 127); break;
-    default: v = (c.r / 17) << 12 | (c.g / 17) << 8 | (c.b / 17) << 4 | c.a / 17; break;
-    }
-    p[0] = u8(v), p[1] = u8(v >> 8);
-}
-
-u32 morton_offset(u32 x, u32 y, u32 bpp) {  // offset inside a row of 8x8 tiles
-    const u32 i = (x & 1) | (y & 1) << 1 | (x & 2) << 1 | (y & 2) << 2 | (x & 4) << 2 | (y & 4) << 3;
-    return (i + (x & ~7u) * 8) * bpp;
-}
+using namespace gfx::pica::pixel;
 
 // ---- GX commands
 void memory_fill(u32 start, u32 value, u32 end, u16 control) {
@@ -201,6 +176,9 @@ void display_transfer(u32 in, u32 out, u32 in_dim, u32 out_dim, u32 flags) {
 
 void run_command(u32 cmd) {
     auto w = [&](u32 i) { return g_mem->read<u32>(cmd + i * 4); };
+    // Anything but a command list may read or overwrite VRAM: settle the render target first.
+    if ((w(0) & 0xFF) != 0x01)
+        if (auto* r = g_renderer.load()) r->flush(*g_mem);
     switch (w(0) & 0xFF) {
     case 0x00:  // RequestDma(src, dst, size)
         std::memmove(g_mem->host(w(2)), g_mem->host(w(1)), w(3));
@@ -208,22 +186,41 @@ void run_command(u32 cmd) {
         return;
     case 0x01: {  // SubmitGpuCommandList(address, size, flags)
         const u32 addr = w(1), size = w(2);
+        if (std::getenv("DOT_TRACE_FB")) std::fprintf(stderr, "gsp: command list %08X size %u\n", addr, size);
         g_pica.process({reinterpret_cast<const u32*>(g_mem->host(addr)), size / 4});
         ++g_lists;
         signal_interrupt(P3D);
         return;
     }
     case 0x02: {  // MemoryFill(start0, value0, end0, start1, value1, end1, control0 | control1 << 16)
+        if (std::getenv("DOT_TRACE_FB"))
+            std::fprintf(stderr, "gsp: memory fill %08X-%08X = %08X, %08X-%08X = %08X\n", w(1), w(3), w(2), w(4),
+                         w(6), w(5));
         memory_fill(w(1), w(2), w(3), u16(w(7)));
         memory_fill(w(4), w(5), w(6), u16(w(7) >> 16));
+        if (auto* r = g_renderer.load()) {
+            if (w(1)) r->memory_fill(w(1), w(3), w(2), w(7) >> 8 & 3);
+            if (w(4)) r->memory_fill(w(4), w(6), w(5), w(7) >> 24 & 3);
+        }
         ++g_fills;
         if (w(1)) signal_interrupt(PSC0);
         if (w(4)) signal_interrupt(PSC1);
         return;
     }
     case 0x03:  // DisplayTransfer(in, out, in dims, out dims, flags)
+        if (std::getenv("DOT_TRACE_FB"))
+            std::fprintf(stderr, "gsp: display transfer %08X -> %08X in %08X out %08X flags %08X\n", w(1), w(2), w(3),
+                         w(4), w(5));
         if (w(5) >> 3 & 1) texture_copy(w(1), w(2), (w(3) & 0xFFFF) * (w(3) >> 16) * 4, 0, 0);
         else display_transfer(w(1), w(2), w(3), w(4), w(5));
+        if (std::getenv("DOT_TRACE_FB")) {
+            const u32 n = (w(4) & 0xFFFF) * (w(4) >> 16) * bytes_per_pixel(w(5) >> 12 & 7);
+            u32 in_nz = 0, out_nz = 0;
+            for (u32 i = 0; i < n; ++i) out_nz += g_mem->read<u8>(w(2) + i) != 0;
+            for (u32 i = 0; i < (w(3) & 0xFFFF) * (w(3) >> 16) * bytes_per_pixel(w(5) >> 8 & 7); ++i)
+                in_nz += g_mem->read<u8>(w(1) + i) != 0;
+            std::fprintf(stderr, "gsp:   input %u non-zero bytes, output %u non-zero bytes\n", in_nz, out_nz);
+        }
         ++g_transfers;
         signal_interrupt(PPF);
         return;
@@ -301,12 +298,23 @@ void gsp_command(core::Memory& mem, u32 base) {
 
 void register_gsp(core::Memory& mem) {
     g_mem = &mem;
-    g_pica.on_draw = [](u32) { ++g_draws; };
+    g_pica.fetch = [](u32 pa, u32 bytes) -> std::span<const u32> {
+        const u32 va = Memory::pa_to_va(pa);
+        if (!va) return {};
+        return {reinterpret_cast<const u32*>(g_mem->host(va)), bytes / 4};
+    };
+    g_pica.on_draw = [](u32 trigger) {
+        ++g_draws;
+        if (auto* r = g_renderer.load())
+            r->draw(*g_mem, g_pica.regs(), g_pica.vs(), trigger == gfx::pica::reg::DRAW_ELEMENTS);
+    };
     kernel::register_service("gsp::Gpu", gsp_command);
     kernel::add_periodic(16'715'000, vblank);  // ~59.83 Hz
 }
 
 namespace gsp {
+
+void set_renderer(gfx::vulkan::Renderer* renderer) { g_renderer = renderer; }
 
 bool screen_image(int screen, std::vector<u32>& rgba) {
     Framebuffer fb;

@@ -21,7 +21,14 @@
 #include "core/types.h"
 
 // Host side of gsp::Gpu: the framebuffers the guest last swapped in.
+namespace gfx::vulkan {
+class Renderer;
+}
+
 namespace hle::service::gsp {
+
+// Draws go to `renderer` once set (before that they are only counted).
+void set_renderer(gfx::vulkan::Renderer* renderer);
 
 // Fills `rgba` (bytes R,G,B,A; row 0 = top) with the current framebuffer of screen
 // 0 (top, 400x240) or 1 (bottom, 320x240). Returns false until the guest set one.

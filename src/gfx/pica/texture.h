@@ -17,10 +17,10 @@ enum class TexFormat : u32 {
 u32 bits_per_texel(TexFormat fmt);
 size_t texture_size(TexFormat fmt, u32 width, u32 height);
 
-// Decodes a tiled (8x8 Morton) PICA texture into linear RGBA8 (bytes R,G,B,A),
-// rows in memory order: row 0 is the first tile row (the bottom of the image in
-// PICA's GL-style convention; flip at sampling time). Width/height must be multiples
-// of 8. Returns empty on bad size or unknown format.
+// Decodes a tiled (8x8 Morton) PICA texture into linear RGBA8 (bytes R,G,B,A), rows in
+// memory order. PICA textures are stored bottom-up (memory row r = t of (h-1-r)/h), so
+// flip rows for GL/Vulkan-style sampling. Width/height must be multiples of 8. Returns
+// empty on bad size or unknown format.
 std::vector<u32> decode_texture(std::span<const u8> src, u32 width, u32 height, TexFormat fmt);
 
 }  // namespace gfx::pica

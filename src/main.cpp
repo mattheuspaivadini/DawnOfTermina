@@ -29,6 +29,7 @@
 #include "game/guest.h"
 #include "gfx/pica/texture.h"
 #include "gfx/vulkan/context.h"
+#include "gfx/vulkan/renderer.h"
 #include "hle/dsp.h"
 #include "hle/fs.h"
 #include "hle/hid.h"
@@ -53,6 +54,13 @@ static u8 read_main_priority(const std::filesystem::path& data) {
     char p = 0x30;
     f.read(&p, 1);
     return u8(p);
+}
+
+// Writes an RGBA8 screen as a binary PPM (debugging aid for DOT_DUMP_FRAMES).
+static void write_ppm(const std::filesystem::path& path, const std::vector<u32>& px, u32 w, u32 h) {
+    std::ofstream f(path, std::ios::binary);
+    f << "P6\n" << w << " " << h << "\n255\n";
+    for (u32 p : px) f.put(char(p)).put(char(p >> 8)).put(char(p >> 16));
 }
 
 // Bottom screen placeholder until the game renders: the title's own SMDH icon
@@ -132,6 +140,11 @@ int main(int argc, char** argv) {
     {  // scope: the Vulkan surface must be destroyed before the window
         gfx::vulkan::Context gpu;
         if (!gpu.init(window)) return 1;
+#ifdef DOT_HAVE_RECOMP
+        gfx::vulkan::Renderer renderer(gpu);
+        if (!renderer.init()) return 1;
+        hle::service::gsp::set_renderer(&renderer);
+#endif
         const std::vector<u32> top(gfx::vulkan::TOP_W * gfx::vulkan::SCREEN_H, 0xFF402010);
         const std::vector<u32> bottom = icon_screen(data / "exefs" / "icon.bin");
         std::vector<u32> game_top, game_bottom;
@@ -161,14 +174,34 @@ int main(int argc, char** argv) {
                 static u64 frame = 0;
                 if (++frame % 60 == 0) {
                     const auto st = hle::service::gsp::stats();
-                    std::printf("gsp: vblanks %llu, command lists %llu, draws %llu, fills %llu, transfers %llu\n",
+                    static u64 last_vblanks = ~0ull;
+                    static int still = 0;
+                    if (st.vblanks == last_vblanks && ++still == 3)
+                        std::printf("guest is not progressing:\n%s", hle::kernel::dump_threads().c_str());
+                    if (st.vblanks != last_vblanks) still = 0;
+                    last_vblanks = st.vblanks;
+                    const auto rs = renderer.stats();
+                    std::printf("gsp: vblanks %llu, command lists %llu, draws %llu, fills %llu, transfers %llu | "
+                                "rendered %llu, skipped %llu, pipelines %llu, flushes %llu\n",
                                 (unsigned long long)st.vblanks, (unsigned long long)st.command_lists,
                                 (unsigned long long)st.draws, (unsigned long long)st.memory_fills,
-                                (unsigned long long)st.display_transfers);
+                                (unsigned long long)st.display_transfers, (unsigned long long)rs.draws,
+                                (unsigned long long)rs.skipped, (unsigned long long)rs.pipelines,
+                                (unsigned long long)rs.flushes);
                 }
             }
             const bool have_top = hle::service::gsp::screen_image(0, game_top);
             const bool have_bottom = hle::service::gsp::screen_image(1, game_bottom);
+            if (const char* dir = std::getenv("DOT_DUMP_FRAMES"); dir && have_top) {
+                static u32 n = 0;
+                if (++n % 120 == 0) {
+                    write_ppm(std::filesystem::path(dir) / ("top_" + std::to_string(n / 120) + ".ppm"), game_top,
+                              gfx::vulkan::TOP_W, gfx::vulkan::SCREEN_H);
+                    if (have_bottom)
+                        write_ppm(std::filesystem::path(dir) / ("bottom_" + std::to_string(n / 120) + ".ppm"),
+                                  game_bottom, gfx::vulkan::BOTTOM_W, gfx::vulkan::SCREEN_H);
+                }
+            }
             const u32* top_px = have_top ? game_top.data() : top.data();
             const u32* bottom_px = have_bottom ? game_bottom.data() : bottom.data();
 #else
@@ -179,6 +212,9 @@ int main(int argc, char** argv) {
                              {gfx::vulkan::BOTTOM_W, gfx::vulkan::SCREEN_H, bottom_px}))
                 break;  // FIFO present paces the loop to vsync
         }
+#ifdef DOT_HAVE_RECOMP
+        hle::service::gsp::set_renderer(nullptr);
+#endif
     }
 
 #ifdef DOT_HAVE_RECOMP

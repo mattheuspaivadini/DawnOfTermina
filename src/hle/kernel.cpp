@@ -111,6 +111,7 @@ struct Thread : Object {
     std::condition_variable cv;
     std::thread host;
     u64 last_run = 0;  // round robin among equal priorities
+    const char* host_where = "starting";  // diagnostics: what the host thread is doing
 
     // wait state
     std::vector<std::shared_ptr<Object>> wait_objects;
@@ -232,6 +233,7 @@ void switch_away(std::unique_lock<std::mutex>& lk, Thread* self) {
     self->last_run = ++g_run_counter;
     if (g_current == self) pick_next();
     if (self->state == State::Dead) return;
+    self->host_where = "waiting for the baton";
     while (g_current != self) {
         if (g_status) {  // guest stopped: park this thread forever
             self->cv.wait(lk);
@@ -250,6 +252,7 @@ void switch_away(std::unique_lock<std::mutex>& lk, Thread* self) {
         if (!g_current && self->state == State::Ready) pick_next();
     }
     self->state = State::Running;
+    self->host_where = "guest code";
 }
 
 // Blocks the current thread with its wait fields set (lock held).
@@ -264,6 +267,7 @@ Result block(std::unique_lock<std::mutex>& lk, s64 timeout_ns) {
 
 [[noreturn]] void park_forever() {
     std::unique_lock lk(g_lock);
+    t_self->host_where = "parked (thread ended)";
     for (;;) t_self->cv.wait(lk);
 }
 
@@ -280,6 +284,7 @@ void thread_main(Thread* self, u32 entry) {
         std::unique_lock lk(g_lock);
         while (g_current != self) self->cv.wait(lk);
         self->state = State::Running;
+        self->host_where = "guest code";
     }
     try {
         recomp::call(&self->ctx, entry);
@@ -440,12 +445,14 @@ Result set_thread_priority(Handle h, s32 priority) {
 
 std::string dump_threads() {
     std::lock_guard lk(g_lock);
-    std::string out;
+    std::string out = "  baton: ";
+    out += !g_current ? "nobody" : g_current == host_marker() ? "host" : "thread " + std::to_string(g_current->id);
+    out += g_preempt ? " (preempt pending)\n" : "\n";
     for (auto& t : g_threads) {
         static const char* names[] = {"ready", "running", "waiting", "dead"};
         char line[160];
-        std::snprintf(line, sizeof line, "  thread %u prio 0x%02X %-7s lr=0x%08X sp=0x%08X", t->id, t->priority,
-                      names[int(t->state)], t->ctx.r[14], t->ctx.r[13]);
+        std::snprintf(line, sizeof line, "  thread %u prio 0x%02X %-7s [host: %s] lr=0x%08X sp=0x%08X", t->id,
+                      t->priority, names[int(t->state)], t->host_where, t->ctx.r[14], t->ctx.r[13]);
         out += line;
         if (t->state == State::Waiting) {
             if (t->arbiter_addr) out += " on arbiter address " + hex(t->arbiter_addr);

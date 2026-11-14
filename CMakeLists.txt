@@ -23,6 +23,9 @@ add_library(dot_runtime STATIC
     src/gfx/pica/shbin.cpp
     src/gfx/pica/shader_gen.cpp
     src/gfx/vulkan/spirv.cpp
+    src/gfx/vulkan/renderer.cpp
+    src/gfx/pica/vertex_loader.cpp
+    src/gfx/pica/shader_interp.cpp
     src/gfx/vulkan/context.cpp
     src/game/guest.cpp
     src/game/crt0.cpp

@@ -11,6 +11,9 @@ namespace gfx::pica {
 // Register ids (word index into the 0x300-word PICA200 register file) that act as triggers.
 namespace reg {
 constexpr u32 COUNT = 0x300;
+constexpr u32 FIXED_ATTRIB_INDEX = 0x232;
+constexpr u32 FIXED_ATTRIB_DATA = 0x233;  // 3 regs: four packed float24
+constexpr u32 CMDBUF_SIZE0 = 0x238, CMDBUF_ADDR0 = 0x23A, CMDBUF_JUMP0 = 0x23C;  // channel 1 at +1
 constexpr u32 DRAW_ARRAYS = 0x22E;
 constexpr u32 DRAW_ELEMENTS = 0x22F;
 constexpr u32 VS_BOOL_UNIFORMS = 0x2B0;
@@ -35,15 +38,18 @@ struct ShaderState {
     std::array<Vec4, 96> float_uniforms{};
     std::array<u32, 4> int_uniforms{};
     u16 bool_uniforms = 0;
+    std::array<Vec4, 16> fixed_attribs{};  // default values of vertex attributes
 };
 
 // Executes PICA200 command lists (as submitted through GSP) into register state.
 // Rasterisation is delegated to `on_draw`, called with the trigger register id.
-// shortcut: geometry shader (0x280-0x2AF) and fixed-attribute (0x232) uploads are
-// stored as plain registers only; add trigger handling when the game uses them.
+// shortcut: geometry shader (0x280-0x2AF) uploads and immediate-mode vertices (fixed
+// attribute index 0xF) are stored as plain registers only; add when the game uses them.
 class CommandProcessor {
 public:
     std::function<void(u32 trigger_reg)> on_draw;
+    // Resolves a command buffer jump target (physical address, size in bytes) to words.
+    std::function<std::span<const u32>(u32 pa, u32 bytes)> fetch;
 
     // `words` must be 8-byte aligned command list data. Returns false on a truncated list.
     bool process(std::span<const u32> words);
@@ -57,6 +63,9 @@ private:
     ShaderState vs_;
     u32 uniform_buf_[4]{};
     u32 uniform_words_ = 0;
+    u32 fixed_buf_[3]{};
+    u32 fixed_words_ = 0;
+    int jump_channel_ = -1;  // set by a write to CMDBUF_JUMP0/1
 };
 
 }  // namespace gfx::pica

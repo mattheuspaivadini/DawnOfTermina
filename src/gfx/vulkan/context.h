@@ -2,6 +2,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <mutex>
 #include <vector>
 
 #include "core/types.h"
@@ -29,6 +30,13 @@ public:
     // Skips silently while the window is minimised. Returns false on a fatal device error.
     bool present(const ScreenImage& top, const ScreenImage& bottom);
 
+    VkDevice device() const { return device_; }
+    VkPhysicalDevice gpu() const { return gpu_; }
+    VkQueue queue() const { return queue_; }
+    u32 queue_family() const { return queue_family_; }
+    // The single queue is shared with the PICA renderer (guest thread): hold this to submit.
+    std::mutex& queue_lock() { return queue_lock_; }
+
 private:
     bool create_swapchain();
     void destroy_swapchain();
@@ -41,6 +49,7 @@ private:
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue queue_ = VK_NULL_HANDLE;
     u32 queue_family_ = 0;
+    std::mutex queue_lock_;
 
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkFormat swapchain_format_ = VK_FORMAT_UNDEFINED;

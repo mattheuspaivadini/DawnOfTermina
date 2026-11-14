@@ -270,7 +270,7 @@ struct Translator {
         std::string out = "#version 450\n";
         for (u32 r : inputs_read) out += std::format("layout(location = {}) in vec4 vs_in{};\n", r, r);
         out += R"(
-layout(std140, set = 0, binding = 0) uniform PicaVsUniforms { vec4 c[96]; ivec4 i[4]; uint b; } u;
+layout(std140, set = 0, binding = 0) uniform PicaVsUniforms { vec4 c[96]; ivec4 i[4]; vec4 depth; uint b; } u;
 
 layout(location = 0) out vec4 primary_color;
 layout(location = 1) out vec2 texcoord0;
@@ -331,8 +331,9 @@ void main() {
                 const u32 id = s.outmap[reg] >> (c * 8) & 0x1F;
                 if (id < 0x18 && sem[id]) out += std::format("    {} = o[{}].{};\n", sem[id], reg, "xyzw"[c]);
             }
-        // PICA clip space has z in [-w, 0]; Vulkan expects [0, w].
-        out += R"(    gl_Position = vec4(pos.x, pos.y, -pos.z, pos.w);
+        // PICA window depth = z/w * scale + offset (depth.x/.y from regs 0x4D/0x4E); Vulkan's
+        // depth range is the identity, so pre-multiply by w.
+        out += R"(    gl_Position = vec4(pos.x, pos.y, pos.z * u.depth.x + pos.w * u.depth.y, pos.w);
     primary_color = col;
     texcoord0 = t0;
     texcoord1 = t1;

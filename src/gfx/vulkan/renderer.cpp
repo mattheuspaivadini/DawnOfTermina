@@ -46,16 +46,28 @@ using pica::f24_to_f32;
 // PICA registers used here (word indices).
 constexpr u32 CULL = 0x040, VIEWPORT_W = 0x041, VIEWPORT_H = 0x043, DEPTH_SCALE = 0x04D, DEPTH_OFFSET = 0x04E;
 constexpr u32 OUTMAP = 0x050, SCISSOR_MODE = 0x065, SCISSOR_MIN = 0x066, SCISSOR_MAX = 0x067, VIEWPORT_XY = 0x068;
-constexpr u32 TEX_CONFIG = 0x080, COLOR_OP = 0x100, BLEND_FUNC = 0x101, BLEND_COLOR = 0x103;
+constexpr u32 TEX_CONFIG = 0x080, COLOR_OP = 0x100, BLEND_FUNC = 0x101, BLEND_COLOR = 0x103, STENCIL_TEST = 0x105,
+              STENCIL_OP = 0x106;
 constexpr u32 DEPTH_COLOR_MASK = 0x107, COLOR_WRITE_ENABLE = 0x113, DEPTH_WRITE_ENABLE = 0x115;
-constexpr u32 COLOR_FORMAT = 0x117, DEPTH_ADDR = 0x11C, COLOR_ADDR = 0x11D, FB_DIM = 0x11E;
+constexpr u32 DEPTH_FORMAT = 0x116, COLOR_FORMAT = 0x117, DEPTH_ADDR = 0x11C, COLOR_ADDR = 0x11D, FB_DIM = 0x11E;
 constexpr u32 PRIMITIVE_CONFIG = 0x25E, VS_ENTRY = 0x2BA;
 // Texture units: dims, param, address, type.
 constexpr u32 TEX_REGS[3][4] = {{0x082, 0x083, 0x085, 0x08E}, {0x092, 0x093, 0x095, 0x096}, {0x09A, 0x09B, 0x09D, 0x09E}};
 
 constexpr u32 UBO_SIZE = 96 * 16 + 4 * 16 + 16 + 16;
 constexpr u32 LIGHT_REGS = 0x140, LIGHT_REG_WORDS = 0x90;  // fragment lighting buffer, see shader_gen.h
-constexpr u32 LIGHT_BUF_SIZE = (LIGHT_REG_WORDS + 24 * 256) * 4;
+constexpr u32 LIGHT_BUF_SIZE = (LIGHT_REG_WORDS + 24 * 256 + 128) * 4;  // + fog LUT
+
+// Only D24S8 depth buffers have a stencil channel.
+bool has_stencil(const std::array<u32, pica::reg::COUNT>& regs) { return (regs[DEPTH_FORMAT] & 3) == 3; }
+
+VkStencilOp stencil_op(u32 op) {
+    static constexpr VkStencilOp map[] = {
+        VK_STENCIL_OP_KEEP, VK_STENCIL_OP_ZERO, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_INCREMENT_AND_CLAMP,
+        VK_STENCIL_OP_DECREMENT_AND_CLAMP, VK_STENCIL_OP_INVERT, VK_STENCIL_OP_INCREMENT_AND_WRAP,
+        VK_STENCIL_OP_DECREMENT_AND_WRAP};
+    return map[op & 7];
+}
 
 // A vertex after the (CPU-run) PICA vertex shader, packed by output semantic.
 struct ShadedVertex {
@@ -188,7 +200,13 @@ struct Renderer::Impl {
     VkShaderModule pass_vs = VK_NULL_HANDLE;
     std::map<u64, VkShaderModule> vertex_shaders;  // by program + bool/int uniforms; null = CPU fallback
     std::map<u64, VkPipeline> pipelines;
-    std::map<u32, float> depth_clears;  // last MemoryFill value per address, normalised
+    struct DepthClear {
+        float depth;
+        u32 stencil;
+    };
+    std::map<u32, DepthClear> depth_clears;  // last MemoryFill value per address, normalised
+    VkFormat depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    static constexpr VkImageAspectFlags DS_ASPECT = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     std::mutex lock;  // draw/flush may come from different guest threads
     Stats stats{};
 
@@ -403,16 +421,20 @@ struct Renderer::Impl {
         VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         vkCreateFence(dev, &fci, nullptr, &fence);
 
-        // Render pass: the colour/depth targets keep their contents between draws.
+        // Depth + stencil: D32S8 where available (float depth keeps precision), else D24S8.
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(gpu, depth_format, &fp);
+        if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT))
+            depth_format = VK_FORMAT_D24_UNORM_S8_UINT;
+
+        // Render pass: the colour/depth/stencil targets keep their contents between draws.
         VkAttachmentDescription att[2]{};
         att[0].format = VK_FORMAT_R8G8B8A8_UNORM;
-        att[1].format = VK_FORMAT_D32_SFLOAT;
+        att[1].format = depth_format;
         for (int i = 0; i < 2; ++i) {
             att[i].samples = VK_SAMPLE_COUNT_1_BIT;
-            att[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-            att[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-            att[i].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-            att[i].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            att[i].loadOp = att[i].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            att[i].storeOp = att[i].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
             att[i].initialLayout = att[i].finalLayout =
                 i ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         }
@@ -622,8 +644,7 @@ struct Renderer::Impl {
                                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                       VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                   VK_IMAGE_ASPECT_COLOR_BIT);
-        target.depth = make_image(w, h, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                                  VK_IMAGE_ASPECT_DEPTH_BIT);
+        target.depth = make_image(w, h, depth_format, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, DS_ASPECT);
         VkImageView views[2] = {target.color.view, target.depth.view};
         VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
         fi.renderPass = render_pass;
@@ -672,8 +693,10 @@ struct Renderer::Impl {
 
     VkPipeline pipeline(VkShaderModule vs, VkShaderModule fs, const std::array<u32, pica::reg::COUNT>& regs) {
         const u32 topo = regs[PRIMITIVE_CONFIG] >> 8 & 3;
+        const bool stencil = has_stencil(regs) && (regs[STENCIL_TEST] & 1);
         const u32 state[] = {topo, regs[CULL] & 3, regs[COLOR_OP], regs[BLEND_FUNC], regs[DEPTH_COLOR_MASK],
-                             regs[COLOR_WRITE_ENABLE] != 0, regs[DEPTH_WRITE_ENABLE] != 0};
+                             regs[COLOR_WRITE_ENABLE] != 0, regs[DEPTH_WRITE_ENABLE] != 0,
+                             stencil ? (regs[STENCIL_TEST] & 0x70) | (regs[STENCIL_OP] & 0x777) << 8 | 1 : 0};
         const u64 key = fnv(state, sizeof state, fnv(&vs, sizeof vs, fnv(&fs, sizeof fs)));
         auto it = pipelines.find(key);
         if (it != pipelines.end()) return it->second;
@@ -714,6 +737,13 @@ struct Renderer::Impl {
         ds.depthTestEnable = dcm & 1;
         ds.depthCompareOp = compare_op(dcm >> 4);
         ds.depthWriteEnable = (dcm >> 12 & 1) && regs[DEPTH_WRITE_ENABLE] != 0;
+        // Reference and masks are dynamic state (set per draw).
+        ds.stencilTestEnable = stencil;
+        ds.front.failOp = stencil_op(regs[STENCIL_OP]);
+        ds.front.depthFailOp = stencil_op(regs[STENCIL_OP] >> 4);
+        ds.front.passOp = stencil_op(regs[STENCIL_OP] >> 8);
+        ds.front.compareOp = compare_op(regs[STENCIL_TEST] >> 4);
+        ds.back = ds.front;
         VkPipelineColorBlendAttachmentState cb{};
         const u32 bf = regs[BLEND_FUNC];
         cb.blendEnable = regs[COLOR_OP] >> 8 & 1;  // otherwise logic op (shortcut: treated as COPY)
@@ -724,9 +754,10 @@ struct Renderer::Impl {
         VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         cbs.attachmentCount = 1, cbs.pAttachments = &cb;
         const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                                      VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+                                      VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+                                      VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE};
         VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dy.dynamicStateCount = 3, dy.pDynamicStates = dyn;
+        dy.dynamicStateCount = 6, dy.pDynamicStates = dyn;
         VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         pi.stageCount = 2, pi.pStages = stages;
         pi.pVertexInputState = &vi, pi.pInputAssemblyState = &ia, pi.pViewportState = &vp;
@@ -829,9 +860,12 @@ struct Renderer::Impl {
         std::memcpy(u + 1616, &bools, 4);
         // Lighting registers + LUTs rarely change between draws: reuse the last copy if equal.
         if (last_light.empty() || std::memcmp(last_light.data(), &regs[LIGHT_REGS], LIGHT_REG_WORDS * 4) ||
-            std::memcmp(last_light.data() + LIGHT_REG_WORDS, vs.light_lut.data(), sizeof(vs.light_lut))) {
+            std::memcmp(last_light.data() + LIGHT_REG_WORDS, vs.light_lut.data(), sizeof(vs.light_lut)) ||
+            std::memcmp(last_light.data() + LIGHT_REG_WORDS + vs.light_lut.size(), vs.fog_lut.data(),
+                        sizeof(vs.fog_lut))) {
             last_light.assign(&regs[LIGHT_REGS], &regs[LIGHT_REGS] + LIGHT_REG_WORDS);
             last_light.insert(last_light.end(), vs.light_lut.begin(), vs.light_lut.end());
+            last_light.insert(last_light.end(), vs.fog_lut.begin(), vs.fog_lut.end());
             lb_last = take(lb_used, LIGHT_BUF_SIZE);
             std::memcpy(lbuf.ptr + lb_last, last_light.data(), LIGHT_BUF_SIZE);
         }
@@ -853,7 +887,7 @@ struct Renderer::Impl {
             vkCmdCopyBufferToImage(cmd, xfer.buf, target.color.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
             barrier(target.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-            barrier(target.depth.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+            barrier(target.depth.img, DS_ASPECT, VK_IMAGE_LAYOUT_UNDEFINED,
                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         }
 
@@ -882,10 +916,12 @@ struct Renderer::Impl {
         rbi.framebuffer = target.fb;
         rbi.renderArea = {{0, 0}, {target.width, target.height}};
         vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
-        if (target.fresh) {  // depth starts at the guest's last fill value for this buffer
+        if (target.fresh) {  // depth/stencil start at the guest's last fill value for this buffer
             auto it = depth_clears.find(target.depth_va);
-            VkClearAttachment ca{VK_IMAGE_ASPECT_DEPTH_BIT, 1, {}};
-            ca.clearValue.depthStencil = {it == depth_clears.end() ? 0.0f : it->second, 0};
+            VkClearAttachment ca{DS_ASPECT, 1, {}};
+            ca.clearValue.depthStencil = it == depth_clears.end() ? VkClearDepthStencilValue{0.0f, 0}
+                                                                  : VkClearDepthStencilValue{it->second.depth,
+                                                                                             it->second.stencil};
             VkClearRect rect{{{0, 0}, {target.width, target.height}}, 0, 1};
             vkCmdClearAttachments(cmd, 1, &ca, 1, &rect);
             target.fresh = false;
@@ -904,6 +940,11 @@ struct Renderer::Impl {
         const u32 bc = regs[BLEND_COLOR];
         const float consts[4] = {(bc & 0xFF) / 255.f, (bc >> 8 & 0xFF) / 255.f, (bc >> 16 & 0xFF) / 255.f, (bc >> 24) / 255.f};
         vkCmdSetBlendConstants(cmd, consts);
+        const u32 st = regs[STENCIL_TEST];
+        vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, st >> 24 & 0xFF);
+        vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK,
+                                 regs[DEPTH_WRITE_ENABLE] & 1 ? st >> 8 & 0xFF : 0);  // bit 0 stencil, bit 1 depth
+        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, st >> 16 & 0xFF);
         const auto push = pica::fragment_push_constants(regs);
         vkCmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof push, push.data());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 2, sets, 0, nullptr);
@@ -943,7 +984,9 @@ void Renderer::flush(core::Memory& mem) {
 
 void Renderer::memory_fill(u32 start, u32, u32 value, u32 width_mode) {
     std::lock_guard lk(impl_->lock);
-    impl_->depth_clears[start] = width_mode == 0 ? (value & 0xFFFF) / 65535.0f : (value & 0xFFFFFF) / 16777215.0f;
+    // 16-bit fills clear D16; 24/32-bit fills D24, the 32-bit ones with the stencil in the top byte.
+    impl_->depth_clears[start] = width_mode == 0 ? Impl::DepthClear{(value & 0xFFFF) / 65535.0f, 0}
+                                                 : Impl::DepthClear{(value & 0xFFFFFF) / 16777215.0f, width_mode == 2 ? value >> 24 : 0};
 }
 
 Renderer::Stats Renderer::stats() const { return impl_->stats; }

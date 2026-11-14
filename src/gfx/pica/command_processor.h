@@ -16,6 +16,8 @@ constexpr u32 FIXED_ATTRIB_DATA = 0x233;  // 3 regs: four packed float24
 constexpr u32 CMDBUF_SIZE0 = 0x238, CMDBUF_ADDR0 = 0x23A, CMDBUF_JUMP0 = 0x23C;  // channel 1 at +1
 constexpr u32 LIGHTING_LUT_INDEX = 0x1C5;  // bits 0-7 entry, 8-12 table
 constexpr u32 LIGHTING_LUT_DATA = 0x1C8;   // 8 regs, all write the same FIFO
+constexpr u32 FOG_LUT_INDEX = 0xE6;        // bits 0-6 entry
+constexpr u32 FOG_LUT_DATA = 0xE8;         // 8 regs, all write the same FIFO
 constexpr u32 DRAW_ARRAYS = 0x22E;
 constexpr u32 DRAW_ELEMENTS = 0x22F;
 constexpr u32 VS_BOOL_UNIFORMS = 0x2B0;
@@ -45,6 +47,8 @@ struct ShaderState {
     // of 256 raw entries {bits 0-11 value 0.12, bits 12-23 signed difference 1.11}.
     // Tables: 0 D0, 1 D1, 3 FR, 4 RB, 5 RG, 6 RR, 8-15 SP per light, 16-23 DA per light.
     std::array<u32, 24 * 256> light_lut{};
+    // Fog factor by depth: 128 entries {bits 0-12 signed difference 1.11, bits 13-23 value 0.11}.
+    std::array<u32, 128> fog_lut{};
 };
 
 // Executes PICA200 command lists (as submitted through GSP) into register state.

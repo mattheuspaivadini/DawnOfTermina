@@ -95,6 +95,10 @@ void CommandProcessor::write(u32 id, u32 value, u32 byte_mask) {
         u32& sel = regs_[LIGHTING_LUT_INDEX];
         if (const u32 table = sel >> 8 & 0x1F; table < 24) vs_.light_lut[table * 256 + (sel & 0xFF)] = value;
         sel = (sel & ~0xFFu) | ((sel + 1) & 0xFF);
+    } else if (id >= FOG_LUT_DATA && id < FOG_LUT_DATA + 8) {
+        u32& index = regs_[FOG_LUT_INDEX];
+        vs_.fog_lut[index & 0x7F] = value;
+        index = (index & ~0x7Fu) | ((index + 1) & 0x7F);
     } else if (id >= VS_PROGRAM_DATA && id < VS_PROGRAM_DATA + 8) {
         u32& off = regs_[VS_PROGRAM_OFFSET];
         if (off < vs_.code.size()) vs_.code[off] = value;

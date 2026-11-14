@@ -109,6 +109,16 @@ static void test_fragment() {
     assert(fs.find("next_combiner_buffer.rgb = last_tex_env_out.rgb;") != std::string::npos);
     assert(compiles(fs, ShaderStage::Fragment));
 
+    // Fog (mode 5), both depth directions; the colour is a push constant.
+    for (u32 flip = 0; flip < 2; ++flip) {
+        auto fog = regs;
+        fog[0xE0] |= 5 | flip << 16;
+        fog[0xE1] = 0x00FF8000;
+        const std::string ffs = generate_fragment_shader(fog);
+        assert(ffs.find("fog_lut[") != std::string::npos && compiles(ffs, ShaderStage::Fragment));
+        assert(fragment_push_constants(fog)[8] == 0x00FF8000);
+    }
+
     // Every colour/alpha combiner op compiles.
     for (u32 op = 0; op < 10; ++op) {
         regs[0xC2] = op | op << 16;

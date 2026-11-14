@@ -332,7 +332,7 @@ std::string generate_vertex_shader(const VsSource& src, std::string* error) {
 namespace {
 
 constexpr u32 TEV_STAGE_REGS[6] = {0xC0, 0xC8, 0xD0, 0xD8, 0xF0, 0xF8};
-constexpr u32 TEV_BUFFER_INPUT = 0xE0, TEV_BUFFER_COLOR = 0xFD, ALPHA_TEST = 0x104;
+constexpr u32 TEV_BUFFER_INPUT = 0xE0, FOG_COLOR = 0xE1, TEV_BUFFER_COLOR = 0xFD, ALPHA_TEST = 0x104;
 
 std::string tev_source(u32 id) {
     switch (id) {
@@ -398,7 +398,9 @@ constexpr u32 LIGHTING_ENABLE = 0x08F, LIGHT0 = 0x140, LIGHT_MAX_INDEX = 0x1C2, 
               LIGHT_CONFIG1 = 0x1C4, LIGHTING_DISABLE = 0x1C6, LUT_ABS = 0x1D0, LUT_SELECT = 0x1D1,
               LUT_SCALE = 0x1D2, LIGHT_PERMUTATION = 0x1D9;
 
-constexpr const char* LIGHTING_DECLS = R"(layout(std430, set = 0, binding = 1) readonly buffer PicaLighting { uint lr[0x90]; uint lut[24 * 256]; };
+constexpr const char* FRAGMENT_BUFFER_DECL =
+    "layout(std430, set = 0, binding = 1) readonly buffer PicaLighting { uint lr[0x90]; uint lut[24 * 256]; uint fog_lut[128]; };\n";
+constexpr const char* LIGHTING_DECLS = R"(
 vec3 light_color(uint r) { return vec3((r >> 20) & 0x3FFu, (r >> 10) & 0x3FFu, r & 0x3FFu) / 255.0; }
 float f16(uint v) { return unpackHalf2x16(v & 0xFFFFu).x; }
 float f20(uint v) {  // 1.7.12 float
@@ -532,6 +534,7 @@ std::array<u32, FRAGMENT_PUSH_WORDS> fragment_push_constants(const std::array<u3
     for (u32 i = 0; i < 6; ++i) pc[i] = regs[TEV_STAGE_REGS[i] + 3];
     pc[6] = regs[TEV_BUFFER_COLOR];
     pc[7] = regs[ALPHA_TEST] >> 8 & 0xFF;
+    pc[8] = regs[FOG_COLOR];
     return pc;
 }
 
@@ -548,9 +551,11 @@ layout(set = 1, binding = 0) uniform sampler2D tex0;
 layout(set = 1, binding = 1) uniform sampler2D tex1;
 layout(set = 1, binding = 2) uniform sampler2D tex2;
 layout(location = 0) out vec4 frag_color;
-layout(push_constant) uniform PicaFragment { uint tev_const[6]; uint tev_buffer_color; uint alpha_ref; } pc;
+layout(push_constant) uniform PicaFragment { uint tev_const[6]; uint tev_buffer_color; uint alpha_ref; uint fog_color; } pc;
 )";
     const bool lit = lighting_enabled(regs);
+    const bool fog = (regs[TEV_BUFFER_INPUT] & 7) == 5;
+    if (lit || fog) out += FRAGMENT_BUFFER_DECL;
     if (lit) out += LIGHTING_DECLS;
     out += R"(
 void main() {
@@ -594,6 +599,19 @@ void main() {
             if (regs[TEV_BUFFER_INPUT] >> (12 + i) & 1) out += "    next_combiner_buffer.a = last_tex_env_out.a;\n";
         }
         out += "    }\n";
+    }
+
+    if (fog) {  // gl_FragCoord.z already is the PICA window depth (z/w * scale + offset)
+        out += std::format(R"(    {{
+    float fog_index = clamp({}, 0.0, 1.0) * 128.0;
+    float fog_i = clamp(floor(fog_index), 0.0, 127.0);
+    uint e = fog_lut[int(fog_i)];
+    float fog_factor = clamp(float((e >> 13) & 0x7FFu) / 2047.0 +
+                             float(bitfieldExtract(int(e), 0, 13)) / 2047.0 * (fog_index - fog_i), 0.0, 1.0);
+    last_tex_env_out.rgb = mix(unpackUnorm4x8(pc.fog_color).rgb, last_tex_env_out.rgb, fog_factor);
+    }}
+)",
+                           regs[TEV_BUFFER_INPUT] >> 16 & 1 ? "1.0 - gl_FragCoord.z" : "gl_FragCoord.z");
     }
 
     const u32 at = regs[ALPHA_TEST];

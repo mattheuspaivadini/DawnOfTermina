@@ -31,10 +31,11 @@
 // VS uniforms: set 0 binding 0, std140 { vec4 c[96]; ivec4 i[4]; vec4 depth (scale, offset); uint b; }
 // FS textures: set 1 bindings 0..2 (sampler2D tex0..tex2).
 // FS push constants (values that change per draw, kept out of the shader so they do not
-// create variants): { uint tev_const[6]; uint tev_buffer_color; uint alpha_ref; }, the colours
-// as raw RGBA8 registers (see fragment_push_constants).
-// FS lighting (only when enabled): set 0 binding 1, std430 storage buffer
-//   { uint regs[0x90] (registers 0x140..0x1C0); uint lut[24 * 256] (ShaderState::light_lut) }.
+// create variants): { uint tev_const[6]; uint tev_buffer_color; uint alpha_ref; uint fog_color; },
+// the colours as raw RGBA8 registers (see fragment_push_constants).
+// FS lighting and fog (declared only when enabled): set 0 binding 1, std430 storage buffer
+//   { uint regs[0x90] (registers 0x140..0x1C0); uint lut[24 * 256] (ShaderState::light_lut);
+//     uint fog_lut[128] (ShaderState::fog_lut) }.
 namespace gfx::pica {
 
 struct VsSource {
@@ -53,10 +54,10 @@ struct VsSource {
 std::string generate_vertex_shader(const VsSource& src, std::string* error);
 
 // Fragment shader for the TEV combiner / alpha-test state in the register file.
-// shortcut: fog, procedural textures, shadow maps and non-2D texture types are not
-// generated yet; add when a scene needs them.
+// shortcut: gas (fog mode 7), procedural textures, shadow maps and non-2D texture types are
+// not generated yet; add when a scene needs them.
 std::string generate_fragment_shader(const std::array<u32, reg::COUNT>& regs);
-constexpr u32 FRAGMENT_PUSH_WORDS = 8;
+constexpr u32 FRAGMENT_PUSH_WORDS = 9;
 std::array<u32, FRAGMENT_PUSH_WORDS> fragment_push_constants(const std::array<u32, reg::COUNT>& regs);
 
 }  // namespace gfx::pica

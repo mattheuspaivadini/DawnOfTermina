@@ -36,3 +36,11 @@
 0x001d62ac,nn_ir_InitEvent,? creates an event via svcCreateEvent; fatal on failure
 0x001d5f30,nn_ir_GetConnectionStatusEvent,? closes the held event and stores the one ir:USER hands out (copy handle)
 0x001d5820,nn_ir_WaitConnection,? waits on the ir connection-status event; a failed wait is fatal (needs copied handles to stay valid)
+0x00163044,nn_snd_Initialize,? creates the snd event, starts the DSP (nn_snd_InitializeDspShared) and the sound threads
+0x001631c8,nn_snd_InitializeDspShared,? pipe-2 Initialize, reads the 15 struct addresses, converts each twice (addr and addr|0x10000 = two regions); strides 0xC0 voice config / 0xC status / 0x20 ADPCM coeffs; writes frame counter 4 in region 0
+0x0017ad28,nn_snd_ConvertDspAddress,? wrapper: *out = -1 unless the dsp session exists, then ConvertProcessAddressFromDspDram
+0x00192ef8,nn_dsp_ConvertProcessAddressFromDspDram,H dsp::DSP IPC 0x000C0040 (hle/service/dsp.cpp)
+0x0017abf4,nn_snd_WriteAudioPipe,? WriteProcessPipe on channel 2 (state change)
+0x0017ac3c,nn_snd_ReadAudioPipe,? ReadPipeIfPossible on channel 2
+0x0017ab94,nn_dsp_SetSemaphore,? dsp::DSP SetSemaphore (0x4000 after writing shared memory)
+0x00192d3c,nn_os_CriticalSection_Enter,? recursive: owner = TLS id, count at +8

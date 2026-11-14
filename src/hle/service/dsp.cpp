@@ -14,17 +14,15 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// dsp::DSP — control protocol of the audio DSP, as a silent sound card: the component
-// "loads", the audio pipe hands out shared-structure addresses on Initialize, and an
-// audio-frame tick advances the frame counter and raises the pipe interrupt.
-// shortcut: no audio processing or output, and each of the 15 shared structures gets its
-// own roomy DSP RAM region instead of the firmware's exact layout; implement the DSP HLE
-// (mixing, ADPCM, output) in the audio stage.
+// dsp::DSP — control protocol of the audio DSP: the component "loads", the audio pipe hands
+// out the shared-structure addresses on Initialize, and every audio frame (160 samples at
+// 32728 Hz) runs the HLE firmware (hle/dsp.cpp) and raises the pipe interrupt.
 
 #include <algorithm>
 #include <deque>
 #include <mutex>
 
+#include "hle/dsp.h"
 #include "hle/ipc.h"
 #include "hle/service/services.h"
 
@@ -33,27 +31,25 @@ namespace hle::service {
 namespace {
 
 constexpr u32 PIPE_AUDIO = 2;
-constexpr u32 DSP_DRAM_VA = core::Memory::DSP_BASE + 0x40000;  // DSP address 0 (16-bit words)
-constexpr u16 STRUCT_BASE = 0x8000, STRUCT_STRIDE = 0x1000;     // DSP word addresses
 
 core::Memory* g_mem = nullptr;
 std::mutex g_dsp_lock;
 std::deque<u8> g_pipes[8];
 Handle g_semaphore_event = 0, g_pipe_event[8] = {};
 bool g_running = false;
-u16 g_frame = 0;
 
-u32 dsp_to_va(u32 dsp_addr) { return DSP_DRAM_VA + dsp_addr * 2; }
+u32 dsp_to_va(u32 dsp_addr) { return dsp::DSP_DRAM_VA + dsp_addr * 2; }
 
 void audio_frame() {
     Handle ev;
+    s16 samples[dsp::FRAME_SAMPLES * 2];
     {
         std::lock_guard lk(g_dsp_lock);
         if (!g_running) return;
-        ++g_frame;
-        g_mem->write<u16>(dsp_to_va(STRUCT_BASE), g_frame);  // structure 0: frame counter
+        dsp::process_frame(*g_mem, samples);
         ev = g_pipe_event[PIPE_AUDIO];
     }
+    dsp::output(samples, dsp::FRAME_SAMPLES);
     if (ev) kernel::signal_event(ev);
 }
 
@@ -77,10 +73,12 @@ void dsp_command(core::Memory& mem, u32 base) {
     case 0x20:  // ForceHeadphoneOut
         c.reply(1, 0);
         return;
-    case 0x0C:  // ConvertProcessAddressFromDspDram(dsp address)
+    case 0x0C: {  // ConvertProcessAddressFromDspDram(dsp address); read before reply() overwrites it
+        const u32 va = dsp_to_va(c[1]);
         c.reply(2, 0);
-        c.set(2, dsp_to_va(c[1]));
+        c.set(2, va);
         return;
+    }
     case 0x0D: {  // WriteProcessPipe(channel, size, static desc, address)
         const u32 channel = c[1] & 7, size = c[2], addr = c[4];
         if (channel == PIPE_AUDIO && size >= 4) {
@@ -89,8 +87,9 @@ void dsp_command(core::Memory& mem, u32 base) {
                 auto& p = g_pipes[PIPE_AUDIO];
                 p.clear();
                 auto push16 = [&](u16 v) { p.push_back(u8(v)), p.push_back(u8(v >> 8)); };
-                push16(15);
-                for (u16 i = 0; i < 15; ++i) push16(u16(STRUCT_BASE + i * STRUCT_STRIDE));
+                push16(dsp::NUM_STRUCTS);
+                for (u16 off : dsp::STRUCT_OFFSET) push16(u16(dsp::REGION0_WORD + off / 2));
+                if (state == 0) dsp::reset();
                 g_running = true;
             } else if (state == 1 || state == 3) {  // Shutdown / Sleep
                 g_running = false;

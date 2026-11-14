@@ -89,7 +89,7 @@ endif()
 
 enable_testing()
 add_executable(dot_selftest tests/selftest.cpp tests/pica_test.cpp tests/shader_test.cpp
-    tests/recomp_test.cpp)
+    tests/recomp_test.cpp tests/audio_test.cpp)
 target_link_libraries(dot_selftest PRIVATE dot_runtime)
 add_test(NAME selftest COMMAND dot_selftest ${CMAKE_SOURCE_DIR}/game_data)
 find_package(Python3 COMPONENTS Interpreter)

@@ -245,8 +245,8 @@ int main(int argc, char** argv) {
     if (std::getenv("DOT_STATS")) std::printf("guest threads at exit:\n%s", hle::kernel::dump_threads().c_str());
 #endif
     SDL_DestroyWindow(window);
-    SDL_Quit();
     hle::dsp::Shutdown();
+    SDL_Quit();
     std::fflush(stdout);
     // Guest threads may still be parked inside the kernel: skip static destructors.
     std::_Exit(0);

@@ -15,7 +15,7 @@ O código ARM11 original (`code.bin` do ExeFS) é traduzido automaticamente para
 | Compilador C++20 | GCC 12 / Clang 16 | build |
 | CMake | 3.20 | build |
 | Ninja ou Make | — | build |
-| SDL3 | 3.2 | janela, input, (áudio) |
+| SDL3 | 3.2 | janela, input, áudio |
 | Vulkan SDK (headers, loader) | 1.3 | renderização |
 | glslang | 14+ | GLSL → SPIR-V em runtime |
 | Python | 3.10 | scripts em `tools/` |
@@ -68,7 +68,8 @@ Cada função transcrita mantém o endereço virtual original em comentário (`/
 | 5 | Entry point (`_start` / `nnMain`) | ✅ boot do crt0 transcrito até a fronteira atual |
 | 6 | Recompilador estático automático ARM11 → C++ | ✅ boot do SDK roda recompilado até a criação de threads |
 | 7 | Threads do guest e serviços do sistema até o primeiro frame | ✅ título, criação de arquivo (teclado HLE), cutscene inicial da Lost Woods e Link controlável (circle pad) a ~60 VBlanks/s |
-| 8+ | Subsistemas do jogo (cenas, loop, áudio, colisão, atores, HUD) | ⏳ |
+| 8 | Áudio: HLE do DSP (24 vozes, PCM8/PCM16/ADPCM) com saída via SDL3 | ✅ música e efeitos; sem reverb/filtros |
+| 9+ | Subsistemas do jogo (cenas, loop, colisão, atores, HUD) | ⏳ |
 
 ## Licença
 

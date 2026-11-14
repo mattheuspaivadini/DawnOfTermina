@@ -29,6 +29,15 @@ Recompilação estática nativa de *Majora's Mask 3D* (3DS, ARM11) para C++20 + 
 - `hle::dsp`: stub, sem áudio.
 - **Faltam:** threads/handles/sincronização (`svcCreateThread`, eventos, mutexes), `cfg`, `ptm`, `apt`, toque na tela inferior, C-stick (`ir:rst`), áudio, saves.
 
+## Gráficos (Etapa 4)
+
+- **`gfx::vulkan::Context`** (`src/gfx/vulkan/`): instância (via SDL3), seleção de GPU (prefere discreta), device, swapchain FIFO recriada ao redimensionar/minimizar, 1 frame em voo. Apresenta as telas superior (400×240) e inferior (320×240) empilhadas em uma tela virtual de 400×480, escaladas com aspecto preservado (upload por staging + `vkCmdBlitImage`, filtro nearest).
+  - Formato de swapchain: **UNORM + `SRGB_NONLINEAR`** obrigatório; framebuffers do 3DS já vêm com gama, e um formato `*_SRGB` ou espaço linear aplicaria a gama duas vezes (bug já visto: a SDL expõe espaços extras via `VK_EXT_swapchain_colorspace`).
+  - `DOT_VULKAN_VALIDATION=1` liga a `VK_LAYER_KHRONOS_validation` se estiver instalada (pacote `vulkan-validation-layers`).
+- **`gfx::pica::decode_texture`** (`src/gfx/pica/texture.*`): os 14 formatos PICA200 (RGBA8 … ETC1A4) → RGBA8 linear. Tiles 8×8 em ordem Morton (x nos bits 0/2/4, y em 1/3/5); ETC1 = 4 blocos 4×4 em ordem Z por tile, cada bloco u64 LE; ETC1A4 = u64 de alfa (nibble em `(x*4+y)*4`) antes de cada bloco. A saída fica na ordem da memória (linha 0 = primeira na memória; em texturas PICA é a base da imagem, convenção GL); inverter ao amostrar. Validado com o ícone SMDH real (48×48 RGB565 em `icon.bin+0x24C0`).
+- **`gfx::pica::CommandProcessor`** (`src/gfx/pica/command_processor.*`): parser de command lists (`[valor][cabeçalho: id 0-15, máscara de bytes 16-19, extras 20-30, consecutivo 31]`, padding de 8 bytes), banco de 0x300 registradores, uploads do vertex shader (código 0x2CB/0x2CC, swizzle 0x2D5/0x2D6, uniforms float f24/f32 0x2C0/0x2C1 com auto-incremento, int 0x2B1, bool 0x2B0), gatilhos de draw 0x22E/0x22F via `on_draw`.
+- **Falta (4b):** GSP HLE (`gsp::Gpu`: framebuffers, `DisplayTransfer`, `MemoryFill`, submissão de command lists, conversão PA↔VA: VRAM PA `0x18000000`↔VA `0x1F000000`, FCRAM PA `0x20000000`↔heap linear VA `0x14000000`); leitura de vertex arrays/índices; tradutor PICA VS → GLSL → SPIR-V (glslang, disponível em `/usr/lib/libglslang.so`); TEV 6 estágios → fragment shader; estado de blend/depth/stencil/cull; render passes/pipelines com cache; render targets na VRAM; geometry shader e atributos fixos (0x232).
+
 ## Mapa de memória do 3DS (Horizon, processo de aplicação)
 
 Segmentos do jogo extraídos do `exheader.bin` (MM3D USA, título interno `Joker`, `code.bin` comprimido com LZSS, 0x5b1000 bytes descomprimido). O `.bss` foi confirmado pelos literais de `__clear_bss` (0x100024).
@@ -67,7 +76,7 @@ cmake --build build
 ./build/dawnoftermina game_data
 ```
 
-Dependências de build: SDL3 (`find_package(SDL3 CONFIG)`).
+Dependências de build: SDL3 (`find_package(SDL3 CONFIG)`), Vulkan (`find_package(Vulkan)`).
 
 Ambiente atual do dev: CMake não está instalado no sistema; usar `uvx cmake ...` como substituto (sem Ninja: gerador padrão Make).
 
@@ -88,6 +97,6 @@ python3 tools/extract_cia.py "ISO/The Legend of Zelda Majora's Mask 3D (USA).cia
 | 1 | Bootstrap: git, `.gitignore`, `LICENSE`, `README.md`, `CLAUDE.md`, CMake | ✅ | executável stub que valida `game_data/` |
 | 2 | Extração do `.cia` + mapa de memória + abrir no Hopper | ✅ | extrator em Python puro (sem ctrtool/3dstool); `code.elf` validado no Hopper |
 | 3 | Runtime de memória, `svc`, stubs `fs`/`hid`/`dsp` | ✅ | HLE no nível do SDK, sem IPC; `tests/selftest.cpp` via ctest |
-| 4 | Vulkan + tradutor PICA200 | ⏳ | |
+| 4 | Vulkan + tradutor PICA200 | 🟡 | **4a ✅** contexto Vulkan + apresentação das 2 telas, decodificador de texturas, command processor. **4b ⏳** GSP, shaders VS/TEV, pipelines de draw |
 | 5 | Entry point / `nnMain` | ⏳ | |
 | 6+ | Subsistemas do jogo | ⏳ | |

@@ -97,11 +97,14 @@ static void test_loader(Memory& mem, const stdfs::path& data) {
     assert(mem.read<u32>(cs->data.addr + cs->data.size) == 0);  // .bss starts zeroed
 }
 
+void test_pica();  // tests/pica_test.cpp
+
 int main(int argc, char** argv) {
     Memory mem;
     test_memory_and_svc(mem);
     test_fs();
     test_hid();
+    test_pica();
     test_loader(mem, argc > 1 ? argv[1] : "game_data");
     std::puts("selftest: OK");
     return 0;

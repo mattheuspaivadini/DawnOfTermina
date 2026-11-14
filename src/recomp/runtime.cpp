@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <limits>
+#include <vector>
 
 namespace recomp {
 
@@ -33,10 +34,20 @@ void service_interrupt() {
     if (g_interrupt_handler) g_interrupt_handler();
 }
 static const FuncEntry* g_table = nullptr;
-static u32 g_count = 0;
+// Direct index: slot (key - g_lo) / 2 holds 1 + the entry's position in g_table (0 = none).
+// Entries are at least halfword aligned, so ARM and Thumb keys never share a slot.
+static std::vector<u32> g_slots;
+static u32 g_lo = 0;
 
 void set_memory(u8* guest_base) { g_base = guest_base; }
-void set_function_table(const FuncEntry* table, u32 count) { g_table = table, g_count = count; }
+void set_function_table(const FuncEntry* table, u32 count) {
+    g_table = table;
+    g_slots.clear();
+    if (!count) return;
+    g_lo = table[0].key & ~1u;  // sorted by key
+    g_slots.assign(((table[count - 1].key - g_lo) >> 1) + 1, 0);
+    for (u32 i = 0; i < count; ++i) g_slots[(table[i].key - g_lo) >> 1] = i + 1;
+}
 
 static std::string hex(u32 v) {
     char b[16];
@@ -45,12 +56,13 @@ static std::string hex(u32 v) {
 }
 
 u32 call(Context* c, u32 target) {
-    const FuncEntry* end = g_table + g_count;
-    const FuncEntry* it = std::lower_bound(g_table, end, target, [](const FuncEntry& e, u32 k) { return e.key < k; });
-    if (it == end || it->key != target)
+    const u32 slot = (target - g_lo) >> 1;  // wraps to huge below g_lo
+    const u32 i = slot < g_slots.size() ? g_slots[slot] : 0;
+    // The key check rejects an ARM/Thumb mode mismatch at a real entry address.
+    if (!i || g_table[i - 1].key != target)
         throw Trap(target, "indirect call/jump to " + hex(target) + " which is not a recompiled function entry "
                            "(add it to tools/recomp/extra_entries.txt if it is real code); LR=" + hex(c->r[14]));
-    return it->fn(c);
+    return g_table[i - 1].fn(c);
 }
 
 void unimplemented(Context*, u32 pc, const char* what) {

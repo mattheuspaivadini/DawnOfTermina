@@ -60,7 +60,7 @@ struct Trap : std::runtime_error {
 // ---- setup
 void set_memory(u8* guest_base);
 void set_svc_memory(core::Memory& mem);
-void set_function_table(const FuncEntry* table, u32 count);  // sorted by key
+void set_function_table(const FuncEntry* table, u32 count);  // sorted by key; O(1) lookup in call()
 
 // ---- asynchronous interrupts
 // Set by the host when a guest thread should stop at the next loop back-edge (pending

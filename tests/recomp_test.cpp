@@ -108,4 +108,14 @@ void test_recomp_runtime() {
     hooks::cosf(&c);
     assert(fs(&c, 0) == 1.0f);
     set_memory(saved_base);
+
+    // Indirect calls: direct-index table, exact key match (Thumb bit included)
+    static const FuncEntry table[] = {{0x100000, [](Context*) { return 1u; }},
+                                      {0x100005, [](Context*) { return 2u; }},
+                                      {0x100008, [](Context*) { return 3u; }}};
+    set_function_table(table, 3);
+    assert(call(&c, 0x100000) == 1 && call(&c, 0x100005) == 2 && call(&c, 0x100008) == 3);
+    for (u32 bad : {0x100004u, 0x100001u, 0x0FFFFEu, 0x10000Au, 0u})
+        try { call(&c, bad); assert(false); } catch (const Trap&) {}
+    set_function_table(nullptr, 0);
 }

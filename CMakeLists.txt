@@ -105,6 +105,12 @@ if(EXISTS "${DOT_GAME_DATA}/exefs/code.bin")
     target_compile_definitions(dawnoftermina PRIVATE DOT_HAVE_RECOMP=1)
 endif()
 
+# Self-contained folder: cmake --install build --prefix dist. With game data configured the
+# executable holds the recompiled game code: personal use only, never commit or share it.
+install(TARGETS dawnoftermina RUNTIME DESTINATION .)
+install(FILES tools/extract_cia.py DESTINATION tools)
+install(FILES LICENSE README.md DESTINATION .)
+
 enable_testing()
 add_executable(dot_selftest tests/selftest.cpp tests/pica_test.cpp tests/shader_test.cpp
     tests/recomp_test.cpp tests/audio_test.cpp)

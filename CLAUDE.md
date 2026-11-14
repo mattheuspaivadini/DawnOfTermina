@@ -179,6 +179,8 @@ cmake --build build
 ./build/dawnoftermina game_data
 ```
 
+**Pasta `dist/`** (ignorada pelo Git): `cmake --install build --prefix dist` → `dist/dawnoftermina` + `dist/tools/extract_cia.py` + `LICENSE` + `README.md`. O executável usa o `tools/` ao lado dele (senão o do diretório pai, caso de `build/` num checkout), então a pasta é autocontida: sem `game_data`, a tela de 1ª execução extrai o `.cia` para `dist/game_data`, e `config.toml`/`saves/`/`cache/` ficam em `dist/`. Validado: cópia do `dist/` sem dados + `DOT_SETUP_CIA` → `game_data` idêntico ao do repositório → jogo roda. Precisa de `python3` e das bibliotecas do sistema (SDL3, Vulkan, glslang). **Com `game_data` no build o executável contém o código do jogo recompilado: uso pessoal, nunca commitar nem redistribuir.**
+
 Dependências de build: SDL3 (`find_package(SDL3 CONFIG)`), Vulkan (`find_package(Vulkan)`), glslang, Dear ImGui 1.91.9 (`FetchContent` do GitHub, SHA-256 fixo; offline: `-DFETCHCONTENT_SOURCE_DIR_IMGUI=<cópia local>`).
 
 Ambiente atual do dev: CMake não está instalado no sistema; usar `uvx cmake ...` como substituto (sem Ninja: gerador padrão Make).

@@ -18,6 +18,7 @@ exefs/
 
 # Build
 build/
+dist/
 build-*/
 cmake-build-*/
 compile_commands.json

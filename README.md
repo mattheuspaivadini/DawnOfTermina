@@ -44,6 +44,14 @@ cmake --build build
 ./build/dawnoftermina game_data
 ```
 
+### Pasta autocontida (`dist/`)
+
+```sh
+cmake --install build --prefix dist
+```
+
+Gera `dist/dawnoftermina` com `dist/tools/extract_cia.py` ao lado. Aberto sem `game_data/`, ele pede o `.cia` e extrai para `dist/game_data` (precisa de `python3`); configurações, saves e caches também ficam em `dist/`. O executável contém o código do jogo recompilado da **sua** cópia: é para uso pessoal, não distribua.
+
 ### Configuração e controles
 
 Na primeira execução é criado um `config.toml` ao lado de `game_data/` (ignorado pelo Git) com: **1080p**, widescreen **16:9**, **tela única** (a tela de baixo vira uma sobreposição), VSync e **30 FPS**. O modo **60 FPS** (quadros intermediários interpolados; a lógica do jogo continua a 30 Hz) renderiza o dobro na GPU: ative no menu se ela tiver folga na resolução escolhida (uma Intel Iris Xe mantém 720p a 60 FPS). Tudo pode ser mudado em jogo no menu (**F1** ou **Esc**) e é salvo na hora, inclusive a resolução interna: 1080p = 4×, 720p = 3×, 240p = 1× (a escala é inteira).

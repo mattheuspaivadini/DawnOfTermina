@@ -104,11 +104,14 @@ static bool has_game_data(const std::filesystem::path& d) {
 }
 
 int main(int argc, char** argv) {
-    // game_data: the argument, else the working directory, else next to the executable
-    // (build/../game_data in a source checkout), so launching from a file manager works.
+    // game_data: the argument, else the working directory, else next to the executable, so
+    // launching from a file manager works. The root is the folder whose tools/ the executable
+    // uses: its own (a dist/ install) or its parent's (build/ in a source checkout).
     namespace fs = std::filesystem;
     const fs::path base = SDL_GetBasePath() ? fs::path(SDL_GetBasePath()) : fs::current_path();
-    const fs::path root = fs::exists(base / ".." / "tools" / "extract_cia.py") ? (base / "..").lexically_normal() : base;
+    const fs::path root = !fs::exists(base / "tools" / "extract_cia.py") && fs::exists(base / ".." / "tools" / "extract_cia.py")
+                              ? (base / "..").lexically_normal()
+                              : base;
     fs::path data = argc > 1 ? fs::path(argv[1]) : fs::path("game_data");
     if (argc <= 1 && !has_game_data(data)) data = root / "game_data";
     if (!has_game_data(data)) {

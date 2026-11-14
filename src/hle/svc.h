@@ -59,6 +59,9 @@ Result ControlMemory(core::Memory& mem, u32* out_addr, u32 addr0, u32 addr1, u32
 void SleepThread(s64 ns);
 // svc 0x28 — ARM11 ticks (268,111,856 Hz) since boot.
 u64 GetSystemTick();
+// Guest time runs this many times faster than host time (DOT_SPEED, default 1): a fast-forward
+// for scripted runs. Scales the system tick and kernel timeouts/periodic work (VBlank).
+double TimeScale();
 // svc 0x3C
 [[noreturn]] void Break(u32 reason);
 // svc 0x3D

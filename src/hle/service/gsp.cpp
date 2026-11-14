@@ -53,7 +53,7 @@ Framebuffer g_fb[2];
 Handle g_shared = 0, g_event = 0;
 gfx::pica::CommandProcessor g_pica;
 std::atomic<gfx::vulkan::Renderer*> g_renderer{nullptr};
-std::atomic<u64> g_vblanks{0}, g_lists{0}, g_draws{0}, g_fills{0}, g_transfers{0};
+std::atomic<u64> g_vblanks{0}, g_lists{0}, g_draws{0}, g_fills{0}, g_transfers{0}, g_frames{0};
 
 u32 shared_base() { return kernel::shared_memory(g_shared).addr; }
 
@@ -92,6 +92,7 @@ void vblank() {
             const u8 index = g_mem->read<u8>(upd) & 1;
             set_framebuffer(screen, upd + 4 + index * 0x1C);
             g_mem->write<u8>(upd + 1, 0);
+            if (screen == 0) ++g_frames;
         }
     }
     ++g_vblanks;
@@ -345,7 +346,7 @@ bool screen_image(int screen, std::vector<u32>& rgba) {
     return true;
 }
 
-Stats stats() { return {g_vblanks, g_lists, g_draws, g_fills, g_transfers}; }
+Stats stats() { return {g_vblanks, g_lists, g_draws, g_fills, g_transfers, g_frames}; }
 
 }  // namespace gsp
 

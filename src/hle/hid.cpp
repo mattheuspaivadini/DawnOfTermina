@@ -25,6 +25,8 @@
 #include <mutex>
 #include <utility>
 
+#include "hle/service/gsp.h"
+
 namespace hle::hid {
 
 // Keyboard: K/J/I/U = A/B/X/Y, Q/E = L/R, 1/3 = ZL/ZR, arrows = D-pad, WASD = circle pad.
@@ -75,9 +77,18 @@ bool parse_input_script(std::string_view text, std::vector<ScriptEvent>& out) {
         ScriptEvent e{};
         char name[16] = {};
         unsigned x = 0, y = 0;
-        if (std::sscanf(item.c_str(), "%lf:T%ux%u", &e.t, &x, &y) == 3 && x < 320 && y < 240) {
+        int sx = 0, sy = 0, at = 0;
+        if (std::sscanf(item.c_str(), "%lf+%lf:%n", &e.t, &e.duration, &at) < 2 || !at) {
+            at = 0;
+            if (std::sscanf(item.c_str(), "%lf:%n", &e.t, &at) < 1 || !at) return false;
+        }
+        const char* ev = item.c_str() + at;
+        if (std::sscanf(ev, "T%ux%u", &x, &y) == 2 && x < 320 && y < 240) {
             e.touch = true, e.x = u16(x), e.y = u16(y);
-        } else if (std::sscanf(item.c_str(), "%lf:%15[A-Z]", &e.t, name) == 2) {
+        } else if (std::sscanf(ev, "CP%dx%d", &sx, &sy) == 2 && std::abs(sx) <= int(CPAD_MAX) &&
+                   std::abs(sy) <= int(CPAD_MAX)) {
+            e.stick = true, e.sx = s16(sx), e.sy = s16(sy);
+        } else if (std::sscanf(ev, "%15[A-Z]", name) == 1) {
             for (auto [n, bit] : NAMES)
                 if (n == name) e.buttons = bit;
             if (!e.buttons) return false;
@@ -123,13 +134,15 @@ void Update() {
 
     u32 buttons = 0;
     int x = 0, y = 0;
-    const bool* kb = SDL_GetKeyboardState(nullptr);
+    // A script owns the input: host devices are ignored so a run is reproducible.
+    static const bool empty[SDL_SCANCODE_COUNT] = {};
+    const bool* kb = script.empty() ? SDL_GetKeyboardState(nullptr) : empty;
     for (auto [key, bit] : KEYS)
         if (kb[key]) buttons |= bit;
     x += (kb[SDL_SCANCODE_D] - kb[SDL_SCANCODE_A]) * CPAD_MAX;
     y += (kb[SDL_SCANCODE_W] - kb[SDL_SCANCODE_S]) * CPAD_MAX;
 
-    if (gamepad) {
+    if (gamepad && script.empty()) {
         for (auto [btn, bit] : PAD)
             if (SDL_GetGamepadButton(gamepad, btn)) buttons |= bit;
         if (SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16000) buttons |= ZL;
@@ -140,18 +153,20 @@ void Update() {
     // Touch: left mouse button over the bottom screen of the focused window. While dragged
     // off-screen the pen stays down at the last position, like a stylus slid to the bezel.
     float mx = 0, my = 0;
-    const bool down = SDL_GetMouseState(&mx, &my) & SDL_BUTTON_LMASK;
+    const bool down = (SDL_GetMouseState(&mx, &my) & SDL_BUTTON_LMASK) && script.empty();
     int w = 0, h = 0;
     if (SDL_Window* win = SDL_GetMouseFocus()) SDL_GetWindowSize(win, &w, &h);
 
     bool script_touch = false;
     u16 sx = 0, sy = 0;
     if (!script.empty()) {
-        static const u64 start = SDL_GetTicks();
-        const double t = (SDL_GetTicks() - start) / 1000.0;
+        // Guest time in VBlanks, not wall time: the script stays in step with the game when
+        // frames drop or under DOT_SPEED.
+        const double t = double(service::gsp::stats().vblanks) / 59.83;
         for (const auto& e : script)
-            if (t >= e.t && t < e.t + 0.15) {
+            if (t >= e.t && t < e.t + e.duration) {
                 buttons |= e.buttons;
+                if (e.stick) x += e.sx, y += e.sy;
                 if (e.touch) script_touch = true, sx = e.x, sy = e.y;
             }
     }

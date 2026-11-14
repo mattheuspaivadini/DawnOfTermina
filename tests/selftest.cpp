@@ -97,6 +97,10 @@ static void test_hid() {
     assert(parse_input_script("20:START,21.5:A,30:T160x120", ev) && ev.size() == 3);
     assert(ev[0].buttons == START && ev[1].t == 21.5 && ev[1].buttons == A);
     assert(ev[2].touch && ev[2].x == 160 && ev[2].y == 120 && !ev[2].buttons);
+    assert(parse_input_script("40+2.5:CP-156x100,41+1:A", ev) && ev.size() == 2);
+    assert(ev[0].stick && ev[0].sx == -156 && ev[0].sy == 100 && ev[0].t == 40 && ev[0].duration == 2.5);
+    assert(ev[1].buttons == A && ev[1].duration == 1 && !ev[1].stick);
+    assert(!parse_input_script("5:CP200x0", ev));
     assert(!parse_input_script("5:JUMP", ev) && !parse_input_script("5:T400x10", ev) && !parse_input_script("x", ev));
 }
 

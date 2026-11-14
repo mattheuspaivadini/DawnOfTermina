@@ -260,7 +260,7 @@ Result block(std::unique_lock<std::mutex>& lk, s64 timeout_ns) {
     Thread* self = t_self;
     self->state = State::Waiting;
     self->has_deadline = timeout_ns >= 0;
-    if (self->has_deadline) self->deadline = Clock::now() + std::chrono::nanoseconds(timeout_ns);
+    if (self->has_deadline) self->deadline = Clock::now() + std::chrono::nanoseconds(s64(timeout_ns / svc::TimeScale()));
     switch_away(lk, self);
     return self->wait_result;
 }
@@ -665,6 +665,7 @@ Result unmap_memory_block(Handle h, u32 addr) {
 
 void add_periodic(s64 period_ns, std::function<void()> fn) {
     std::lock_guard lk(g_lock);
+    period_ns = s64(period_ns / svc::TimeScale());  // host time from here on
     g_periodic.push_back({period_ns, Clock::now() + std::chrono::nanoseconds(period_ns), std::move(fn)});
 }
 

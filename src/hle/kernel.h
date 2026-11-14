@@ -99,7 +99,8 @@ Result unmap_memory_block(Handle h, u32 addr);                // svc 0x20
 
 // ---- host-driven periodic work (VBlank, ...)
 // Callbacks run with guest execution excluded: from the host main loop while no guest
-// thread is running (host_tick), or from the current guest thread at a syscall.
+// thread is running (host_tick, ~1 kHz from a host thread), or from the current guest thread
+// at a syscall.
 void add_periodic(s64 period_ns, std::function<void()> fn);
 void host_tick();
 

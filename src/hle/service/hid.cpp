@@ -74,6 +74,8 @@ void update() {
         g_mem->write<s16>(entry + 0xC, pad.stick_x);
         g_mem->write<s16>(entry + 0xE, pad.stick_y);
         g_mem->write<u32>(base + PAD + 0x1C, pad.hold);
+        g_mem->write<s16>(base + PAD + 0x20, pad.stick_x);
+        g_mem->write<s16>(base + PAD + 0x22, pad.stick_y);
         g_last_buttons = pad.hold;
 
         // Touch: ring header, raw entry, then 8 entries {u16 x, u16 y, u32 valid}.

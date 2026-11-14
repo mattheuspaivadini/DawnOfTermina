@@ -119,15 +119,24 @@ Result ControlMemory(Memory& mem, u32* out_addr, u32 addr0, u32 /*addr1*/, u32 s
 
 void ExitProcess() { std::exit(0); }
 
+double TimeScale() {
+    static const double scale = [] {
+        const char* s = std::getenv("DOT_SPEED");
+        const double v = s ? std::atof(s) : 1.0;
+        return v > 0 ? v : 1.0;
+    }();
+    return scale;
+}
+
 void SleepThread(s64 ns) {
-    if (ns > 0) std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
+    if (ns > 0) std::this_thread::sleep_for(std::chrono::nanoseconds(s64(ns / TimeScale())));
     else std::this_thread::yield();
 }
 
 u64 GetSystemTick() {
     using namespace std::chrono;
     static const auto boot = steady_clock::now();
-    const auto ns = duration_cast<nanoseconds>(steady_clock::now() - boot).count();
+    const auto ns = u64(double(duration_cast<nanoseconds>(steady_clock::now() - boot).count()) * TimeScale());
     constexpr u64 HZ = 268111856, NS = 1000000000;
     return u64(ns) / NS * HZ + u64(ns) % NS * HZ / NS;  // split to avoid u64 overflow
 }

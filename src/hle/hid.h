@@ -49,15 +49,18 @@ bool window_to_touch(float wx, float wy, int win_w, int win_h, u16& tx, u16& ty)
 // Pure state step: derives trigger/release and the CPAD_* direction bits.
 PadStatus next_pad(const PadStatus& prev, u32 buttons, s16 stick_x, s16 stick_y);
 
-// Scripted input (DOT_INPUT="<seconds>:<event>,..."), for runs without a usable keyboard or
-// mouse such as automated validation. An event is a button name (A B X Y L R ZL ZR START
-// SELECT UP DOWN LEFT RIGHT) or T<x>x<y> (bottom-screen touch); each is held for 150 ms,
-// timed from the first Update(). Returns false on a malformed script.
+// Scripted input (DOT_INPUT="<seconds>[+<duration>]:<event>,..."), for runs without a usable
+// keyboard or mouse such as automated validation. An event is a button name (A B X Y L R ZL
+// ZR START SELECT UP DOWN LEFT RIGHT), T<x>x<y> (bottom-screen touch) or CP<x>x<y> (circle
+// pad, -156..156, +y = up); each is held for <duration> seconds (default 0.15) of guest time,
+// counted in VBlanks since boot. While a script is set, keyboard, mouse and gamepad are
+// ignored. Returns false on a malformed script.
 struct ScriptEvent {
-    double t;
-    u32 buttons;
-    bool touch;
-    u16 x, y;
+    double t = 0, duration = 0.15;
+    u32 buttons = 0;
+    bool touch = false, stick = false;
+    u16 x = 0, y = 0;      // touch
+    s16 sx = 0, sy = 0;    // circle pad
 };
 bool parse_input_script(std::string_view text, std::vector<ScriptEvent>& out);
 

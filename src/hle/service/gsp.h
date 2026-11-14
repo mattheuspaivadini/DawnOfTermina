@@ -37,6 +37,7 @@ bool screen_image(int screen, std::vector<u32>& rgba);
 // Counters for diagnostics.
 struct Stats {
     u64 vblanks, command_lists, draws, memory_fills, display_transfers;
+    u64 frames;  // top-screen buffer swaps latched: the game's own frame count
 };
 Stats stats();
 

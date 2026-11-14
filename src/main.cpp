@@ -16,12 +16,16 @@
 
 #include <SDL3/SDL.h>
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <optional>
 #include <fstream>
 #include <iterator>
+#include <thread>
 #include <vector>
 
 #include "core/loader.h"
@@ -152,6 +156,17 @@ int main(int argc, char** argv) {
         // Until the game loop is transcribed (stage 5), pump input, log pad changes and
         // present placeholder screens.
         bool reported = false;
+#ifdef DOT_HAVE_RECOMP
+        // Periodic guest work (VBlank, HID sampling) is due on its own clock, not the display's:
+        // an idle guest only advances through host_tick, and DOT_SPEED needs it above 60 Hz.
+        std::atomic<bool> ticking{true};
+        std::thread ticker([&] {
+            while (ticking.load(std::memory_order_relaxed)) {
+                hle::kernel::host_tick();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+#endif
         for (bool running = true; running;) {
             for (SDL_Event e; SDL_PollEvent(&e);)
                 if (e.type == SDL_EVENT_QUIT) running = false;
@@ -169,7 +184,6 @@ int main(int argc, char** argv) {
             if (pad.trigger || pad.release)
                 std::printf("pad hold=%08x stick=(%d,%d)\n", pad.hold, pad.stick_x, pad.stick_y);
 #ifdef DOT_HAVE_RECOMP
-            hle::kernel::host_tick();
             if (std::getenv("DOT_STATS")) {  // once per second: what the guest GPU path is doing
                 static u64 frame = 0;
                 if (++frame % 60 == 0) {
@@ -181,9 +195,9 @@ int main(int argc, char** argv) {
                     if (st.vblanks != last_vblanks) still = 0;
                     last_vblanks = st.vblanks;
                     const auto rs = renderer.stats();
-                    std::printf("gsp: vblanks %llu, command lists %llu, draws %llu, fills %llu, transfers %llu | "
+                    std::printf("gsp: vblanks %llu, frames %llu, command lists %llu, draws %llu, fills %llu, transfers %llu | "
                                 "rendered %llu, skipped %llu, pipelines %llu, shaders %llu, flushes %llu\n",
-                                (unsigned long long)st.vblanks, (unsigned long long)st.command_lists,
+                                (unsigned long long)st.vblanks, (unsigned long long)st.frames, (unsigned long long)st.command_lists,
                                 (unsigned long long)st.draws, (unsigned long long)st.memory_fills,
                                 (unsigned long long)st.display_transfers, (unsigned long long)rs.draws,
                                 (unsigned long long)rs.skipped, (unsigned long long)rs.pipelines,
@@ -195,12 +209,19 @@ int main(int argc, char** argv) {
             const bool have_bottom = hle::service::gsp::screen_image(1, game_bottom);
             if (const char* dir = std::getenv("DOT_DUMP_FRAMES"); dir && have_top) {
                 static u32 n = 0;
-                if (++n % 120 == 0) {
-                    write_ppm(std::filesystem::path(dir) / ("top_" + std::to_string(n / 120) + ".ppm"), game_top,
-                              gfx::vulkan::TOP_W, gfx::vulkan::SCREEN_H);
+                static const u32 every = std::max(1, std::atoi(std::getenv("DOT_DUMP_EVERY") ? std::getenv("DOT_DUMP_EVERY") : "120"));
+                if (++n % every == 0) {
+                    const std::string id = std::to_string(n / every);
+                    write_ppm(std::filesystem::path(dir) / ("top_" + id + ".ppm"), game_top, gfx::vulkan::TOP_W,
+                              gfx::vulkan::SCREEN_H);
                     if (have_bottom)
-                        write_ppm(std::filesystem::path(dir) / ("bottom_" + std::to_string(n / 120) + ".ppm"),
-                                  game_bottom, gfx::vulkan::BOTTOM_W, gfx::vulkan::SCREEN_H);
+                        write_ppm(std::filesystem::path(dir) / ("bottom_" + id + ".ppm"), game_bottom,
+                                  gfx::vulkan::BOTTOM_W, gfx::vulkan::SCREEN_H);
+                    // Guest time of each dump, in the units of DOT_INPUT, to line scripts up with frames.
+                    if (std::FILE* f = std::fopen((std::filesystem::path(dir) / "frames.txt").c_str(), "a")) {
+                        std::fprintf(f, "%s %.1f\n", id.c_str(), hle::service::gsp::stats().vblanks / 59.83);
+                        std::fclose(f);
+                    }
                 }
             }
             const u32* top_px = have_top ? game_top.data() : top.data();
@@ -214,6 +235,8 @@ int main(int argc, char** argv) {
                 break;  // FIFO present paces the loop to vsync
         }
 #ifdef DOT_HAVE_RECOMP
+        ticking = false;
+        ticker.join();
         hle::service::gsp::set_renderer(nullptr);
 #endif
     }

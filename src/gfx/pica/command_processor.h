@@ -45,7 +45,7 @@ struct ShaderState {
     u16 bool_uniforms = 0;
     std::array<Vec4, 16> fixed_attribs{};  // default values of vertex attributes
     // Fragment lighting tables (not shader state proper, but uploaded the same way): 24 tables
-    // of 256 raw entries {bits 0-11 value 0.12, bits 12-23 signed difference 1.11}.
+    // of 256 raw entries {bits 0-11 value 0.12, bits 12-22 difference magnitude, bit 23 its sign}.
     // Tables: 0 D0, 1 D1, 3 FR, 4 RB, 5 RG, 6 RR, 8-15 SP per light, 16-23 DA per light.
     std::array<u32, 24 * 256> light_lut{};
     // Fog factor by depth: 128 entries {bits 0-12 signed difference 1.11, bits 13-23 value 0.11}.

@@ -409,9 +409,12 @@ float f20(uint v) {  // 1.7.12 float
     float m = ldexp(1.0 + float(v & 0xFFFu) / 4096.0, int((v >> 12) & 0x7Fu) - 63);
     return (v & 0x80000u) != 0u ? -m : m;
 }
+// Entry: value 0.12 in bits 0-11, difference to the next entry as sign-magnitude: 11 bits of
+// magnitude (/2047) and the sign in bit 23 (not two's complement: 0x808 is -8, a gentle slope).
 float lut_entry(int t, int i, float delta) {
     uint e = lut[t * 256 + i];
-    return float(e & 0xFFFu) / 4095.0 + float(bitfieldExtract(int(e), 12, 12)) / 2047.0 * delta;
+    float diff = float((e >> 12) & 0x7FFu) / 2047.0;
+    return float(e & 0xFFFu) / 4095.0 + ((e & 0x800000u) != 0u ? -diff : diff) * delta;
 }
 float lut_unsigned(int t, float pos) {
     int i = int(clamp(floor(pos * 256.0), 0.0, 255.0));

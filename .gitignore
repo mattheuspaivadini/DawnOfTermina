@@ -31,3 +31,6 @@ compile_commands.json
 __pycache__/
 saves/
 cache/
+
+# Local user settings (written by the game)
+config.toml

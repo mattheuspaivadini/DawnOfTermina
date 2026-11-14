@@ -24,6 +24,7 @@ void register_all(core::Memory& mem, const std::filesystem::path& game_data) {
     hle::srv::RegisterIpc();
     register_apt();
     register_misc();
+    register_ir(mem);
     register_cfg();
     register_gsp(mem);
     register_hid(mem);

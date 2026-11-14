@@ -47,6 +47,7 @@ Context::~Context() {
     if (device_) {
         vkDeviceWaitIdle(device_);
         destroy_swapchain();
+        vkDestroyRenderPass(device_, render_pass_, nullptr);
         for (int i = 0; i < 2; ++i) {
             vkDestroyImage(device_, screens_[i], nullptr);
             vkFreeMemory(device_, screen_mem_[i], nullptr);
@@ -219,6 +220,7 @@ bool Context::create_swapchain() {
     VkSwapchainKHR old = swapchain_;
     for (VkSemaphore s : render_done_) vkDestroySemaphore(device_, s, nullptr);
     render_done_.clear();
+    destroy_views();
     swapchain_images_.clear();
     swapchain_ = VK_NULL_HANDLE;
     extent_ = extent;
@@ -245,6 +247,44 @@ bool Context::create_swapchain() {
             break;
         }
     swapchain_format_ = fmt.format;
+    if (!render_pass_) {  // overlay pass: keeps the composed screens, leaves the image ready to present
+        VkAttachmentDescription at{};
+        at.format = fmt.format;
+        at.samples = VK_SAMPLE_COUNT_1_BIT;
+        at.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        at.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        at.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        at.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        at.initialLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        at.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        const VkAttachmentReference ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription sub{};
+        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub.colorAttachmentCount = 1;
+        sub.pColorAttachments = &ref;
+        VkSubpassDependency dep{};
+        dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+        dep.srcStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dep.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        VkRenderPassCreateInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        rp.attachmentCount = 1, rp.pAttachments = &at;
+        rp.subpassCount = 1, rp.pSubpasses = &sub;
+        rp.dependencyCount = 1, rp.pDependencies = &dep;
+        if (!check(vkCreateRenderPass(device_, &rp, nullptr, &render_pass_), "vkCreateRenderPass")) return false;
+    }
+
+    // Without vsync: mailbox (no tearing) if available, else immediate.
+    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;  // always available
+    if (!vsync_) {
+        u32 pn = 0;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(gpu_, surface_, &pn, nullptr);
+        std::vector<VkPresentModeKHR> modes(pn);
+        vkGetPhysicalDeviceSurfacePresentModesKHR(gpu_, surface_, &pn, modes.data());
+        for (VkPresentModeKHR m : {VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR})
+            if (mode == VK_PRESENT_MODE_FIFO_KHR && std::find(modes.begin(), modes.end(), m) != modes.end()) mode = m;
+    }
 
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = surface_;
@@ -254,11 +294,11 @@ bool Context::create_swapchain() {
     ci.imageColorSpace = fmt.colorSpace;
     ci.imageExtent = extent;
     ci.imageArrayLayers = 1;
-    ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;  // always available; vsync
+    ci.presentMode = mode;
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = old;
     const bool ok = check(vkCreateSwapchainKHR(device_, &ci, nullptr, &swapchain_), "vkCreateSwapchainKHR");
@@ -272,12 +312,36 @@ bool Context::create_swapchain() {
     render_done_.resize(n);
     for (auto& s : render_done_)
         if (!check(vkCreateSemaphore(device_, &sci, nullptr, &s), "vkCreateSemaphore")) return false;
+    for (VkImage img : swapchain_images_) {
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = img;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = fmt.format;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkImageView view = VK_NULL_HANDLE;
+        if (!check(vkCreateImageView(device_, &vi, nullptr, &view), "vkCreateImageView")) return false;
+        views_.push_back(view);
+        VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fi.renderPass = render_pass_;
+        fi.attachmentCount = 1, fi.pAttachments = &view;
+        fi.width = extent.width, fi.height = extent.height, fi.layers = 1;
+        VkFramebuffer fb = VK_NULL_HANDLE;
+        if (!check(vkCreateFramebuffer(device_, &fi, nullptr, &fb), "vkCreateFramebuffer")) return false;
+        framebuffers_.push_back(fb);
+    }
     return true;
+}
+
+void Context::destroy_views() {
+    for (VkFramebuffer f : framebuffers_) vkDestroyFramebuffer(device_, f, nullptr);
+    for (VkImageView v : views_) vkDestroyImageView(device_, v, nullptr);
+    framebuffers_.clear(), views_.clear();
 }
 
 void Context::destroy_swapchain() {
     for (VkSemaphore s : render_done_) vkDestroySemaphore(device_, s, nullptr);
     render_done_.clear();
+    destroy_views();
     vkDestroySwapchainKHR(device_, swapchain_, nullptr);
     swapchain_ = VK_NULL_HANDLE;
 }
@@ -292,7 +356,8 @@ bool Context::present(const ScreenImage& top, const ScreenImage& bottom, const G
     }
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(window_, &w, &h);
-    if (u32(w) != extent_.width || u32(h) != extent_.height || !swapchain_) {
+    if (u32(w) != extent_.width || u32(h) != extent_.height || !swapchain_ || recreate_) {
+        recreate_ = false;
         {
             std::lock_guard qlk(queue_lock_);
             vkQueueWaitIdle(queue_);
@@ -370,6 +435,15 @@ bool Context::present(const ScreenImage& top, const ScreenImage& bottom, const G
         vkCmdBlitImage(cmd, g ? g->image : screens_[i], g ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, g ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
+    if (overlay_) {  // the render pass also moves the image to PRESENT_SRC
+        VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        rbi.renderPass = render_pass_;
+        rbi.framebuffer = framebuffers_[idx];
+        rbi.renderArea = {{0, 0}, extent_};
+        vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        overlay_(cmd);
+        vkCmdEndRenderPass(cmd);
+    }
     VkImageMemoryBarrier to_present{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     to_present.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     to_present.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -377,11 +451,12 @@ bool Context::present(const ScreenImage& top, const ScreenImage& bottom, const G
     to_present.srcQueueFamilyIndex = to_present.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     to_present.image = target;
     to_present.subresourceRange = range;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
-                         nullptr, 0, nullptr, 1, &to_present);
+    if (!overlay_)
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
+                             nullptr, 0, nullptr, 1, &to_present);
     vkEndCommandBuffer(cmd);
 
-    const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.waitSemaphoreCount = 1;
     si.pWaitSemaphores = &image_ready_;

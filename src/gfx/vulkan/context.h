@@ -2,6 +2,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <functional>
 #include <mutex>
 #include <vector>
 
@@ -41,6 +42,14 @@ public:
     VkExtent2D extent() const { return extent_; }
     float max_anisotropy() const { return anisotropy_; }  // 0 = unsupported
 
+    // Presentation mode: FIFO (vsync) or the lowest-latency mode available without it.
+    void set_vsync(bool on) { recreate_ |= vsync_ != on, vsync_ = on; }
+    // Drawn over the composed screens inside a render pass on the swapchain image (menu).
+    void set_overlay(std::function<void(VkCommandBuffer)> fn) { overlay_ = std::move(fn); }
+    VkInstance instance() const { return instance_; }
+    VkRenderPass render_pass() const { return render_pass_; }
+    u32 image_count() const { return u32(swapchain_images_.size()); }
+
     VkDevice device() const { return device_; }
     VkPhysicalDevice gpu() const { return gpu_; }
     VkQueue queue() const { return queue_; }
@@ -51,6 +60,7 @@ public:
 private:
     bool create_swapchain();
     void destroy_swapchain();
+    void destroy_views();
     bool create_screen_images();
 
     SDL_Window* window_ = nullptr;
@@ -68,6 +78,11 @@ private:
     VkExtent2D extent_{};
     std::vector<VkImage> swapchain_images_;
     std::vector<VkSemaphore> render_done_;  // one per swapchain image
+    std::vector<VkImageView> views_;          // for the overlay render pass
+    std::vector<VkFramebuffer> framebuffers_;
+    VkRenderPass render_pass_ = VK_NULL_HANDLE;
+    bool vsync_ = true, recreate_ = false;  // recreate: present mode changed
+    std::function<void(VkCommandBuffer)> overlay_;
 
     VkCommandPool pool_ = VK_NULL_HANDLE;
     VkCommandBuffer cmd_ = VK_NULL_HANDLE;

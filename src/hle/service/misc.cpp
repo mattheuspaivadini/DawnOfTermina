@@ -70,22 +70,6 @@ void register_misc() {
             c.reply(1, 0);
         }
     });
-
-    // ir:USER (Circle Pad Pro / IR): no device ever connects. The event getters hand out
-    // events that are never signalled; every other command succeeds.
-    kernel::register_service("ir:USER", [](core::Memory& mem, u32 base) {
-        ipc::Cmd c{mem, base};
-        static Handle events[3] = {};  // receive, send, connection status
-        if (const u32 id = c.id(); id >= 0x0A && id <= 0x0C) {
-            Handle& e = events[id - 0x0A];
-            if (!e) e = kernel::create_event(0);
-            c.reply(1, 2);
-            c.set(2, ipc::copy_handles(1)), c.set(3, e);
-            return;
-        }
-        log_once("ir:USER", c.header());
-        c.reply(1, 0);
-    });
 }
 
 }  // namespace hle::service

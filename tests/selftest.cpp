@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <fstream>
 
+#include "core/config.h"
 #include "core/loader.h"
 #include "game/crt0.h"
 #include "game/guest.h"
@@ -88,19 +89,31 @@ static void test_hid() {
     p = next_pad(p, A, 10, 0);  // inside the dead zone: no direction bits
     assert(p.hold == A && p.stick_x == 10);
 
-    u16 tx, ty;  // 800x960 window: scale 2, bottom screen spans x 80..719, y 480..959
+    u16 tx, ty;  // dual screen, 800x960 window: scale 2, bottom screen spans x 80..719, y 480..959
+    gfx::g_single_screen = false;
     assert(window_to_touch(80, 480, 800, 960, tx, ty) && tx == 0 && ty == 0);
     assert(window_to_touch(719.9f, 959.9f, 800, 960, tx, ty) && tx == 319 && ty == 239);
     assert(!window_to_touch(79, 600, 800, 960, tx, ty) && !window_to_touch(400, 479, 800, 960, tx, ty));
     assert(window_to_touch(200 + 80, 480, 1200, 960, tx, ty) && tx == 0);  // pillarboxed by 200px
-    // Widescreen layout (16:9 top screen filling 1920x1080): bottom overlay 432x324 at (1488, 756).
-    gfx::g_top_width = 240.0f * 16 / 9;
+    gfx::g_top_width = 240.0f * 16 / 9;  // dual + widescreen: 960x540 top at x 480, bottom at (600, 540)
+    assert(window_to_touch(600, 540, 1920, 1080, tx, ty) && tx == 0 && ty == 0);
+    // Single screen (16:9 top screen filling 1920x1080): bottom overlay 432x324 at (1488, 756).
+    gfx::g_single_screen = true;
     assert(window_to_touch(1488, 756, 1920, 1080, tx, ty) && tx == 0 && ty == 0);
     assert(window_to_touch(1919.9f, 1079.9f, 1920, 1080, tx, ty) && tx == 319 && ty == 239);
     assert(!window_to_touch(1400, 900, 1920, 1080, tx, ty));
     gfx::g_show_bottom = false;
     assert(!window_to_touch(1700, 900, 1920, 1080, tx, ty));
     gfx::g_show_bottom = true, gfx::g_top_width = 400.0f;
+    assert(window_to_touch(1488, 756, 1920, 1080, tx, ty) && tx == 0);  // 5:3 top pillarboxed, same overlay
+
+    // config.toml round trip
+    core::Config c = core::parse_config("[display]\nresolution = \"720p\" # x\nvsync = false\nfps = 30\n"
+                                        "[audio]\nvolume = 150\n[keys]\nA = \"K\"\n");
+    assert(c.resolution == "720p" && !c.vsync && c.fps == 30 && c.volume == 100 && c.keys["A"] == "K");
+    assert(c.layout == "single" && c.widescreen == "16:9");  // defaults kept
+    const core::Config d = core::parse_config(core::format_config(c));
+    assert(d.resolution == c.resolution && d.vsync == c.vsync && d.fps == c.fps && d.keys == c.keys);
 
     std::vector<ScriptEvent> ev;
     assert(parse_input_script("20:START,21.5:A,30:T160x120", ev) && ev.size() == 3);
@@ -109,6 +122,7 @@ static void test_hid() {
     assert(parse_input_script("40+2.5:CP-156x100,41+1:A", ev) && ev.size() == 2);
     assert(ev[0].stick && ev[0].sx == -156 && ev[0].sy == 100 && ev[0].t == 40 && ev[0].duration == 2.5);
     assert(ev[1].buttons == A && ev[1].duration == 1 && !ev[1].stick);
+    assert(parse_input_script("7:CS156x0", ev) && ev[0].c_stick && !ev[0].stick && ev[0].sx == 156);
     assert(!parse_input_script("5:CP200x0", ev));
     assert(!parse_input_script("5:JUMP", ev) && !parse_input_script("5:T400x10", ev) && !parse_input_script("x", ev));
 }

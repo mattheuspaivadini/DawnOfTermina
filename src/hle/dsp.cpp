@@ -261,6 +261,10 @@ void Initialize() {
     g_stream = s;
 }
 
+void SetVolume(float gain) {
+    if (SDL_AudioStream* s = g_stream.load()) SDL_SetAudioStreamGain(s, gain);
+}
+
 void Shutdown() {
     if (SDL_AudioStream* s = g_stream.exchange(nullptr)) SDL_DestroyAudioStream(s);
 }

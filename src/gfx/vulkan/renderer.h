@@ -66,6 +66,10 @@ public:
     // Reads a screen image back (DOT_DUMP_FRAMES), RGBA8 rows top first.
     bool read_display(u32 va, std::vector<u32>& rgba, u32& width, u32& height, bool interp = false);
     u32 scale() const;
+    // Runtime settings (menu): top screen aspect (0 = off, < 0 = the window's) and DOT_FPS=60
+    // frame interpolation. The resolution scale is fixed at init().
+    void set_widescreen(float aspect);
+    void set_interpolate(bool on);
 
     struct Stats {
         u64 draws, skipped, pipelines, readbacks, shaders;  // shaders = GLSL compiled (not from the disk cache)

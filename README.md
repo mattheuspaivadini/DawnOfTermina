@@ -18,6 +18,7 @@ O código ARM11 original (`code.bin` do ExeFS) é traduzido automaticamente para
 | SDL3 | 3.2 | janela, input, áudio |
 | Vulkan SDK (headers, loader) | 1.3 | renderização |
 | glslang | 14+ | GLSL → SPIR-V em runtime |
+| Dear ImGui | 1.91.9 | menu de configurações (baixado pelo CMake) |
 | Python | 3.10 | scripts em `tools/` |
 
 ## Preparando os dados do jogo
@@ -41,7 +42,27 @@ cmake --build build
 ./build/dawnoftermina game_data
 ```
 
-Para renderizar acima da resolução do 3DS: `DOT_RES_SCALE=3 ./build/dawnoftermina game_data` (1–8, ou `native` para o maior fator que cabe na janela). Widescreen sem barras: `DOT_WIDESCREEN=window DOT_RES_SCALE=native DOT_WINDOW=1920x1080 ./build/dawnoftermina game_data` (a tela de cima preenche a janela; Tab mostra/esconde a tela de baixo; F11 = tela cheia). 60 FPS: `DOT_FPS=60` (quadros intermediários interpolados; a lógica do jogo continua a 30 Hz).
+### Configuração e controles
+
+Na primeira execução é criado um `config.toml` ao lado de `game_data/` (ignorado pelo Git) com: **1080p**, widescreen **16:9**, **tela única** (a tela de baixo vira uma sobreposição), VSync e **60 FPS** (quadros intermediários interpolados; a lógica do jogo continua a 30 Hz). Tudo pode ser mudado em jogo no menu (**F1** ou **Esc**) e é salvo na hora; a escala de renderização (resolução interna) vale a partir da próxima execução.
+
+| Tecla | Ação |
+|---|---|
+| K / J / I / U | A / B / X / Y |
+| Q / E, 1 / 3 | L / R, ZL / ZR |
+| WASD, setas | circle pad, D-pad |
+| Enter / Backspace | Start / Select |
+| F / G / O / M | botões de toque: item I / item II / Ocarina / mapa |
+| F2 | câmera no mouse (captura o cursor; Esc solta) |
+| Tab | mostra/esconde a tela de baixo |
+| F11 | tela cheia |
+| F1 / Esc | menu de configurações |
+
+Teclas remapeáveis no menu (aba *Controls*). Controle: layout posicional da Nintendo (leste = A), analógico direito = câmera (C-stick), L3/R3 = itens I/II. Mouse: clique na tela de baixo = toque.
+
+**C-stick:** o jogo conversa com um *Circle Pad Pro* emulado. Na tela "This game supports the Circle Pad Pro" aperte **ZR** (tecla 3 ou gatilho direito) para ativá-lo; *Don't Use* deixa a câmera só no botão L.
+
+Variáveis de ambiente `DOT_*` têm prioridade sobre o `config.toml` (úteis para testes): `DOT_RES_SCALE=1..8|native`, `DOT_WIDESCREEN=16:9|21:9|window`, `DOT_WINDOW=1920x1080`, `DOT_FPS=30|60`.
 
 ## Arquitetura
 
@@ -75,6 +96,7 @@ Cada função transcrita mantém o endereço virtual original em comentário (`/
 | 10 | Widescreen real (`DOT_WIDESCREEN=16:9`, `21:9`, `window`…) | ✅ |
 | 11 | 60 FPS por interpolação de quadros (`DOT_FPS=60`), sem acelerar a lógica | ✅ |
 | 12 | Hooks nativos para rotinas da libc (memcpy/memset/strlen/strcmp/sinf/cosf/atan2f) | ✅ infraestrutura; ganho medido dentro do ruído |
+| 5E | Experiência de PC: `config.toml`, menu ImGui (F1), tela única/dupla, câmera no mouse (C-stick), atalhos de toque | ✅ |
 | 13+ | Subsistemas do jogo (cenas, loop, colisão, atores, HUD) | ⏳ |
 
 ## Licença

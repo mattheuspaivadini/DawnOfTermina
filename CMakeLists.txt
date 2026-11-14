@@ -15,9 +15,24 @@ find_package(SDL3 REQUIRED CONFIG)
 find_package(Vulkan REQUIRED)
 find_package(glslang REQUIRED CONFIG)
 
+# Dear ImGui (MIT) for the in-game settings menu, pinned by hash. Offline builds can point
+# FETCHCONTENT_SOURCE_DIR_IMGUI at a local copy of the same release.
+include(FetchContent)
+FetchContent_Declare(imgui
+    URL https://github.com/ocornut/imgui/archive/refs/tags/v1.91.9.tar.gz
+    URL_HASH SHA256=3872a5f90df78fced023c1945f4466b654fd74573370b77b17742149763a7a7c)
+FetchContent_MakeAvailable(imgui)
+add_library(imgui STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp ${imgui_SOURCE_DIR}/imgui_draw.cpp ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp)
+target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+target_link_libraries(imgui PUBLIC SDL3::SDL3 Vulkan::Vulkan)
+
 add_library(dot_runtime STATIC
     src/core/memory.cpp
     src/core/loader.cpp
+    src/core/config.cpp
     src/hle/svc.cpp
     src/hle/srv.cpp
     src/hle/fs.cpp
@@ -38,6 +53,7 @@ add_library(dot_runtime STATIC
     src/hle/service/services.cpp
     src/hle/service/apt.cpp
     src/hle/service/misc.cpp
+    src/hle/service/ir.cpp
     src/hle/service/fs.cpp
     src/hle/service/cfg.cpp
     src/hle/service/gsp.cpp
@@ -52,8 +68,8 @@ target_link_libraries(dot_runtime PUBLIC SDL3::SDL3 Vulkan::Vulkan
     glslang::glslang glslang::SPIRV glslang::glslang-default-resource-limits)
 target_compile_options(dot_runtime PUBLIC -Wall -Wextra -Wno-missing-field-initializers)
 
-add_executable(dawnoftermina src/main.cpp)
-target_link_libraries(dawnoftermina PRIVATE dot_runtime)
+add_executable(dawnoftermina src/main.cpp src/ui/menu.cpp)
+target_link_libraries(dawnoftermina PRIVATE dot_runtime imgui)
 
 # Static recompilation of the user's code.bin (tools/recomp). Generated at build time
 # into the build tree only: it is derived from the game and must never be committed.

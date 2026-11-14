@@ -102,6 +102,7 @@ void reset();  // all voices off (DSP shutdown/initialize)
 // Host output. Initialize() needs SDL_INIT_AUDIO; without a device, frames are dropped.
 void Initialize();
 void Shutdown();
+void SetVolume(float gain);  // host output volume, 0..1 (settings menu)
 void output(const s16* samples, u32 frames);
 
 }  // namespace hle::dsp

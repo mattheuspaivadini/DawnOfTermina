@@ -28,6 +28,7 @@
 #include <thread>
 #include <vector>
 
+#include "core/config.h"
 #include "core/loader.h"
 #include "game/crt0.h"
 #include "game/guest.h"
@@ -44,6 +45,7 @@
 #include "hle/service/services.h"
 #include "hle/svc.h"
 #include "recomp/runtime.h"
+#include "ui/menu.h"
 
 #ifdef DOT_HAVE_RECOMP
 namespace recomp {
@@ -88,6 +90,10 @@ static std::vector<u32> icon_screen(const std::filesystem::path& smdh_path) {
 
 int main(int argc, char** argv) {
     const std::filesystem::path data = argc > 1 ? argv[1] : "game_data";
+    // config.toml lives next to game_data/ (like saves/ and cache/); DOT_* variables override it.
+    const std::filesystem::path config_file = std::filesystem::absolute(data).parent_path() / "config.toml";
+    core::Config config = core::load_config(config_file);
+    core::apply_env_defaults(config);
 
     core::Memory mem;
     auto code = core::load_code(mem, data);
@@ -135,8 +141,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
-    // Top screen 400x240 stacked over the 320x240 bottom screen, 2x scale.
-    // DOT_WINDOW=<w>x<h> picks the initial window size (e.g. 1920x1080 with DOT_WIDESCREEN=window).
+    // Initial window size: config.toml resolution, or DOT_WINDOW=<w>x<h>.
     int win_w = 800, win_h = 960;
     if (const char* e = std::getenv("DOT_WINDOW")) std::sscanf(e, "%dx%d", &win_w, &win_h);
     SDL_Window* window = SDL_CreateWindow("DawnOfTermina", std::max(win_w, 160), std::max(win_h, 120),
@@ -149,10 +154,12 @@ int main(int argc, char** argv) {
     {  // scope: the Vulkan surface must be destroyed before the window
         gfx::vulkan::Context gpu;
         if (!gpu.init(window)) return 1;
+        if (!ui::init(window, gpu, config, config_file)) std::fprintf(stderr, "ui: settings menu unavailable\n");
 #ifdef DOT_HAVE_RECOMP
         gfx::vulkan::Renderer renderer(gpu);
         if (!renderer.init(std::filesystem::absolute(data).parent_path() / "cache")) return 1;
         hle::service::gsp::set_renderer(&renderer);
+        ui::set_renderer(&renderer);
 #endif
         const std::vector<u32> top(gfx::vulkan::TOP_W * gfx::vulkan::SCREEN_H, 0xFF402010);
         const std::vector<u32> bottom = icon_screen(data / "exefs" / "icon.bin");
@@ -175,10 +182,7 @@ int main(int argc, char** argv) {
         for (bool running = true; running;) {
             for (SDL_Event e; SDL_PollEvent(&e);)
                 if (e.type == SDL_EVENT_QUIT) running = false;
-                else if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_TAB && !e.key.repeat)
-                    gfx::g_show_bottom = !gfx::g_show_bottom;  // widescreen layout: bottom screen overlay
-                else if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_F11 && !e.key.repeat)
-                    SDL_SetWindowFullscreen(window, !(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN));
+                else ui::handle_event(e);  // menu and hotkeys; the game polls the device state itself
 #ifdef DOT_HAVE_RECOMP
             if (auto st = reported ? std::nullopt : hle::kernel::stopped()) {
                 reported = true;
@@ -252,10 +256,17 @@ int main(int argc, char** argv) {
             const gfx::vulkan::GpuScreen* gpu_top_ptr = nullptr;
             const gfx::vulkan::GpuScreen* gpu_bottom_ptr = nullptr;
 #endif
+            ui::frame();
+            if (!config.vsync) {  // FIFO paces the loop with vsync; without it, cap at 240 Hz
+                static auto next = std::chrono::steady_clock::now();
+                std::this_thread::sleep_until(next);
+                next = std::max(next + std::chrono::microseconds(4167), std::chrono::steady_clock::now());
+            }
             if (!gpu.present({gfx::vulkan::TOP_W, gfx::vulkan::SCREEN_H, top_px},
                              {gfx::vulkan::BOTTOM_W, gfx::vulkan::SCREEN_H, bottom_px}, gpu_top_ptr, gpu_bottom_ptr))
                 break;  // FIFO present paces the loop to vsync
         }
+        ui::shutdown();
 #ifdef DOT_HAVE_RECOMP
         ticking = false;
         ticker.join();

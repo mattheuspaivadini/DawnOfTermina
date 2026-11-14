@@ -27,6 +27,7 @@ void register_all(core::Memory& mem, const std::filesystem::path& game_data);
 
 void register_apt();
 void register_misc();
+void register_ir(core::Memory& mem);
 void register_cfg();
 void register_gsp(core::Memory& mem);
 void register_hid(core::Memory& mem);

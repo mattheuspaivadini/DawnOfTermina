@@ -1629,6 +1629,18 @@ bool Renderer::read_display(u32 va, std::vector<u32>& rgba, u32& width, u32& hei
 
 u32 Renderer::scale() const { return impl_->scale; }
 
+void Renderer::set_widescreen(float aspect) {
+    std::lock_guard lk(impl_->lock);
+    impl_->wide_aspect = aspect;
+}
+
+void Renderer::set_interpolate(bool on) {
+    std::lock_guard lk(impl_->lock);
+    impl_->interpolate = on;
+    impl_->frame_ops.clear(), impl_->prev_ops.clear(), impl_->key_counts.clear();
+    for (auto& [va, d] : impl_->displays) d.interp_fresh = false;
+}
+
 Renderer::Stats Renderer::stats() const {
     Stats s = impl_->stats;
     s.interpolated = impl_->interp_frames, s.not_interpolated = impl_->interp_skipped;

@@ -17,7 +17,9 @@
 #include <SDL3/SDL.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <optional>
 #include <fstream>
 #include <iterator>
 #include <vector>
@@ -41,6 +43,15 @@ extern const FuncEntry kFunctions[];
 extern const u32 kFunctionCount;
 }  // namespace recomp
 #endif
+
+// ExHeader ARM11 local capabilities: main thread priority at 0x20F.
+static u8 read_main_priority(const std::filesystem::path& data) {
+    std::ifstream f(data / "exheader.bin", std::ios::binary);
+    f.seekg(0x20F);
+    char p = 0x30;
+    f.read(&p, 1);
+    return u8(p);
+}
 
 // Bottom screen placeholder until the game renders: the title's own SMDH icon
 // (48x48 tiled RGB565 at 0x24C0), scaled 3x and centred. Exercises the PICA texture
@@ -83,24 +94,18 @@ int main(int argc, char** argv) {
     hle::dsp::Initialize();
 
 #ifdef DOT_HAVE_RECOMP
-    // Run the recompiled code.bin from its entry point until it needs something the
-    // runtime/HLE does not provide yet; that report is the next thing to implement.
+    // The recompiled code.bin runs on guest threads (hle::kernel); this host thread keeps
+    // the window, input and presentation. Whatever the guest needs next and the runtime
+    // does not provide yet stops it with a report: that is the next thing to implement.
     recomp::set_memory(mem.host(0));
     recomp::set_svc_memory(mem);
     recomp::set_function_table(recomp::kFunctions, recomp::kFunctionCount);
     hle::kernel::init(mem);
     hle::srv::RegisterIpc();
-    recomp::Context ctx{};
-    ctx.r[13] = core::Memory::STACK_TOP;
-    ctx.tls = core::Memory::tls(0);
-    std::printf("boot: running recompiled code (%u functions)\n", recomp::kFunctionCount);
-    try {
-        recomp::call(&ctx, code->text.addr);
-    } catch (const recomp::Trap& t) {
-        std::printf("boot: stopped: %s\n      pc=0x%08X lr=0x%08X sp=0x%08X\n", t.what(), t.pc, ctx.r[14], ctx.r[13]);
-    } catch (const hle::kernel::Unimplemented& u) {
-        std::printf("boot: stopped in HLE: %s\n      lr=0x%08X\n", u.what(), ctx.r[14]);
-    }
+    const u8 main_priority = read_main_priority(data);
+    std::printf("boot: running recompiled code (%u functions), main thread priority 0x%02X\n",
+                recomp::kFunctionCount, main_priority);
+    hle::kernel::start_main_thread(code->text.addr, core::Memory::STACK_TOP, main_priority);
 #else
     // No recompiled code (game_data absent at configure time): run the hand-transcribed
     // boot until it reaches code that is not transcribed yet.
@@ -130,9 +135,19 @@ int main(int argc, char** argv) {
 
         // Until the game loop is transcribed (stage 5), pump input, log pad changes and
         // present placeholder screens.
+        bool reported = false;
         for (bool running = true; running;) {
             for (SDL_Event e; SDL_PollEvent(&e);)
                 if (e.type == SDL_EVENT_QUIT) running = false;
+#ifdef DOT_HAVE_RECOMP
+            if (auto st = reported ? std::nullopt : hle::kernel::stopped()) {
+                reported = true;
+                if (st->exited) std::printf("guest: process exited\n");
+                else std::printf("guest: stopped: %s\n", st->error.c_str());
+                std::fflush(stdout);
+                if (std::getenv("DOT_EXIT_ON_STOP")) running = false;
+            }
+#endif
             hle::hid::Update();
             auto pad = hle::hid::ReadPad();
             if (pad.trigger || pad.release)

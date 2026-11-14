@@ -34,6 +34,7 @@ static s64 ns64(u32 lo, u32 hi) { return s64(u64(hi) << 32 | lo); }
 void svc(Context* c, u32 imm) {
     namespace k = hle::kernel;
     u32* r = c->r;
+    k::preemption_point();
     switch (imm) {
     case 0x01: {  // ControlMemory(op r0, addr0 r1, addr1 r2, size r3, perm r4) -> r1 addr
         u32 out = 0;
@@ -46,8 +47,15 @@ void svc(Context* c, u32 imm) {
         r[0] = RESULT_OK, r[1] = info.base, r[2] = info.size, r[3] = info.perm, r[4] = info.state, r[5] = 0;
         return;
     }
-    case 0x03: hle::svc::ExitProcess();
-    case 0x0A: hle::svc::SleepThread(ns64(r[0], r[1])); return;
+    case 0x03: k::exit_process();
+    case 0x08: {  // CreateThread(prio r0, entry r1, arg r2, stack top r3, core r4) -> r1 handle
+        Handle h = 0;
+        r[0] = k::create_thread(r[1], r[2], r[3], s32(r[0]), s32(r[4]), &h);
+        r[1] = h;
+        return;
+    }
+    case 0x09: k::exit_thread();
+    case 0x0A: k::sleep_thread(ns64(r[0], r[1])); return;
     case 0x0B: {  // GetThreadPriority(handle r1) -> r1
         s32 prio = 0;
         r[0] = k::get_thread_priority(r[1], &prio);
@@ -110,7 +118,7 @@ void svc(Context* c, u32 imm) {
         r[1] = out;
         return;
     }
-    case 0x32: r[0] = k::send_sync_request(r[0], c->tls); return;
+    case 0x32: r[0] = k::send_sync_request(r[0]); return;
     case 0x35: r[0] = RESULT_OK, r[1] = 0x28; return;  // GetProcessId: any stable application pid
     case 0x37: {  // GetThreadId(handle r1) -> r1
         u32 id = 0;

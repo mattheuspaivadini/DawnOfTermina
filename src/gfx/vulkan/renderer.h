@@ -29,7 +29,7 @@ class Context;
 // Executes PICA200 draws with Vulkan. The render target mirrors the guest's colour buffer
 // in VRAM: it is loaded from guest memory when first drawn to and written back (tiled, in
 // the guest's pixel format) by flush(), which GSP calls before any GX command that could
-// read or overwrite VRAM. One submission per draw.
+// read or overwrite VRAM. Draws are batched into one submission per flush.
 // shortcut: no stencil, logic ops, fog, shadow maps, geometry shaders; depth is kept
 // on the GPU only (cleared by MemoryFill on the depth buffer, never written back).
 class Renderer {

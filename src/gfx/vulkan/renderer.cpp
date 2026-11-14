@@ -172,6 +172,12 @@ struct Renderer::Impl {
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
     Buffer vbuf, ubuf, lbuf, xfer;
+    // Draws are recorded into `cmd` and submitted as one batch by flush() (or when a buffer
+    // or the descriptor pool fills up); each buffer is sub-allocated linearly per batch.
+    bool recording = false;
+    u32 batch_draws = 0;
+    VkDeviceSize vb_used = 0, ub_used = 0, lb_used = 0, x_used = 0, lb_last = 0;
+    std::vector<u32> last_light;  // lighting data at lb_last, to skip re-uploading it
     Target target;
     Texture dummy;
     std::map<u64, Texture> textures;  // by (va, size, format)
@@ -261,14 +267,31 @@ struct Renderer::Impl {
                              0, nullptr, 1, &b);
     }
 
+    static constexpr u32 MAX_BATCH_DRAWS = 1024;
+
+    static VkDeviceSize align(VkDeviceSize v) { return (v + 255) & ~VkDeviceSize(255); }  // >= any offset alignment
+
+    // Takes `size` bytes from a buffer for the current batch (callers checked it fits).
+    static VkDeviceSize take(VkDeviceSize& used, VkDeviceSize size) {
+        const VkDeviceSize off = used;
+        used += align(size);
+        return off;
+    }
+
+    // Opens the batch's command buffer if needed.
     void begin() {
+        if (recording) return;
+        recording = true;
         vkResetCommandBuffer(cmd, 0);
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(cmd, &bi);
     }
 
+    // Submits the open batch (if any), waits for it and recycles the per-batch resources.
     void submit_and_wait() {
+        if (!recording) return;
+        recording = false;
         vkEndCommandBuffer(cmd);
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1;
@@ -279,6 +302,9 @@ struct Renderer::Impl {
             check(vkQueueSubmit(ctx.queue(), 1, &si, fence), "vkQueueSubmit");
         }
         vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX);
+        vkResetDescriptorPool(dev, desc_pool, 0);
+        batch_draws = 0, vb_used = ub_used = lb_used = x_used = 0;
+        last_light.clear();
     }
 
     bool init() {
@@ -337,19 +363,19 @@ struct Renderer::Impl {
         pli.setLayoutCount = 2;
         pli.pSetLayouts = set_layouts;
         vkCreatePipelineLayout(dev, &pli, nullptr, &pipeline_layout);
-        VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4},
-                                         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 12},
-                                         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}};
+        VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_BATCH_DRAWS},
+                                         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * MAX_BATCH_DRAWS},
+                                         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAX_BATCH_DRAWS}};
         VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        dpi.maxSets = 4;
+        dpi.maxSets = 2 * MAX_BATCH_DRAWS;
         dpi.poolSizeCount = 3;
         dpi.pPoolSizes = sizes;
         vkCreateDescriptorPool(dev, &dpi, nullptr, &desc_pool);
 
-        ensure(vbuf, 1 << 20, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-        ensure(ubuf, UBO_SIZE, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-        ensure(lbuf, LIGHT_BUF_SIZE, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        ensure(xfer, 1 << 20, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        ensure(vbuf, 8 << 20, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        ensure(ubuf, MAX_BATCH_DRAWS * align(UBO_SIZE), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+        ensure(lbuf, 64 * align(LIGHT_BUF_SIZE), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        ensure(xfer, 16 << 20, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 
         // 1x1 white texture for disabled units.
         dummy.image = make_image(1, 1, VK_FORMAT_R8G8B8A8_UNORM,
@@ -453,18 +479,22 @@ struct Renderer::Impl {
         if (!target.color.img) return;
         if (!target.fresh) {  // only write back if something was drawn
             const VkDeviceSize bytes = VkDeviceSize(target.width) * target.height * 4;
+            if (x_used + bytes > xfer.size) submit_and_wait();
             ensure(xfer, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             begin();
+            const VkDeviceSize xoff = take(x_used, bytes);
             barrier(target.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             VkBufferImageCopy copy{};
             copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.bufferOffset = xoff;
             copy.imageExtent = {target.width, target.height, 1};
             vkCmdCopyImageToBuffer(cmd, target.color.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, xfer.buf, 1, &copy);
             submit_and_wait();
+            const u8* const px = xfer.ptr + xoff;
             if (std::getenv("DOT_TRACE_DRAWS") || std::getenv("DOT_TRACE_FB")) {
                 size_t nonzero = 0;
-                for (VkDeviceSize i = 0; i < bytes; i += 4) nonzero += (xfer.ptr[i] | xfer.ptr[i + 1] | xfer.ptr[i + 2]) != 0;
+                for (VkDeviceSize i = 0; i < bytes; i += 4) nonzero += (px[i] | px[i + 1] | px[i + 2]) != 0;
                 std::fprintf(stderr, "renderer: flush %ux%u fmt %u at %08X: %zu non-black pixels\n", target.width,
                              target.height, target.format, target.color_va, nonzero);
             }
@@ -475,13 +505,14 @@ struct Renderer::Impl {
                 if (std::FILE* f = std::fopen(name, "wb")) {
                     std::fprintf(f, "P6\n%u %u\n255\n", target.width, target.height);
                     for (u32 y = target.height; y-- > 0;)  // top row first in the image file
-                        for (u32 x = 0; x < target.width; ++x) std::fwrite(xfer.ptr + (y * target.width + x) * 4, 1, 3, f);
+                        for (u32 x = 0; x < target.width; ++x) std::fwrite(px + (y * target.width + x) * 4, 1, 3, f);
                     std::fclose(f);
                 }
             }
-            write_guest_color(mem, xfer.ptr);
+            write_guest_color(mem, px);
             ++stats.flushes;
         }
+        submit_and_wait();  // nothing may still use the target or this batch's buffers
         drop_target();
     }
 
@@ -515,7 +546,7 @@ struct Renderer::Impl {
     }
 
     // Decodes and (re)uploads a texture unit if its contents changed. Records into cmd.
-    Texture& texture(const Memory& mem, const std::array<u32, pica::reg::COUNT>& regs, u32 unit, VkDeviceSize& xfer_off) {
+    Texture& texture(const Memory& mem, const std::array<u32, pica::reg::COUNT>& regs, u32 unit) {
         const u32* r = TEX_REGS[unit];
         const u32 h = regs[r[0]] & 0x7FF, w = regs[r[0]] >> 16 & 0x7FF;
         const auto fmt = pica::TexFormat(regs[r[3]] & 0xF);
@@ -541,10 +572,10 @@ struct Renderer::Impl {
         }
         // Texture memory is bottom-up too: memory row r is t = (h - 1 - r) / h, so flip rows
         // to make Vulkan's v coordinate equal PICA's t.
+        const VkDeviceSize off = take(x_used, rgba.size() * 4);
         for (u32 row = 0; row < h; ++row)
-            std::memcpy(xfer.ptr + xfer_off + size_t(row) * w * 4, rgba.data() + size_t(h - 1 - row) * w, w * 4);
-        upload_image(t.image.img, w, h, xfer_off);
-        xfer_off += (rgba.size() * 4 + 255) & ~VkDeviceSize(255);
+            std::memcpy(xfer.ptr + off + size_t(row) * w * 4, rgba.data() + size_t(h - 1 - row) * w, w * 4);
+        upload_image(t.image.img, w, h, off);
         t.hash = hash, t.ready = true;
         return t;
     }
@@ -653,11 +684,27 @@ struct Renderer::Impl {
         const VkPipeline pipe = pipeline(vmod, fmod, regs);
         if (!pipe) return skip("pipeline creation");
 
-        // Vertex data and uniforms.
+        // Room in this batch: vertices, uniforms, lighting, staging (texture uploads are
+        // bounded by the units' full sizes, the target upload by its size).
         const VkDeviceSize vbytes = shaded.size() * sizeof(ShadedVertex);
-        ensure(vbuf, vbytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-        std::memcpy(vbuf.ptr, shaded.data(), vbytes);
-        u8* u = ubuf.ptr;
+        VkDeviceSize xbytes = target.fresh ? align(VkDeviceSize(target.width) * target.height * 4) : 0;
+        for (u32 i = 0; i < 3; ++i)
+            if (regs[TEX_CONFIG] >> i & 1) {
+                const u32 dim = regs[TEX_REGS[i][0]];
+                xbytes += align(VkDeviceSize(dim & 0x7FF) * (dim >> 16 & 0x7FF) * 4);
+            }
+        if (batch_draws == MAX_BATCH_DRAWS || vb_used + align(vbytes) > vbuf.size ||
+            ub_used + align(UBO_SIZE) > ubuf.size || lb_used + align(LIGHT_BUF_SIZE) > lbuf.size ||
+            x_used + xbytes > xfer.size)
+            submit_and_wait();
+        ensure(vbuf, vbytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);  // grows only right after a submit
+        ensure(xfer, xbytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        ++batch_draws;
+
+        // Vertex data and uniforms.
+        const VkDeviceSize voff = take(vb_used, vbytes), uoff = take(ub_used, UBO_SIZE);
+        std::memcpy(vbuf.ptr + voff, shaded.data(), vbytes);
+        u8* u = ubuf.ptr + uoff;
         std::memcpy(u, vs.float_uniforms.data(), 96 * 16);
         for (u32 i = 0; i < 4; ++i) {
             const u32 iv = vs.int_uniforms[i];
@@ -668,18 +715,22 @@ struct Renderer::Impl {
         std::memcpy(u + 1600, depth, 16);
         const u32 bools = vs.bool_uniforms;
         std::memcpy(u + 1616, &bools, 4);
-        std::memcpy(lbuf.ptr, &regs[LIGHT_REGS], LIGHT_REG_WORDS * 4);
-        std::memcpy(lbuf.ptr + LIGHT_REG_WORDS * 4, vs.light_lut.data(), sizeof(vs.light_lut));
+        // Lighting registers + LUTs rarely change between draws: reuse the last copy if equal.
+        if (last_light.empty() || std::memcmp(last_light.data(), &regs[LIGHT_REGS], LIGHT_REG_WORDS * 4) ||
+            std::memcmp(last_light.data() + LIGHT_REG_WORDS, vs.light_lut.data(), sizeof(vs.light_lut))) {
+            last_light.assign(&regs[LIGHT_REGS], &regs[LIGHT_REGS] + LIGHT_REG_WORDS);
+            last_light.insert(last_light.end(), vs.light_lut.begin(), vs.light_lut.end());
+            lb_last = take(lb_used, LIGHT_BUF_SIZE);
+            std::memcpy(lbuf.ptr + lb_last, last_light.data(), LIGHT_BUF_SIZE);
+        }
 
         begin();
         // Texture uploads (before the render pass).
-        ensure(xfer, 16u << 20, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        VkDeviceSize xoff = 0;
         Texture* tex[3];
         for (u32 i = 0; i < 3; ++i)
-            tex[i] = regs[TEX_CONFIG] >> i & 1 ? &texture(mem, regs, i, xoff) : &dummy;
+            tex[i] = regs[TEX_CONFIG] >> i & 1 ? &texture(mem, regs, i) : &dummy;
         if (target.fresh) {  // bring in the guest's current pixels
-            const VkDeviceSize bytes = VkDeviceSize(target.width) * target.height * 4;
+            const VkDeviceSize xoff = take(x_used, VkDeviceSize(target.width) * target.height * 4);
             read_guest_color(mem, xfer.ptr + xoff);
             barrier(target.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -692,18 +743,16 @@ struct Renderer::Impl {
                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
             barrier(target.depth.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-            xoff += bytes;
         }
 
-        // Descriptors.
-        vkResetDescriptorPool(dev, desc_pool, 0);
+        // Descriptors (the pool is recycled per batch).
         VkDescriptorSet sets[2];
         VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         dai.descriptorPool = desc_pool;
         dai.descriptorSetCount = 2;
         dai.pSetLayouts = set_layouts;
         vkAllocateDescriptorSets(dev, &dai, sets);
-        const VkDescriptorBufferInfo bi[2] = {{ubuf.buf, 0, UBO_SIZE}, {lbuf.buf, 0, LIGHT_BUF_SIZE}};
+        const VkDescriptorBufferInfo bi[2] = {{ubuf.buf, uoff, UBO_SIZE}, {lbuf.buf, lb_last, LIGHT_BUF_SIZE}};
         VkDescriptorImageInfo ii[3];
         for (u32 i = 0; i < 3; ++i)
             ii[i] = {sampler(regs[TEX_REGS[i][1]]), tex[i]->image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
@@ -744,15 +793,9 @@ struct Renderer::Impl {
         const float consts[4] = {(bc & 0xFF) / 255.f, (bc >> 8 & 0xFF) / 255.f, (bc >> 16 & 0xFF) / 255.f, (bc >> 24) / 255.f};
         vkCmdSetBlendConstants(cmd, consts);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 2, sets, 0, nullptr);
-        const VkDeviceSize zero = 0;
-        vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf.buf, &zero);
+        vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf.buf, &voff);
         vkCmdDraw(cmd, u32(verts.size()), 1, 0, 0);
         vkCmdEndRenderPass(cmd);
-        const auto t0 = std::chrono::steady_clock::now();
-        submit_and_wait();
-        const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        if (ms > 50 && std::getenv("DOT_TRACE_DRAWS"))
-            std::fprintf(stderr, "renderer: slow draw %.0f ms (%zu vertices, entry %u)\n", ms, verts.size(), entry);
         ++stats.draws;
         if (std::getenv("DOT_TRACE_FB"))
             std::fprintf(stderr, "renderer:   draw %zu vertices into %08X\n", verts.size(), target.color_va);

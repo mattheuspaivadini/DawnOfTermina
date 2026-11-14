@@ -2,6 +2,11 @@
 cmake_minimum_required(VERSION 3.20)
 project(DawnOfTermina LANGUAGES CXX)
 
+# An unoptimised runtime (VS interpreter, renderer, kernel) runs the game several times slower.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

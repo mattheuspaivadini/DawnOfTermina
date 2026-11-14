@@ -31,7 +31,16 @@
 #include "hle/fs.h"
 #include "hle/hid.h"
 #include "hle/srv.h"
+#include "hle/kernel.h"
 #include "hle/svc.h"
+#include "recomp/runtime.h"
+
+#ifdef DOT_HAVE_RECOMP
+namespace recomp {
+extern const FuncEntry kFunctions[];
+extern const u32 kFunctionCount;
+}  // namespace recomp
+#endif
 
 // Bottom screen placeholder until the game renders: the title's own SMDH icon
 // (48x48 tiled RGB565 at 0x24C0), scaled 3x and centred. Exercises the PICA texture
@@ -66,15 +75,42 @@ int main(int argc, char** argv) {
                 code->data.addr, code->data.size, code->bss_size, code->text.addr);
 
     hle::svc::InitProcess(mem, code->image_bytes());
+    hle::svc::AddRegion(code->text.addr, code->text.pages * core::Memory::PAGE, 5, 4);  // r-x code
+    hle::svc::AddRegion(code->rodata.addr, code->rodata.pages * core::Memory::PAGE, 1, 4);
+    hle::svc::AddRegion(code->data.addr, (code->data.size + code->bss_size + 0xFFF) & ~0xFFFu, 3, 4);
+    const u32 stack = (code->stack_size + 0xFFF) & ~0xFFFu;
+    hle::svc::AddRegion(core::Memory::STACK_TOP - stack, stack, 3, 5);
     hle::dsp::Initialize();
 
-    // Run the transcribed boot until it reaches code that is not transcribed yet.
+#ifdef DOT_HAVE_RECOMP
+    // Run the recompiled code.bin from its entry point until it needs something the
+    // runtime/HLE does not provide yet; that report is the next thing to implement.
+    recomp::set_memory(mem.host(0));
+    recomp::set_svc_memory(mem);
+    recomp::set_function_table(recomp::kFunctions, recomp::kFunctionCount);
+    hle::kernel::init(mem);
+    hle::srv::RegisterIpc();
+    recomp::Context ctx{};
+    ctx.r[13] = core::Memory::STACK_TOP;
+    ctx.tls = core::Memory::tls(0);
+    std::printf("boot: running recompiled code (%u functions)\n", recomp::kFunctionCount);
+    try {
+        recomp::call(&ctx, code->text.addr);
+    } catch (const recomp::Trap& t) {
+        std::printf("boot: stopped: %s\n      pc=0x%08X lr=0x%08X sp=0x%08X\n", t.what(), t.pc, ctx.r[14], ctx.r[13]);
+    } catch (const hle::kernel::Unimplemented& u) {
+        std::printf("boot: stopped in HLE: %s\n      lr=0x%08X\n", u.what(), ctx.r[14]);
+    }
+#else
+    // No recompiled code (game_data absent at configure time): run the hand-transcribed
+    // boot until it reaches code that is not transcribed yet.
     game::bind(mem);
     try {
         game::crt0::_start();
     } catch (const game::Frontier& f) {
         std::printf("boot: reached the transcription frontier: %s\n", f.what());
     }
+#endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD) || !hle::hid::Initialize()) {
         std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;

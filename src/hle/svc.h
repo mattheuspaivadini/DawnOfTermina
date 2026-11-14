@@ -39,6 +39,14 @@ constexpr Result ERR_INVALID_ADDRESS = 0xE0E01BF5;
 // 64 MB application mode) and accounts the loaded image (code + data + bss + stack)
 // as already-committed memory.
 void InitProcess(core::Memory& mem, u32 image_bytes);
+
+// Process memory map for svcQueryMemory. MemoryState: 4 code, 5 private, 7 continuous.
+struct MemoryInfo {
+    u32 base, size, perm, state;
+};
+void AddRegion(u32 base, u32 size, u32 perm, u32 state);
+// svc 0x02 — the region containing `addr`, or the free gap around it.
+MemoryInfo QueryMemory(u32 addr);
 // What svcGetResourceLimitCurrentValues(COMMIT) reports for the process.
 u32 CommittedMemory();
 

@@ -26,6 +26,9 @@ add_library(dot_runtime STATIC
     src/gfx/vulkan/context.cpp
     src/game/guest.cpp
     src/game/crt0.cpp
+    src/hle/kernel.cpp
+    src/recomp/runtime.cpp
+    src/recomp/svc.cpp
 )
 target_include_directories(dot_runtime PUBLIC src)
 target_link_libraries(dot_runtime PUBLIC SDL3::SDL3 Vulkan::Vulkan
@@ -35,7 +38,45 @@ target_compile_options(dot_runtime PUBLIC -Wall -Wextra -Wno-missing-field-initi
 add_executable(dawnoftermina src/main.cpp)
 target_link_libraries(dawnoftermina PRIVATE dot_runtime)
 
+# Static recompilation of the user's code.bin (tools/recomp). Generated at build time
+# into the build tree only: it is derived from the game and must never be committed.
+set(DOT_GAME_DATA "${CMAKE_SOURCE_DIR}/game_data" CACHE PATH "Extracted game data (tools/extract_cia.py)")
+set(DOT_RECOMP_CHUNKS 64)
+if(EXISTS "${DOT_GAME_DATA}/exefs/code.bin")
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(gen "${CMAKE_BINARY_DIR}/recomp_gen")
+    set(gen_sources "${gen}/recomp_table.cpp")
+    math(EXPR last "${DOT_RECOMP_CHUNKS} - 1")
+    foreach(i RANGE ${last})
+        if(i LESS 10)
+            list(APPEND gen_sources "${gen}/recomp_0${i}.cpp")
+        else()
+            list(APPEND gen_sources "${gen}/recomp_${i}.cpp")
+        endif()
+    endforeach()
+    file(GLOB recomp_tool CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/tools/recomp/*.py")
+    add_custom_command(
+        OUTPUT ${gen_sources} "${gen}/recomp_funcs.h"
+        COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tools/recomp/recomp.py" "${DOT_GAME_DATA}" "${gen}"
+                --chunks ${DOT_RECOMP_CHUNKS}
+        DEPENDS ${recomp_tool} "${DOT_GAME_DATA}/exefs/code.bin" "${DOT_GAME_DATA}/exheader.bin"
+                "${CMAKE_SOURCE_DIR}/tools/recomp/extra_entries.txt"
+        COMMENT "Recompiling code.bin (ARM11 -> C++)"
+        VERBATIM)
+    add_library(dot_game STATIC ${gen_sources})
+    target_include_directories(dot_game PRIVATE src "${gen}")
+    # Generated code: VFP MAC must not be fused; guest memory is accessed through u8*.
+    target_compile_options(dot_game PRIVATE -O1 -w -ffp-contract=off -fno-strict-aliasing)
+    target_link_libraries(dawnoftermina PRIVATE dot_game)
+    target_compile_definitions(dawnoftermina PRIVATE DOT_HAVE_RECOMP=1)
+endif()
+
 enable_testing()
-add_executable(dot_selftest tests/selftest.cpp tests/pica_test.cpp tests/shader_test.cpp)
+add_executable(dot_selftest tests/selftest.cpp tests/pica_test.cpp tests/shader_test.cpp
+    tests/recomp_test.cpp)
 target_link_libraries(dot_selftest PRIVATE dot_runtime)
 add_test(NAME selftest COMMAND dot_selftest ${CMAKE_SOURCE_DIR}/game_data)
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_FOUND)
+    add_test(NAME recomp_lifter COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tools/recomp/test_lifter.py)
+endif()

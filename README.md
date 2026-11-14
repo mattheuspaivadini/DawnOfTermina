@@ -6,7 +6,7 @@ Recompilação estática nativa (static recompilation / port HLE) de **The Legen
 
 ## Visão geral
 
-O código ARM11 original (`code.bin` do ExeFS) é analisado no Hopper Disassembler e transcrito, função por função, para C++ legível. Os serviços do Horizon OS (`fs`, `hid`, `gsp`, `dsp`, `cfg`, `ptm`, syscalls `svc`) são reimplementados em alto nível (HLE), e as listas de comando da GPU PICA200 são traduzidas para Vulkan. Os assets (RomFS) são lidos em tempo de execução a partir de uma extração local feita pelo usuário.
+O código ARM11 original (`code.bin` do ExeFS) é traduzido automaticamente para C++ por um recompilador estático (`tools/recomp`, executado durante o build a partir da sua cópia do jogo — o código gerado nunca é distribuído), e subsistemas selecionados são analisados no Hopper Disassembler e transcritos à mão para C++ legível. Os serviços do Horizon OS (`fs`, `hid`, `gsp`, `dsp`, `cfg`, `ptm`, syscalls `svc`) são reimplementados em alto nível (HLE), e as listas de comando da GPU PICA200 são traduzidas para Vulkan. Os assets (RomFS) são lidos em tempo de execução a partir de uma extração local feita pelo usuário.
 
 ## Requisitos
 
@@ -32,6 +32,8 @@ O extrator é Python puro (sem dependências externas) e exige um `.cia` **descr
 
 ## Compilando
 
+Com `game_data/` presente, o build também recompila o `code.bin` (≈2 min em 6 núcleos; requer ~4 GB de RAM livres).
+
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
@@ -48,7 +50,9 @@ src/
   gfx/vulkan/   tradutor PICA200 -> Vulkan (registradores, shaders, TEV, formatos de textura)
   game/         código do jogo transcrito do ARM11, organizado por subsistema e endereço original
 tests/          self-test do runtime (ctest)
-tools/          extração do .cia, descompressão do code.bin, geração de stubs/símbolos
+src/recomp/     runtime do código recompilado (contexto da CPU, flags, VFP, despacho, syscalls)
+tools/recomp/   recompilador estático ARM/Thumb/VFP -> C++
+tools/          extração do .cia, símbolos
 ```
 
 Cada função transcrita mantém o endereço virtual original em comentário (`// Original VA: 0x00104A20`) para rastreabilidade 1:1.
@@ -62,7 +66,9 @@ Cada função transcrita mantém o endereço virtual original em comentário (`/
 | 3 | Runtime, memória e HLE do Horizon OS | ✅ |
 | 4 | Backend Vulkan e tradutor PICA200 | 🟡 apresentação, texturas, command lists e tradução de shaders (VS e TEV → SPIR-V) prontas; GSP e pipeline de draw em aberto |
 | 5 | Entry point (`_start` / `nnMain`) | ✅ boot do crt0 transcrito até a fronteira atual |
-| 6+ | Subsistemas do jogo (cenas, loop, áudio, colisão, atores, HUD) | ⏳ |
+| 6 | Recompilador estático automático ARM11 → C++ | ✅ boot do SDK roda recompilado até a criação de threads |
+| 7 | Threads do guest e serviços do sistema até o primeiro frame | ⏳ |
+| 8+ | Subsistemas do jogo (cenas, loop, áudio, colisão, atores, HUD) | ⏳ |
 
 ## Licença
 

@@ -21,7 +21,7 @@ Recompilação estática nativa de *Majora's Mask 3D* (3DS, ARM11) para C++20 + 
 
 - **Espaço de endereçamento:** `core::Memory` reserva 4 GiB de host (`mmap PROT_NONE`) e mapeia regiões sob demanda; VA do guest → host = `mem.host(va)` (uma soma). Páginas não mapeadas dão SIGSEGV, o que expõe transcrições erradas. Acesso: `mem.read<T>(va)` / `mem.write<T>(va, v)`.
 - **Loader:** `core::load_code` lê `exheader.bin` + `exefs/code.bin`, mapeia `.text`/`.rodata` como somente leitura, `.data`+`.bss` e a stack (topo em `0x10000000`).
-- **Modelo HLE:** serviços são **funções C++ chamadas diretamente** pelo código transcrito (no nível do SDK `nn::*`), **sem emular IPC/command buffers**. Quando uma função do SDK (ex.: `nn::fs::TryOpenFile`) for encontrada no Hopper, ela é substituída por uma chamada em `src/hle/`, sem ser transcrita.
+- **Modelo HLE (revisado na Etapa 6):** originalmente no nível do SDK (`nn::*` como chamadas C++ diretas). Com o recompilador, o HLE passou para o nível syscall/IPC (ver "HLE do kernel"); as APIs `hle::fs/hid/dsp` viram backends.
 - `hle::svc`: `ControlMemory` (COMMIT/FREE/PROTECT, heap normal em `0x08000000` e linear em `0x14000000` via bump allocator, limite de 128 MB), `ExitProcess`, `SleepThread`, `GetSystemTick` (268.111.856 Hz), `Break`, `OutputDebugString`.
 - `hle::srv`: `GetServiceHandle` devolve handles fixos para serviços conhecidos.
 - `hle::fs`: `OpenFile("rom:/...")`/`GetSize`/`Read`/`Close` direto de `game_data/romfs/` (rejeita `..`).
@@ -53,9 +53,27 @@ Recompilação estática nativa de *Majora's Mask 3D* (3DS, ARM11) para C++20 + 
 - `hle::svc::InitProcess` preenche a config memory (APPMEMALLOC 64 MB, SYSMEMALLOC, BASEMEMALLOC) e contabiliza a imagem carregada como memória já reservada.
 - **Escala:** o Hopper encontra 15.761 procedimentos; cada função do SDK abre um leque de outras (mutexes, threads, `operator new`, printf). Ver a seção "Decisão pendente" abaixo.
 
-## Decisão pendente: transcrição manual × recompilador automático
+## Recompilador estático (Etapa 6) — `tools/recomp/`
 
-Transcrever à mão toda a cadeia de boot até o primeiro frame significa centenas a milhares de funções. Projetos de static recompilation (N64Recomp, XenonRecomp) usam um **tradutor automático ARM→C++** para todo o binário (cada função vira C++ operando sobre um contexto de registradores + memória do guest), com **overrides HLE** para SDK/svc e **transcrição limpa manual** só onde vale (subsistemas do jogo, hot paths). A infraestrutura atual (fronteira, `guest.h`, HLE) é compatível com os dois caminhos. A decisão é do usuário.
+Decisão do usuário (2026-11-14): **tradutor automático ARM11 → C++** para o binário inteiro; transcrição manual fica para subsistemas que valham uma versão limpa.
+
+- **Saída gerada só no build** (`build/recomp_gen/`, 64 chunks + `recomp_table.cpp` + `stats.txt`). É derivada do jogo: **nunca commitar**. O CMake roda o recompilador se `game_data/exefs/code.bin` existir (`DOT_GAME_DATA`) e compila `dot_game` com `-O1 -w -ffp-contract=off -fno-strict-aliasing` (~2 min com `-j6`).
+- **ISA:** ARMv6K = ARM + **Thumb-1** (sem Thumb-2) + VFPv2. Lifters: `arm.py`, `thumb.py`, `vfp.py`; registro comum `common.py` (`Insn`: kind normal/branch/call/icall/ret/jump/trap).
+- **Descoberta de funções** (`recomp.py`): descida recursiva do entry + `.init_array` (offsets relativos em `0x64A390..0x64A5D0`) + alvos de BL/BLX + literais de código, depois candidatos *vetados* (não podem cair em código já decodificado e precisam passar `plausible_walk`): ponteiros em `.rodata/.data`, `ADR` (`add/sub rd, pc, #imm`, ex. veneers ARM→Thumb) e `ldr rX,=off; add rX, pc` (PIC). ~16.150 funções, ~1,16 M instruções; ~55 traps estáticos, todos dados alcançados após chamadas noreturn.
+- **Modelo de execução:** `u32 func_XXXXXXXX(recomp::Context*)` (chave = endereço | 1 se Thumb) **retorna o endereço para onde "voltou"**; o chamador compara com seu LR e, se diferir, despacha localmente (helpers de switch que mexem no LR). Saltos computados vão para um `switch` local de labels; se o alvo for o LR de entrada da função é um **retorno** (`pop {r3}; bx r3`); senão `recomp::call` pela tabela (`set_function_table`). Branch para outra entrada = tail call. `mov lr, pc; bx rX` = chamada.
+- **Runtime** `src/recomp/runtime.{h,cpp}`: contexto (r0-r15, NZCVQ, GE, s0-s31, FPSCR, TLS, monitor exclusivo), acesso à memória do guest por `g_base + va`, flags, barrel shifter, SIMD/saturação ARMv6, VFP. STREX sempre sucede (uma thread por vez).
+- **Fluxo de trabalho (fronteira):** rodar `./build/dawnoftermina game_data`; a execução para com `recomp::Trap` ou `hle::kernel::Unimplemented` dizendo o que falta (syscall, comando IPC de serviço, entrada indireta desconhecida). Entradas reais não descobertas → `tools/recomp/extra_entries.txt` (ou melhorar a descoberta, preferível). Depurar travas com `gdb` (backtrace mostra `func_<VA>`).
+- **Testes:** `tools/recomp/test_lifter.py` (idiomas críticos de decodificação) e `tests/recomp_test.cpp` (flags, shifter, SIMD, VFP), ambos no `ctest`.
+- **Estado do boot recompilado:** passa por todo o crt0/SDK init (locale, `srv:` por IPC, heap/device memory, objeto da MainThread, stdio com callbacks Thumb) e **para em `svcCreateThread` (0x08)** — entry `0x0012A15C`, prioridade 0x18, chamado de LR `0x0016236C`.
+- O crt0 transcrito à mão (Etapa 5) segue como referência e é usado só quando o build não tem `game_data`.
+
+## HLE do kernel (nível syscall/IPC)
+
+Com o binário todo recompilado, o próprio SDK roda e fala com os serviços por `svcSendSyncRequest` (command buffer em TLS+0x80). **A fronteira do HLE agora é o kernel**, como num emulador; as APIs C++ de `src/hle/{fs,hid,dsp}` passam a ser backends dos handlers IPC.
+- `src/recomp/svc.cpp`: ABI de registradores das syscalls → `hle::svc` / `hle::kernel`. Implementadas: 0x01 ControlMemory, 0x02 QueryMemory, 0x03 ExitProcess, 0x0A SleepThread, 0x0B/0x0C prioridade, 0x13-0x19 mutex/semáforo/evento, 0x21/0x22 address arbiter, 0x23 CloseHandle, 0x24/0x25 WaitSynchronization(N), 0x27 DuplicateHandle (inclui pseudo-handles 0xFFFF8000/8001), 0x28 GetSystemTick, 0x2A/0x2B GetSystem/ProcessInfo, 0x2D ConnectToPort, 0x32 SendSyncRequest, 0x35/0x37 ids, 0x38-0x3A resource limits, 0x3C Break, 0x3D OutputDebugString.
+- `src/hle/kernel.{h,cpp}`: tabela de handles e objetos; esperas com uma thread só retornam timeout ou acusam deadlock (`Unimplemented`). Mapa de regiões para QueryMemory em `hle::svc::AddRegion`.
+- Serviços IPC: `srv:` (RegisterClient, EnableNotification, GetServiceHandle — entrega sessão para **qualquer** nome; o primeiro comando a um serviço sem HLE vira trap com nome + cabeçalho).
+- **Próximo:** threads do guest (`svcCreateThread`/ExitThread/scheduler). Plano: uma thread do host por thread do guest com um "bastão" global (só uma roda por vez), troca cooperativa nos pontos de espera (Wait*, Sleep, ArbitrateAddress) com escolha por prioridade.
 
 ## Mapa de memória do 3DS (Horizon, processo de aplicação)
 
@@ -118,4 +136,6 @@ python3 tools/extract_cia.py "ISO/The Legend of Zelda Majora's Mask 3D (USA).cia
 | 3 | Runtime de memória, `svc`, stubs `fs`/`hid`/`dsp` | ✅ | HLE no nível do SDK, sem IPC; `tests/selftest.cpp` via ctest |
 | 4 | Vulkan + tradutor PICA200 | 🟡 | **4a ✅** contexto Vulkan, apresentação, texturas, command processor. **4b parte 1 ✅** SHBIN, VS→GLSL→SPIR-V, TEV→fragment shader. **4b parte 2 ⏳** GSP, vertex fetch, pipelines de draw |
 | 5 | Entry point / `nnMain` | ✅ | crt0 transcrito até a fronteira `0x0011BECC`; srv/svc/err em HLE; 29 símbolos nomeados |
-| 6+ | Subsistemas do jogo | ⏳ | |
+| 6 | Recompilador estático ARM11 → C++ | ✅ | 16 mil funções compilam; boot recompilado roda o init do SDK até `svcCreateThread`; HLE do kernel por syscall/IPC |
+| 7 | Threads do guest + serviços IPC (fs, apt, gsp, hid…) até o primeiro frame | ⏳ | |
+| 8+ | Subsistemas do jogo | ⏳ | |

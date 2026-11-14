@@ -128,6 +128,7 @@ static void test_boot(const stdfs::path& data) {
 
 void test_pica();                     // tests/pica_test.cpp
 void test_shaders(const char* data);  // tests/shader_test.cpp
+void test_recomp_runtime();            // tests/recomp_test.cpp
 
 int main(int argc, char** argv) {
     Memory mem;
@@ -135,6 +136,7 @@ int main(int argc, char** argv) {
     test_fs();
     test_hid();
     test_pica();
+    test_recomp_runtime();
     test_loader(mem, argc > 1 ? argv[1] : "game_data");
     test_boot(argc > 1 ? argv[1] : "game_data");
     test_shaders(argc > 1 ? argv[1] : "game_data");

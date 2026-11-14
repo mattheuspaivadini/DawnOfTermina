@@ -1,0 +1,2 @@
+# Extra function entry points for the recompiler (hex, Thumb entries with bit 0 set).
+# Add an address here when the runtime reports an indirect call to an unknown entry.

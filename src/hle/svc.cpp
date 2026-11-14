@@ -17,6 +17,8 @@
 #include "hle/svc.h"
 
 #include <chrono>
+#include <iterator>
+#include <map>
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
@@ -29,6 +31,47 @@ using core::Memory;
 // replace with a free list if the game frees and re-commits linear memory.
 static u32 linear_next = Memory::LINEAR_BASE;
 static u32 committed = 0;
+static std::map<u32, MemoryInfo> regions;  // by base
+
+void AddRegion(u32 base, u32 size, u32 perm, u32 state) {
+    // Merge with a directly preceding region of the same kind (heap grows in steps).
+    auto it = regions.lower_bound(base);
+    if (it != regions.begin()) {
+        auto prev = std::prev(it);
+        MemoryInfo& p = prev->second;
+        if (p.base + p.size == base && p.perm == perm && p.state == state) {
+            p.size += size;
+            return;
+        }
+    }
+    regions[base] = {base, size, perm, state};
+}
+
+static void RemoveRange(u32 base, u32 size) {
+    for (auto it = regions.begin(); it != regions.end();) {
+        MemoryInfo r = it->second;
+        const u64 end = u64(r.base) + r.size, cut_end = u64(base) + size;
+        if (end <= base || r.base >= cut_end) {
+            ++it;
+            continue;
+        }
+        it = regions.erase(it);
+        if (r.base < base) regions[r.base] = {r.base, base - r.base, r.perm, r.state};
+        if (end > cut_end) regions[u32(cut_end)] = {u32(cut_end), u32(end - cut_end), r.perm, r.state};
+    }
+}
+
+MemoryInfo QueryMemory(u32 addr) {
+    auto it = regions.upper_bound(addr);
+    u32 gap_start = 0;
+    if (it != regions.begin()) {
+        const MemoryInfo& r = std::prev(it)->second;
+        if (addr < u64(r.base) + r.size) return r;
+        gap_start = r.base + r.size;
+    }
+    const u32 gap_end = it == regions.end() ? 0xFFFFF000u : it->first;
+    return {gap_start, gap_end - gap_start, 0, 0};
+}
 
 void InitProcess(Memory& mem, u32 image_bytes) {
     mem.write<u32>(Memory::CONFIG_MEM + 0x40, 0x04000000);  // APPMEMALLOC
@@ -36,6 +79,7 @@ void InitProcess(Memory& mem, u32 image_bytes) {
     mem.write<u32>(Memory::CONFIG_MEM + 0x48, 0x01400000);  // BASEMEMALLOC
     committed = image_bytes;
     linear_next = Memory::LINEAR_BASE;
+    regions.clear();
 }
 
 u32 CommittedMemory() { return committed; }
@@ -55,12 +99,14 @@ Result ControlMemory(Memory& mem, u32* out_addr, u32 addr0, u32 /*addr1*/, u32 s
             return ERR_INVALID_ADDRESS;
         }
         if (!mem.map(addr, size)) return ERR_INVALID_ADDRESS;
+        AddRegion(addr, size, perm & 7, linear ? 7 : 5);
         committed += size;
         *out_addr = addr;
         return RESULT_OK;
     }
     case MEMOP_FREE:
         if (!mem.unmap(addr0, size)) return ERR_INVALID_ADDRESS;
+        RemoveRange(addr0, size);
         committed -= size < committed ? size : committed;
         *out_addr = addr0;
         return RESULT_OK;

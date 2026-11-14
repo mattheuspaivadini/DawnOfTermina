@@ -30,4 +30,7 @@ constexpr Result ERR_NOT_REGISTERED = 0xD8E06406;
 Result Initialize();
 Result GetServiceHandle(Handle* out, std::string_view name);
 
+// Registers the "srv:" port with hle::kernel for recompiled code (IPC level).
+void RegisterIpc();
+
 }  // namespace hle::srv

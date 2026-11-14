@@ -17,6 +17,18 @@ Recompilação estática nativa de *Majora's Mask 3D* (3DS, ARM11) para C++20 + 
 - `src/game/` organizado por subsistema (`scene/`, `actor/`, `audio/`, `collision/`, `ui/`...), um arquivo por unidade lógica.
 - Comentários explicam o *porquê*; atalhos conhecidos usam `// shortcut: <limite>, <quando melhorar>`.
 
+## Runtime (Etapa 3)
+
+- **Espaço de endereçamento:** `core::Memory` reserva 4 GiB de host (`mmap PROT_NONE`) e mapeia regiões sob demanda; VA do guest → host = `mem.host(va)` (uma soma). Páginas não mapeadas dão SIGSEGV, o que expõe transcrições erradas. Acesso: `mem.read<T>(va)` / `mem.write<T>(va, v)`.
+- **Loader:** `core::load_code` lê `exheader.bin` + `exefs/code.bin`, mapeia `.text`/`.rodata` como somente leitura, `.data`+`.bss` e a stack (topo em `0x10000000`).
+- **Modelo HLE:** serviços são **funções C++ chamadas diretamente** pelo código transcrito (no nível do SDK `nn::*`), **sem emular IPC/command buffers**. Quando uma função do SDK (ex.: `nn::fs::TryOpenFile`) for encontrada no Hopper, ela é substituída por uma chamada em `src/hle/`, sem ser transcrita.
+- `hle::svc`: `ControlMemory` (COMMIT/FREE/PROTECT, heap normal em `0x08000000` e linear em `0x14000000` via bump allocator, limite de 128 MB), `ExitProcess`, `SleepThread`, `GetSystemTick` (268.111.856 Hz), `Break`, `OutputDebugString`.
+- `hle::srv`: `GetServiceHandle` devolve handles fixos para serviços conhecidos.
+- `hle::fs`: `OpenFile("rom:/...")`/`GetSize`/`Read`/`Close` direto de `game_data/romfs/` (rejeita `..`).
+- `hle::hid`: SDL3. Teclado: K/J/I/U = A/B/X/Y, Q/E = L/R, 1/3 = ZL/ZR, Enter/Backspace = Start/Select, setas = D-pad, WASD = circle pad. Controle no layout posicional da Nintendo (leste = A).
+- `hle::dsp`: stub, sem áudio.
+- **Faltam:** threads/handles/sincronização (`svcCreateThread`, eventos, mutexes), `cfg`, `ptm`, `apt`, toque na tela inferior, C-stick (`ir:rst`), áudio, saves.
+
 ## Mapa de memória do 3DS (Horizon, processo de aplicação)
 
 Segmentos do jogo extraídos do `exheader.bin` (MM3D USA, título interno `Joker`, `code.bin` comprimido com LZSS, 0x5b1000 bytes descomprimido). O `.bss` foi confirmado pelos literais de `__clear_bss` (0x100024).
@@ -51,8 +63,11 @@ Segmentos do jogo extraídos do `exheader.bin` (MM3D USA, título interno `Joker
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release   # -G Ninja opcional
 cmake --build build
+(cd build && ctest --output-on-failure)          # self-test; usa game_data/ se existir
 ./build/dawnoftermina game_data
 ```
+
+Dependências de build: SDL3 (`find_package(SDL3 CONFIG)`).
 
 Ambiente atual do dev: CMake não está instalado no sistema; usar `uvx cmake ...` como substituto (sem Ninja: gerador padrão Make).
 
@@ -72,7 +87,7 @@ python3 tools/extract_cia.py "ISO/The Legend of Zelda Majora's Mask 3D (USA).cia
 |---|---|---|---|
 | 1 | Bootstrap: git, `.gitignore`, `LICENSE`, `README.md`, `CLAUDE.md`, CMake | ✅ | executável stub que valida `game_data/` |
 | 2 | Extração do `.cia` + mapa de memória + abrir no Hopper | ✅ | extrator em Python puro (sem ctrtool/3dstool); `code.elf` validado no Hopper |
-| 3 | Runtime de memória, `svc`, stubs `fs`/`hid`/`dsp` | ⏳ | |
+| 3 | Runtime de memória, `svc`, stubs `fs`/`hid`/`dsp` | ✅ | HLE no nível do SDK, sem IPC; `tests/selftest.cpp` via ctest |
 | 4 | Vulkan + tradutor PICA200 | ⏳ | |
 | 5 | Entry point / `nnMain` | ⏳ | |
 | 6+ | Subsistemas do jogo | ⏳ | |

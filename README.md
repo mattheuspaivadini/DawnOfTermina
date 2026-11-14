@@ -15,6 +15,7 @@ O código ARM11 original (`code.bin` do ExeFS) é analisado no Hopper Disassembl
 | Compilador C++20 | GCC 12 / Clang 16 | build |
 | CMake | 3.20 | build |
 | Ninja ou Make | — | build |
+| SDL3 | 3.2 | janela, input, (áudio) |
 | Vulkan SDK (headers, loader, `glslc`) | 1.3 | renderização (Etapa 4) |
 | Python | 3.10 | scripts em `tools/` |
 
@@ -33,6 +34,7 @@ O extrator é Python puro (sem dependências externas) e exige um `.cia` **descr
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
+(cd build && ctest --output-on-failure)
 ./build/dawnoftermina game_data
 ```
 
@@ -44,6 +46,7 @@ src/
   hle/          serviços do Horizon OS (srv, fs, hid, gsp, dsp, cfg, ptm) e syscalls svc
   gfx/vulkan/   tradutor PICA200 -> Vulkan (registradores, shaders, TEV, formatos de textura)
   game/         código do jogo transcrito do ARM11, organizado por subsistema e endereço original
+tests/          self-test do runtime (ctest)
 tools/          extração do .cia, descompressão do code.bin, geração de stubs/símbolos
 ```
 
@@ -55,7 +58,7 @@ Cada função transcrita mantém o endereço virtual original em comentário (`/
 |---|---|---|
 | 1 | Bootstrap do repositório, licença, documentação | ✅ |
 | 2 | Pipeline de extração do `.cia` e preparação do binário para o Hopper | ✅ |
-| 3 | Runtime, memória e HLE do Horizon OS | ⏳ |
+| 3 | Runtime, memória e HLE do Horizon OS | ✅ |
 | 4 | Backend Vulkan e tradutor PICA200 | ⏳ |
 | 5 | Entry point (`_start` / `nnMain`) | ⏳ |
 | 6+ | Subsistemas do jogo (cenas, loop, áudio, colisão, atores, HUD) | ⏳ |

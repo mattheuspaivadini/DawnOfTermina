@@ -16,7 +16,8 @@ O código ARM11 original (`code.bin` do ExeFS) é analisado no Hopper Disassembl
 | CMake | 3.20 | build |
 | Ninja ou Make | — | build |
 | SDL3 | 3.2 | janela, input, (áudio) |
-| Vulkan SDK (headers, loader, `glslc`) | 1.3 | renderização (Etapa 4) |
+| Vulkan SDK (headers, loader) | 1.3 | renderização |
+| glslang | 14+ | GLSL → SPIR-V em runtime |
 | Python | 3.10 | scripts em `tools/` |
 
 ## Preparando os dados do jogo
@@ -59,7 +60,7 @@ Cada função transcrita mantém o endereço virtual original em comentário (`/
 | 1 | Bootstrap do repositório, licença, documentação | ✅ |
 | 2 | Pipeline de extração do `.cia` e preparação do binário para o Hopper | ✅ |
 | 3 | Runtime, memória e HLE do Horizon OS | ✅ |
-| 4 | Backend Vulkan e tradutor PICA200 | 🟡 4a concluída (apresentação, texturas, command lists); 4b em aberto (GSP, shaders, draws) |
+| 4 | Backend Vulkan e tradutor PICA200 | 🟡 apresentação, texturas, command lists e tradução de shaders (VS e TEV → SPIR-V) prontas; GSP e pipeline de draw em aberto |
 | 5 | Entry point (`_start` / `nnMain`) | ✅ boot do crt0 transcrito até a fronteira atual |
 | 6+ | Subsistemas do jogo (cenas, loop, áudio, colisão, atores, HUD) | ⏳ |
 

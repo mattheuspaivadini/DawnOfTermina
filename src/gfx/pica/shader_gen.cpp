@@ -1,0 +1,493 @@
+// DawnOfTermina — native static recompilation of Majora's Mask 3D.
+// Copyright (C) 2026 DawnOfTermina contributors
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+#include "gfx/pica/shader_gen.h"
+
+#include <cstdio>
+#include <format>
+#include <set>
+#include <vector>
+
+namespace gfx::pica {
+
+namespace {
+
+enum Op : u32 {
+    ADD = 0x00, DP3 = 0x01, DP4 = 0x02, DPH = 0x03, DST = 0x04, EX2 = 0x05, LG2 = 0x06, LITP = 0x07,
+    MUL = 0x08, SGE = 0x09, SLT = 0x0A, FLR = 0x0B, MAX = 0x0C, MIN = 0x0D, RCP = 0x0E, RSQ = 0x0F,
+    MOVA = 0x12, MOV = 0x13, DPHI = 0x18, DSTI = 0x19, SGEI = 0x1A, SLTI = 0x1B,
+    BREAK = 0x20, NOP = 0x21, END = 0x22, BREAKC = 0x23, CALL = 0x24, CALLC = 0x25, CALLU = 0x26,
+    IFU = 0x27, IFC = 0x28, LOOP = 0x29, EMIT = 0x2A, SETEMIT = 0x2B, JMPC = 0x2C, JMPU = 0x2D,
+};
+
+u32 bits(u32 v, u32 lo, u32 n) { return v >> lo & ((1u << n) - 1); }
+
+struct Translator {
+    const VsSource& s;
+    std::string body;
+    std::set<u32> inputs_read;
+
+    std::string swz(u32 field) const {
+        std::string out;
+        for (int i = 0; i < 4; ++i) out += "xyzw"[field >> (6 - 2 * i) & 3];
+        return out;
+    }
+
+    // `reg` is the 5- or 7-bit source field; relative addressing only applies to uniforms.
+    std::string src(u32 reg, u32 idx, u32 swizzle_field, bool negate) {
+        std::string base;
+        if (reg < 0x10) {
+            base = std::format("v[{}]", reg);
+            inputs_read.insert(reg);
+        } else if (reg < 0x20) {
+            base = std::format("r[{}]", reg - 0x10);
+        } else {
+            static const char* rel[] = {"", " + a0.x", " + a0.y", " + aL"};
+            base = idx ? std::format("u.c[clamp({}{}, 0, 95)]", reg - 0x20, rel[idx])
+                       : std::format("u.c[{}]", reg - 0x20);
+        }
+        return std::format("{}{}.{}", negate ? "-" : "", base, swz(swizzle_field));
+    }
+
+    std::string dest(u32 reg) const {
+        return reg < 0x10 ? std::format("o[{}]", reg) : std::format("r[{}]", reg - 0x10);
+    }
+
+    static std::string mask_str(u32 desc) {
+        std::string m;
+        for (int i = 0; i < 4; ++i)
+            if (desc >> (3 - i) & 1) m += "xyzw"[i];
+        return m;
+    }
+
+    void assign(u32 dst, u32 desc, const std::string& value) {
+        const std::string m = mask_str(desc);
+        if (!m.empty()) body += std::format("        {}.{} = ({}).{};\n", dest(dst), m, value, m);
+    }
+
+    std::string cond(u32 w) const {
+        const char* x = bits(w, 25, 1) ? "cc.x" : "!cc.x";
+        const char* y = bits(w, 24, 1) ? "cc.y" : "!cc.y";
+        switch (bits(w, 22, 2)) {
+        case 0: return std::format("({} || {})", x, y);
+        case 1: return std::format("({} && {})", x, y);
+        case 2: return x;
+        default: return y;
+        }
+    }
+
+    static std::string bool_uniform(u32 w) { return std::format("((u.b >> {}u) & 1u) != 0u", bits(w, 22, 4)); }
+
+    // Arithmetic instruction (formats 1, 1i, 1c, 5, 5i). Returns false if unsupported.
+    bool arith(u32 w, std::string* error) {
+        const u32 op = w >> 26;
+        if (op >= 0x30) {  // MAD / MADI
+            const bool inv = op < 0x38;
+            const u32 desc = s.swizzles[bits(w, 0, 5)];
+            const u32 idx = bits(w, 22, 2);
+            const u32 r1 = bits(w, 17, 5);
+            const u32 r2 = inv ? bits(w, 12, 5) : bits(w, 10, 7);
+            const u32 r3 = inv ? bits(w, 5, 7) : bits(w, 5, 5);
+            const std::string a = src(r1, 0, bits(desc, 5, 8), bits(desc, 4, 1));
+            const std::string b = src(r2, inv ? 0 : idx, bits(desc, 14, 8), bits(desc, 13, 1));
+            const std::string c = src(r3, inv ? idx : 0, bits(desc, 23, 8), bits(desc, 22, 1));
+            assign(bits(w, 24, 5), desc, std::format("sanitize_mul({}, {}) + {}", a, b, c));
+            return true;
+        }
+        const bool inv = op == DPHI || op == DSTI || op == SGEI || op == SLTI;
+        const u32 desc = s.swizzles[bits(w, 0, 7)];
+        const u32 idx = bits(w, 19, 2);
+        const u32 r1 = inv ? bits(w, 14, 5) : bits(w, 12, 7);
+        const u32 r2 = inv ? bits(w, 7, 7) : bits(w, 7, 5);
+        const std::string a = src(r1, inv ? 0 : idx, bits(desc, 5, 8), bits(desc, 4, 1));
+        const std::string b = src(r2, inv ? idx : 0, bits(desc, 14, 8), bits(desc, 13, 1));
+        const u32 d = bits(w, 21, 5);
+
+        if ((op & 0x3E) == 0x2E) {  // CMP: x/y compared with independent operators
+            static const char* cmp[] = {"==", "!=", "<", "<=", ">", ">="};
+            const u32 cx = bits(w, 24, 3), cy = bits(w, 21, 3);
+            if (cx > 5 || cy > 5) return *error = "bad CMP operator", false;
+            body += std::format("        {{ vec4 ca = {}; vec4 cb = {}; cc = bvec2(ca.x {} cb.x, ca.y {} cb.y); }}\n",
+                                a, b, cmp[cx], cmp[cy]);
+            return true;
+        }
+        switch (op) {
+        case ADD: assign(d, desc, std::format("{} + {}", a, b)); break;
+        case MUL: assign(d, desc, std::format("sanitize_mul({}, {})", a, b)); break;
+        case DP3: assign(d, desc, std::format("vec4(dot3_s({}, {}))", a, b)); break;
+        case DP4: assign(d, desc, std::format("vec4(dot4_s({}, {}))", a, b)); break;
+        case DPH: case DPHI: assign(d, desc, std::format("vec4(dot4_s(vec4(({}).xyz, 1.0), {}))", a, b)); break;
+        case DST: case DSTI: assign(d, desc, std::format("dst_op({}, {})", a, b)); break;
+        case EX2: assign(d, desc, std::format("vec4(exp2(({}).x))", a)); break;
+        case LG2: assign(d, desc, std::format("vec4(log2(({}).x))", a)); break;
+        case SGE: case SGEI: assign(d, desc, std::format("vec4(greaterThanEqual({}, {}))", a, b)); break;
+        case SLT: case SLTI: assign(d, desc, std::format("vec4(lessThan({}, {}))", a, b)); break;
+        case FLR: assign(d, desc, std::format("floor({})", a)); break;
+        case MAX: assign(d, desc, std::format("max_op({}, {})", a, b)); break;
+        case MIN: assign(d, desc, std::format("min_op({}, {})", a, b)); break;
+        case RCP: assign(d, desc, std::format("vec4(1.0 / ({}).x)", a)); break;
+        case RSQ: assign(d, desc, std::format("vec4(inversesqrt(({}).x))", a)); break;
+        case MOV: assign(d, desc, a); break;
+        case MOVA:
+            if (desc >> 3 & 1) body += std::format("        a0.x = int(({}).x);\n", a);
+            if (desc >> 2 & 1) body += std::format("        a0.y = int(({}).y);\n", a);
+            break;
+        default:
+            *error = std::format("unsupported opcode 0x{:02X}", op);
+            return false;
+        }
+        return true;
+    }
+
+    static std::string push(const std::string& final_, const std::string& ret, const std::string& rep,
+                            const std::string& inc, const std::string& loop) {
+        return std::format("        if (sp < 16) {{ stk_final[sp] = {}; stk_ret[sp] = {}; stk_rep[sp] = {}; "
+                           "stk_inc[sp] = {}; stk_loop[sp] = {}; ++sp; }}\n",
+                           final_, ret, rep, inc, loop);
+    }
+
+    std::string run(std::string* error) {
+        const u32 n = u32(s.code.size());
+        // Walk the code reachable from the entry point (blobs are shared between the
+        // programs of a SHBIN, e.g. a VS next to a GS) and collect block leaders: every
+        // address control flow can land on or where a CALL/IF/LOOP frame ends.
+        std::set<u32> reachable, leaders = {s.entry};
+        std::vector<u32> work = {s.entry};
+        auto add = [&](u32 pc) {
+            if (pc < n && reachable.insert(pc).second) work.push_back(pc);
+        };
+        reachable.insert(s.entry);
+        while (!work.empty()) {
+            const u32 pc = work.back();
+            work.pop_back();
+            const u32 w = s.code[pc], op = w >> 26;
+            const u32 dst = bits(w, 10, 12), num = bits(w, 0, 8);
+            switch (op) {
+            case CALL: case CALLC: case CALLU: case IFU: case IFC:
+                leaders.insert({dst, dst + num, pc + 1});
+                add(dst), add(dst + num), add(pc + 1);
+                break;
+            case LOOP:
+                leaders.insert({pc + 1, dst + 1});
+                add(pc + 1), add(dst + 1);
+                break;
+            case JMPC: case JMPU:
+                leaders.insert({dst, pc + 1});
+                add(dst), add(pc + 1);
+                break;
+            case END: case BREAK: leaders.insert(pc + 1); break;
+            case BREAKC: leaders.insert(pc + 1), add(pc + 1); break;
+            case EMIT: case SETEMIT:
+                *error = "geometry shader opcodes (EMIT/SETEMIT) are not supported";
+                return {};
+            case LITP:
+                *error = "LITP is not supported";
+                return {};
+            default: add(pc + 1); break;
+            }
+        }
+        for (u32 pc : reachable)
+            if (!reachable.count(pc - 1)) leaders.insert(pc);  // start of a reachable run
+
+        for (auto it = leaders.begin(); it != leaders.end() && *it < n; ++it) {
+            const u32 start = *it;
+            if (!reachable.count(start)) continue;
+            const u32 stop = std::next(it) == leaders.end() ? n : std::min(*std::next(it), n);
+            body += std::format("    case {}:\n", start);
+            bool terminated = false;
+            for (u32 pc = start; pc < stop && !terminated; ++pc) {
+                const u32 w = s.code[pc], op = w >> 26;
+                const u32 dst = bits(w, 10, 12), num = bits(w, 0, 8);
+                const std::string next = std::to_string(pc + 1);
+                switch (op) {
+                case NOP: break;
+                case END: body += "        running = false; break;\n"; terminated = true; break;
+                case BREAK:  // leave the innermost loop
+                    body += "        if (sp > 0) { pc = stk_ret[sp - 1]; --sp; } else { running = false; } break;\n";
+                    terminated = true;
+                    break;
+                case BREAKC:
+                    body += std::format("        if ({}) {{ if (sp > 0) {{ pc = stk_ret[sp - 1]; --sp; }} else {{ running = false; }} break; }}\n",
+                                        cond(w));
+                    body += std::format("        pc = {}; break;\n", next);
+                    terminated = true;
+                    break;
+                case CALL: case CALLC: case CALLU: {
+                    const std::string c = op == CALL ? "true" : op == CALLC ? cond(w) : bool_uniform(w);
+                    body += std::format("        if ({}) {{\n", c);
+                    body += push(std::to_string(dst + num), next, "0", "0", "0");
+                    body += std::format("        pc = {}; }} else pc = {};\n        break;\n", dst, next);
+                    terminated = true;
+                    break;
+                }
+                case IFU: case IFC: {
+                    const std::string c = op == IFC ? cond(w) : bool_uniform(w);
+                    body += std::format("        if ({}) {{\n", c);
+                    body += push(std::to_string(dst), std::to_string(dst + num), "0", "0", "0");
+                    body += std::format("        pc = {}; }} else {{\n", next);
+                    body += push(std::to_string(dst + num), std::to_string(dst + num), "0", "0", "0");
+                    body += std::format("        pc = {}; }}\n        break;\n", dst);
+                    terminated = true;
+                    break;
+                }
+                case LOOP: {
+                    const u32 id = bits(w, 22, 2);
+                    body += std::format("        aL = u.i[{}].y;\n", id);
+                    body += push(std::to_string(dst + 1), std::to_string(dst + 1), std::format("u.i[{}].x", id),
+                                 std::format("u.i[{}].z", id), next);
+                    body += std::format("        pc = {}; break;\n", next);
+                    terminated = true;
+                    break;
+                }
+                case JMPC: case JMPU: {
+                    const std::string c = op == JMPC ? cond(w)
+                                                     : std::format("(((u.b >> {}u) & 1u) != 0u) != {}",
+                                                                   bits(w, 22, 4), (num & 1) ? "true" : "false");
+                    body += std::format("        pc = ({}) ? {} : {}; break;\n", c, dst, next);
+                    terminated = true;
+                    break;
+                }
+                default:
+                    if (!arith(w, error)) return {};
+                }
+            }
+            if (!terminated) body += std::format("        pc = {}; break;\n", stop);
+        }
+
+        std::string out = "#version 450\n";
+        for (u32 r : inputs_read) out += std::format("layout(location = {}) in vec4 vs_in{};\n", r, r);
+        out += R"(
+layout(std140, set = 0, binding = 0) uniform PicaVsUniforms { vec4 c[96]; ivec4 i[4]; uint b; } u;
+
+layout(location = 0) out vec4 primary_color;
+layout(location = 1) out vec2 texcoord0;
+layout(location = 2) out vec2 texcoord1;
+layout(location = 3) out vec2 texcoord2;
+layout(location = 4) out float texcoord0_w;
+layout(location = 5) out vec4 normquat;
+layout(location = 6) out vec3 view;
+
+bvec4 isnan_or(bvec4 x, bvec4 y) { return bvec4(x.x || y.x, x.y || y.y, x.z || y.z, x.w || y.w); }
+// PICA multiplication: 0 * inf = 0 (only NaN inputs give NaN).
+vec4 sanitize_mul(vec4 a, vec4 b) {
+    vec4 p = a * b;
+    return mix(p, mix(vec4(0.0), p, isnan_or(isnan(a), isnan(b))), isnan(p));
+}
+float dot3_s(vec4 a, vec4 b) { vec4 p = sanitize_mul(a, b); return p.x + p.y + p.z; }
+float dot4_s(vec4 a, vec4 b) { vec4 p = sanitize_mul(a, b); return p.x + p.y + p.z + p.w; }
+vec4 dst_op(vec4 a, vec4 b) { return vec4(1.0, a.y * b.y, a.z, b.w); }
+vec4 max_op(vec4 a, vec4 b) { return mix(b, a, greaterThan(a, b)); }
+vec4 min_op(vec4 a, vec4 b) { return mix(b, a, lessThan(a, b)); }
+
+void main() {
+    vec4 v[16];
+    vec4 r[16];
+    vec4 o[16];
+    for (int k = 0; k < 16; ++k) { v[k] = vec4(0.0); r[k] = vec4(0.0); o[k] = vec4(0.0); }
+)";
+        for (u32 r : inputs_read) out += std::format("    v[{}] = vs_in{};\n", r, r);
+        out += std::format(R"(    ivec2 a0 = ivec2(0);
+    int aL = 0;
+    bvec2 cc = bvec2(false);
+    int stk_final[16], stk_ret[16], stk_rep[16], stk_inc[16], stk_loop[16];
+    int sp = 0;
+    int pc = {};
+    bool running = true;
+    // Dispatcher: one case per basic block; CALL/IF/LOOP frames end at stk_final.
+    for (int guard = 0; running && guard < 65536; ++guard) {{
+        while (sp > 0 && pc == stk_final[sp - 1]) {{
+            aL += stk_inc[sp - 1];
+            if (stk_rep[sp - 1]-- == 0) {{ pc = stk_ret[sp - 1]; --sp; }}
+            else pc = stk_loop[sp - 1];
+        }}
+        switch (pc) {{
+)", s.entry);
+        out += body;
+        out += "    default: running = false; break;\n    }\n    }\n\n";
+
+        // Pack o0..o6 into the fixed varyings according to VS_OUTMAP.
+        out += "    vec4 pos = vec4(0.0, 0.0, 0.0, 1.0);\n    vec4 col = vec4(0.0);\n"
+               "    vec4 quat = vec4(0.0);\n    vec2 t0 = vec2(0.0), t1 = vec2(0.0), t2 = vec2(0.0);\n"
+               "    float t0w = 0.0;\n    vec3 vw = vec3(0.0);\n";
+        static const char* sem[0x18] = {
+            "pos.x", "pos.y", "pos.z", "pos.w", "quat.x", "quat.y", "quat.z", "quat.w",
+            "col.r", "col.g", "col.b", "col.a", "t0.x", "t0.y", "t1.x", "t1.y",
+            "t0w", nullptr, "vw.x", "vw.y", "vw.z", nullptr, "t2.x", "t2.y"};
+        for (u32 reg = 0; reg < 7 && reg < s.outmap.size(); ++reg)
+            for (u32 c = 0; c < 4; ++c) {
+                const u32 id = s.outmap[reg] >> (c * 8) & 0x1F;
+                if (id < 0x18 && sem[id]) out += std::format("    {} = o[{}].{};\n", sem[id], reg, "xyzw"[c]);
+            }
+        // PICA clip space has z in [-w, 0]; Vulkan expects [0, w].
+        out += R"(    gl_Position = vec4(pos.x, pos.y, -pos.z, pos.w);
+    primary_color = col;
+    texcoord0 = t0;
+    texcoord1 = t1;
+    texcoord2 = t2;
+    texcoord0_w = t0w;
+    normquat = quat;
+    view = vw;
+}
+)";
+        return out;
+    }
+};
+
+}  // namespace
+
+std::string generate_vertex_shader(const VsSource& src, std::string* error) {
+    std::string err;
+    Translator t{src, {}, {}};
+    std::string out = t.run(&err);
+    if (error) *error = err;
+    return out;
+}
+
+// ---------------------------------------------------------------- fragment / TEV
+
+namespace {
+
+constexpr u32 TEV_STAGE_REGS[6] = {0xC0, 0xC8, 0xD0, 0xD8, 0xF0, 0xF8};
+constexpr u32 TEV_BUFFER_INPUT = 0xE0, TEV_BUFFER_COLOR = 0xFD, ALPHA_TEST = 0x104;
+
+std::string tev_source(u32 id) {
+    switch (id) {
+    case 0x0: return "primary_color";
+    case 0x1: return "primary_fragment_color";
+    case 0x2: return "secondary_fragment_color";
+    case 0x3: return "tex_color0";
+    case 0x4: return "tex_color1";
+    case 0x5: return "tex_color2";
+    case 0x6: return "vec4(0.0)";  // shortcut: procedural texture unit
+    case 0xD: return "combiner_buffer";
+    case 0xE: return "const_color";
+    default: return "last_tex_env_out";  // 0xF previous
+    }
+}
+
+std::string color_operand(u32 op, const std::string& s) {
+    switch (op) {
+    case 0x0: return s + ".rgb";
+    case 0x1: return "(vec3(1.0) - " + s + ".rgb)";
+    case 0x2: return s + ".aaa";
+    case 0x3: return "(vec3(1.0) - " + s + ".aaa)";
+    case 0x4: return s + ".rrr";
+    case 0x5: return "(vec3(1.0) - " + s + ".rrr)";
+    case 0x8: return s + ".ggg";
+    case 0x9: return "(vec3(1.0) - " + s + ".ggg)";
+    case 0xC: return s + ".bbb";
+    case 0xD: return "(vec3(1.0) - " + s + ".bbb)";
+    default: return s + ".rgb";
+    }
+}
+
+std::string alpha_operand(u32 op, const std::string& s) {
+    static const char* comp[] = {"a", "r", "g", "b"};
+    const std::string v = s + "." + comp[(op >> 1) & 3];
+    return op & 1 ? "(1.0 - " + v + ")" : v;
+}
+
+// `T` is "vec3" or "float"; a/b/c are operand expressions.
+std::string combine(u32 op, const std::string& T, const std::string& a, const std::string& b, const std::string& c) {
+    switch (op) {
+    case 0: return a;
+    case 1: return a + " * " + b;
+    case 2: return a + " + " + b;
+    case 3: return a + " + " + b + " - " + T + "(0.5)";
+    case 4: return a + " * " + c + " + " + b + " * (" + T + "(1.0) - " + c + ")";
+    case 5: return a + " - " + b;
+    case 6: case 7: return T + "(4.0 * dot(" + a + " - vec3(0.5), " + b + " - vec3(0.5)))";
+    case 8: return a + " * " + b + " + " + c;
+    case 9: return "min(" + a + " + " + b + ", " + T + "(1.0)) * " + c;
+    default: return a;
+    }
+}
+
+}  // namespace
+
+std::string generate_fragment_shader(const std::array<u32, reg::COUNT>& regs) {
+    std::string out = R"(#version 450
+layout(location = 0) in vec4 primary_color;
+layout(location = 1) in vec2 texcoord0;
+layout(location = 2) in vec2 texcoord1;
+layout(location = 3) in vec2 texcoord2;
+layout(location = 4) in float texcoord0_w;
+layout(location = 5) in vec4 normquat;
+layout(location = 6) in vec3 view;
+layout(set = 1, binding = 0) uniform sampler2D tex0;
+layout(set = 1, binding = 1) uniform sampler2D tex1;
+layout(set = 1, binding = 2) uniform sampler2D tex2;
+layout(location = 0) out vec4 frag_color;
+
+void main() {
+    vec4 tex_color0 = texture(tex0, texcoord0);
+    vec4 tex_color1 = texture(tex1, texcoord1);
+)";
+    // TEXUNIT_CONFIG bit 13: texture 2 samples texcoord1 instead of texcoord2.
+    out += std::format("    vec4 tex_color2 = texture(tex2, {});\n", regs[0x80] >> 13 & 1 ? "texcoord1" : "texcoord2");
+    const u32 buf = regs[TEV_BUFFER_COLOR];
+    out += std::format(R"(    vec4 primary_fragment_color = vec4(0.0);
+    vec4 secondary_fragment_color = vec4(0.0);
+    vec4 combiner_buffer = vec4(0.0);
+    vec4 next_combiner_buffer = vec4({:.6f}, {:.6f}, {:.6f}, {:.6f});
+    vec4 last_tex_env_out = vec4(0.0);
+    vec4 const_color;
+)",
+                       (buf & 0xFF) / 255.0, (buf >> 8 & 0xFF) / 255.0, (buf >> 16 & 0xFF) / 255.0, (buf >> 24) / 255.0);
+
+    static const float SCALE[4] = {1.0f, 2.0f, 4.0f, 1.0f};
+    for (u32 i = 0; i < 6; ++i) {
+        const u32 base = TEV_STAGE_REGS[i];
+        const u32 srcs = regs[base], ops = regs[base + 1], comb = regs[base + 2], cst = regs[base + 3],
+                  scale = regs[base + 4];
+        const u32 color_op = comb & 0xF, alpha_op = comb >> 16 & 0xF;
+        out += std::format("    // TEV stage {}\n    {{\n", i);
+        out += std::format("    const_color = vec4({:.6f}, {:.6f}, {:.6f}, {:.6f});\n", (cst & 0xFF) / 255.0,
+                           (cst >> 8 & 0xFF) / 255.0, (cst >> 16 & 0xFF) / 255.0, (cst >> 24) / 255.0);
+        std::string ca[3], aa[3];
+        for (u32 k = 0; k < 3; ++k) {
+            ca[k] = color_operand(ops >> (4 * k) & 0xF, tev_source(srcs >> (4 * k) & 0xF));
+            aa[k] = alpha_operand(ops >> (12 + 4 * k) & 0x7, tev_source(srcs >> (16 + 4 * k) & 0xF));
+        }
+        out += std::format("    vec3 color_result = clamp(({}) * {:.1f}, 0.0, 1.0);\n",
+                           combine(color_op, "vec3", ca[0], ca[1], ca[2]), SCALE[scale & 3]);
+        if (color_op == 7)  // DOT3_RGBA writes alpha too
+            out += "    float alpha_result = color_result.r;\n";
+        else
+            out += std::format("    float alpha_result = clamp(({}) * {:.1f}, 0.0, 1.0);\n",
+                               combine(alpha_op, "float", aa[0], aa[1], aa[2]), SCALE[scale >> 16 & 3]);
+        out += "    last_tex_env_out = vec4(color_result, alpha_result);\n";
+        out += "    combiner_buffer = next_combiner_buffer;\n";
+        if (i < 4) {
+            if (regs[TEV_BUFFER_INPUT] >> (8 + i) & 1) out += "    next_combiner_buffer.rgb = last_tex_env_out.rgb;\n";
+            if (regs[TEV_BUFFER_INPUT] >> (12 + i) & 1) out += "    next_combiner_buffer.a = last_tex_env_out.a;\n";
+        }
+        out += "    }\n";
+    }
+
+    const u32 at = regs[ALPHA_TEST];
+    if (at & 1) {
+        static const char* keep[] = {"false", "true", "==", "!=", "<", "<=", ">", ">="};
+        const u32 func = at >> 4 & 7;
+        if (func == 0) out += "    discard;\n";
+        else if (func > 1)
+            out += std::format("    if (!(int(last_tex_env_out.a * 255.0) {} {})) discard;\n", keep[func], at >> 8 & 0xFF);
+    }
+    out += "    frag_color = last_tex_env_out;\n}\n";
+    return out;
+}
+
+}  // namespace gfx::pica

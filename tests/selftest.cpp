@@ -126,7 +126,8 @@ static void test_boot(const stdfs::path& data) {
     std::printf("selftest: boot frontier 0x%08X, heap %u KiB\n", frontier, heap >> 10);
 }
 
-void test_pica();  // tests/pica_test.cpp
+void test_pica();                     // tests/pica_test.cpp
+void test_shaders(const char* data);  // tests/shader_test.cpp
 
 int main(int argc, char** argv) {
     Memory mem;
@@ -136,6 +137,7 @@ int main(int argc, char** argv) {
     test_pica();
     test_loader(mem, argc > 1 ? argv[1] : "game_data");
     test_boot(argc > 1 ? argv[1] : "game_data");
+    test_shaders(argc > 1 ? argv[1] : "game_data");
     std::puts("selftest: OK");
     return 0;
 }

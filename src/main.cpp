@@ -88,8 +88,45 @@ static std::vector<u32> icon_screen(const std::filesystem::path& smdh_path) {
     return screen;
 }
 
+// Shown as a dialog too: launched from a file manager there is no terminal to read.
+// _Exit: guest threads may already be parked in the kernel (no static destructors).
+[[noreturn]] static int fatal(const std::string& msg) {
+    std::fprintf(stderr, "%s\n", msg.c_str());
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "DawnOfTermina", msg.c_str(), nullptr);
+    std::fflush(stdout);
+    std::_Exit(1);
+}
+
+static bool has_game_data(const std::filesystem::path& d) {
+    std::error_code ec;
+    return std::filesystem::exists(d / "exheader.bin", ec) && std::filesystem::exists(d / "exefs" / "code.bin", ec) &&
+           std::filesystem::exists(d / "romfs", ec);
+}
+
 int main(int argc, char** argv) {
-    const std::filesystem::path data = argc > 1 ? argv[1] : "game_data";
+    // game_data: the argument, else the working directory, else next to the executable
+    // (build/../game_data in a source checkout), so launching from a file manager works.
+    namespace fs = std::filesystem;
+    const fs::path base = SDL_GetBasePath() ? fs::path(SDL_GetBasePath()) : fs::current_path();
+    const fs::path root = fs::exists(base / ".." / "tools" / "extract_cia.py") ? (base / "..").lexically_normal() : base;
+    fs::path data = argc > 1 ? fs::path(argv[1]) : fs::path("game_data");
+    if (argc <= 1 && !has_game_data(data)) data = root / "game_data";
+    if (!has_game_data(data)) {
+        // First run: ask for the player's .cia and extract it (offering one found in ISO/).
+        if (!SDL_Init(SDL_INIT_VIDEO)) return fatal(std::string("SDL_Init: ") + SDL_GetError());
+        fs::path suggested;
+        std::error_code ec;
+        for (const fs::path& dir : {root / "ISO", root, fs::current_path() / "ISO"})
+            for (const auto& f : fs::directory_iterator(dir, ec))
+                if (suggested.empty() && f.path().extension() == ".cia") suggested = f.path();
+        const fs::path target = argc > 1 ? data : root / "game_data";
+        if (!ui::run_setup(target, root / "tools" / "extract_cia.py", suggested)) return 0;
+        data = target;
+#ifndef DOT_HAVE_RECOMP
+        return fatal("Game data extracted. This build was configured without it, so it cannot run the game yet:\n"
+                     "rebuild (cmake --build build) and start it again.");
+#endif
+    }
     // config.toml lives next to game_data/ (like saves/ and cache/); DOT_* variables override it.
     const std::filesystem::path config_file = std::filesystem::absolute(data).parent_path() / "config.toml";
     core::Config config = core::load_config(config_file);
@@ -98,9 +135,7 @@ int main(int argc, char** argv) {
     core::Memory mem;
     auto code = core::load_code(mem, data);
     if (!code || !hle::fs::MountRom(data / "romfs")) {
-        std::fprintf(stderr, "game_data not found or incomplete at '%s'. Run tools/extract_cia.py first.\n",
-                     data.string().c_str());
-        return 1;
+        return fatal("game_data not found or incomplete at '" + data.string() + "'. Run tools/extract_cia.py first.");
     }
     std::printf("loaded .text %#x+%#x .rodata %#x+%#x .data %#x+%#x .bss %#x, entry %#x\n",
                 code->text.addr, code->text.size, code->rodata.addr, code->rodata.size,
@@ -138,8 +173,7 @@ int main(int argc, char** argv) {
     }
 #endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD) || !hle::hid::Initialize()) {
-        std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
-        return 1;
+        return fatal(std::string("SDL_Init: ") + SDL_GetError());
     }
     // Initial window size: config.toml resolution, or DOT_WINDOW=<w>x<h>.
     int win_w = 800, win_h = 960;
@@ -147,17 +181,17 @@ int main(int argc, char** argv) {
     SDL_Window* window = SDL_CreateWindow("DawnOfTermina", std::max(win_w, 160), std::max(win_h, 120),
                                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
     if (!window) {
-        std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
-        return 1;
+        return fatal(std::string("SDL_CreateWindow: ") + SDL_GetError());
     }
 
     {  // scope: the Vulkan surface must be destroyed before the window
         gfx::vulkan::Context gpu;
-        if (!gpu.init(window)) return 1;
+        if (!gpu.init(window)) return fatal("Vulkan initialisation failed (see the terminal output). A GPU driver with Vulkan 1.1 is required.");
         if (!ui::init(window, gpu, config, config_file)) std::fprintf(stderr, "ui: settings menu unavailable\n");
 #ifdef DOT_HAVE_RECOMP
         gfx::vulkan::Renderer renderer(gpu);
-        if (!renderer.init(std::filesystem::absolute(data).parent_path() / "cache")) return 1;
+        if (!renderer.init(std::filesystem::absolute(data).parent_path() / "cache"))
+            return fatal("Renderer initialisation failed (see the terminal output).");
         hle::service::gsp::set_renderer(&renderer);
         ui::set_renderer(&renderer);
 #endif

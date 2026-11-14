@@ -41,4 +41,10 @@ bool handle_event(const SDL_Event& e);
 void frame();
 bool visible();
 
+// First run without game data: a window asking for the user's Majora's Mask 3D .cia, which
+// `script` (tools/extract_cia.py) extracts into `target`. `suggested` (may be empty) is a .cia
+// found nearby, offered with one click. Returns false if the player closed the window.
+bool run_setup(const std::filesystem::path& target, const std::filesystem::path& script,
+               const std::filesystem::path& suggested);
+
 }  // namespace ui

@@ -29,6 +29,8 @@ O código ARM11 original (`code.bin` do ExeFS) é traduzido automaticamente para
    python3 tools/extract_cia.py "ISO/<seu jogo>.cia" game_data/
    ```
 
+Alternativa: abra o jogo sem `game_data/`; uma tela pede o seu `.cia` (sugere um que esteja em `ISO/`) e faz a extração para `game_data/` ao lado do projeto. O executável procura `game_data/` no diretório atual e ao lado do binário (`build/../game_data`), então também abre por duplo clique.
+
 O extrator é Python puro (sem dependências externas) e exige um `.cia` **descriptografado**; ele avisa e aborta se o conteúdo estiver criptografado.
 
 ## Compilando

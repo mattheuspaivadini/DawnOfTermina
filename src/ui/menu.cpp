@@ -20,10 +20,18 @@
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_vulkan.h>
 
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "gfx/layout.h"
 #include "gfx/vulkan/context.h"
@@ -148,19 +156,7 @@ void draw_menu() {
     }
 }
 
-}  // namespace
-
-bool init(SDL_Window* window, gfx::vulkan::Context& gpu, core::Config& config, const std::filesystem::path& file) {
-    g_window = window, g_gpu = &gpu, g_cfg = &config, g_file = file;
-    // Keys: config.toml names override the defaults; the file then lists every binding.
-    for (auto& k : hle::hid::key_bindings()) {
-        if (auto it = config.keys.find(k.action); it != config.keys.end())
-            if (const SDL_Scancode sc = SDL_GetScancodeFromName(it->second.c_str()); sc != SDL_SCANCODE_UNKNOWN) k.key = sc;
-        config.keys[k.action] = SDL_GetScancodeName(SDL_Scancode(k.key));
-    }
-    apply(config, nullptr);
-    save();
-
+bool imgui_init(SDL_Window* window, gfx::vulkan::Context& gpu) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::GetIO().IniFilename = nullptr;  // no imgui.ini next to the binary
@@ -182,9 +178,174 @@ bool init(SDL_Window* window, gfx::vulkan::Context& gpu, core::Config& config, c
         std::lock_guard lk(gpu.queue_lock());
         ImGui_ImplVulkan_CreateFontsTexture();
     }
+    return true;
+}
+
+}  // namespace
+
+bool init(SDL_Window* window, gfx::vulkan::Context& gpu, core::Config& config, const std::filesystem::path& file) {
+    g_window = window, g_gpu = &gpu, g_cfg = &config, g_file = file;
+    // Keys: config.toml names override the defaults; the file then lists every binding.
+    for (auto& k : hle::hid::key_bindings()) {
+        if (auto it = config.keys.find(k.action); it != config.keys.end())
+            if (const SDL_Scancode sc = SDL_GetScancodeFromName(it->second.c_str()); sc != SDL_SCANCODE_UNKNOWN) k.key = sc;
+        config.keys[k.action] = SDL_GetScancodeName(SDL_Scancode(k.key));
+    }
+    apply(config, nullptr);
+    save();
+
+    if (!imgui_init(window, gpu)) return false;
     g_ready = true;
     if (std::getenv("DOT_MENU")) set_visible(true);  // opens at start (validating the overlay pass)
     return true;
+}
+
+namespace {
+
+// Extraction in a child process (python3 tools/extract_cia.py), its output collected for the screen.
+struct Extraction {
+    std::mutex lock;
+    std::string log;
+    std::atomic<bool> done{false};
+    bool ok = false;
+
+    void run(std::string script, std::string cia, std::string out) {
+        int fds[2];
+        if (pipe(fds) != 0) return finish(false, "cannot create a pipe\n");
+        posix_spawn_file_actions_t fa;
+        posix_spawn_file_actions_init(&fa);
+        posix_spawn_file_actions_adddup2(&fa, fds[1], 1);
+        posix_spawn_file_actions_adddup2(&fa, fds[1], 2);
+        posix_spawn_file_actions_addclose(&fa, fds[0]);
+        char* argv[] = {const_cast<char*>("python3"), const_cast<char*>("-I"), script.data(), cia.data(), out.data(), nullptr};
+        pid_t pid = 0;
+        const int err = posix_spawnp(&pid, "python3", &fa, nullptr, argv, environ);
+        posix_spawn_file_actions_destroy(&fa);
+        close(fds[1]);
+        if (err) {
+            close(fds[0]);
+            return finish(false, "python3 not found: install Python 3 to extract the game.\n");
+        }
+        char buf[256];
+        for (ssize_t n; (n = read(fds[0], buf, sizeof buf)) > 0;) {
+            std::lock_guard lk(lock);
+            log.append(buf, size_t(n));
+        }
+        close(fds[0]);
+        int status = 0;
+        waitpid(pid, &status, 0);
+        finish(WIFEXITED(status) && WEXITSTATUS(status) == 0, "");
+    }
+
+    void finish(bool success, const char* msg) {
+        {
+            std::lock_guard lk(lock);
+            log += msg;
+        }
+        ok = success, done = true;
+    }
+};
+
+}  // namespace
+
+bool run_setup(const std::filesystem::path& target, const std::filesystem::path& script,
+               const std::filesystem::path& suggested) {
+    SDL_Window* window = SDL_CreateWindow("DawnOfTermina — setup", 900, 560, SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
+    if (!window) return false;
+    bool result = false;
+    {
+        gfx::vulkan::Context gpu;
+        if (!gpu.init(window) || !imgui_init(window, gpu)) {
+            SDL_DestroyWindow(window);
+            return false;
+        }
+        const std::vector<u32> top(gfx::vulkan::TOP_W * gfx::vulkan::SCREEN_H, 0xFF000000);
+        const std::vector<u32> bottom(gfx::vulkan::BOTTOM_W * gfx::vulkan::SCREEN_H, 0xFF000000);
+        std::mutex picked_lock;
+        std::filesystem::path picked;  // set by the file dialog callback
+        auto ex = std::make_unique<Extraction>();
+        std::thread worker;
+        bool running = false, finished = false;
+        auto start = [&](const std::filesystem::path& cia) {
+            if (running) return;
+            ex = std::make_unique<Extraction>();
+            running = true;
+            worker = std::thread([e = ex.get(), script, cia, target] { e->run(script.string(), cia.string(), target.string()); });
+        };
+        if (const char* cia = std::getenv("DOT_SETUP_CIA")) start(cia);  // unattended (testing)
+        for (bool open = true; open && !finished;) {
+            for (SDL_Event e; SDL_PollEvent(&e);) {
+                ImGui_ImplSDL3_ProcessEvent(&e);
+                if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) open = running;  // not mid-extraction
+            }
+            {
+                std::lock_guard lk(picked_lock);
+                if (!picked.empty()) start(picked), picked.clear();
+            }
+            if (running && ex->done) {
+                worker.join();
+                running = false;
+                finished = ex->ok;
+            }
+            ImGui_ImplVulkan_NewFrame();
+            ImGui_ImplSDL3_NewFrame();
+            ImGui::NewFrame();
+            ImGui::SetNextWindowPos(ImVec2(0, 0));
+            ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
+            ImGui::Begin("setup", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove);
+            ImGui::TextUnformatted("DawnOfTermina");
+            ImGui::Separator();
+            ImGui::TextWrapped("The Majora's Mask 3D game data was not found. Select your own copy of the game "
+                               "as a decrypted .cia file; it will be extracted to:");
+            ImGui::TextDisabled("%s", target.string().c_str());
+            ImGui::TextWrapped("This is done once (about 650 MB, a minute or two). Nothing is downloaded.");
+            ImGui::Spacing();
+            ImGui::BeginDisabled(running);
+            if (!suggested.empty() && ImGui::Button(("Use " + suggested.filename().string()).c_str())) start(suggested);
+            if (ImGui::Button("Select .cia file...")) {
+                static const SDL_DialogFileFilter filter{"Nintendo 3DS CIA (*.cia)", "cia"};
+                SDL_ShowOpenFileDialog(
+                    [](void* user, const char* const* files, int) {
+                        auto* ctx = static_cast<std::pair<std::mutex*, std::filesystem::path*>*>(user);
+                        if (files && files[0]) {
+                            std::lock_guard lk(*ctx->first);
+                            *ctx->second = files[0];
+                        }
+                    },
+                    new std::pair<std::mutex*, std::filesystem::path*>(&picked_lock, &picked),  // shortcut: leaked once per click
+                    window, &filter, 1, nullptr, false);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Quit")) open = false;
+            ImGui::EndDisabled();
+            if (running) ImGui::TextUnformatted("Extracting...");
+            else if (ex->done && !ex->ok) ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "Extraction failed: see the log below.");
+            {
+                std::lock_guard lk(ex->lock);
+                ImGui::BeginChild("log", ImVec2(0, 0), ImGuiChildFlags_Borders);
+                ImGui::TextUnformatted(ex->log.c_str());
+                if (running) ImGui::SetScrollHereY(1.0f);
+                ImGui::EndChild();
+            }
+            ImGui::End();
+            ImGui::Render();
+            gpu.set_overlay([](VkCommandBuffer cmd) { ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd); });
+            gfx::g_single_screen = true, gfx::g_show_bottom = false;
+            if (!gpu.present({gfx::vulkan::TOP_W, gfx::vulkan::SCREEN_H, top.data()},
+                             {gfx::vulkan::BOTTOM_W, gfx::vulkan::SCREEN_H, bottom.data()}))
+                break;
+        }
+        if (worker.joinable()) worker.join();
+        result = finished;
+        gpu.set_overlay(nullptr);
+        vkDeviceWaitIdle(gpu.device());
+        ImGui_ImplVulkan_Shutdown();
+        ImGui_ImplSDL3_Shutdown();
+        ImGui::DestroyContext();
+    }
+    gfx::g_show_bottom = true;
+    SDL_DestroyWindow(window);
+    return result;
 }
 
 void set_renderer(gfx::vulkan::Renderer* renderer) { g_renderer = renderer; }

@@ -17,18 +17,16 @@ O código ARM11 original (`code.bin` do ExeFS) é analisado no Hopper Disassembl
 | Ninja ou Make | — | build |
 | Vulkan SDK (headers, loader, `glslc`) | 1.3 | renderização (Etapa 4) |
 | Python | 3.10 | scripts em `tools/` |
-| `ctrtool` e/ou `3dstool` | — | extração do `.cia` (Etapa 2) |
 
 ## Preparando os dados do jogo
 
 1. Coloque sua cópia do jogo em qualquer pasta fora do controle de versão (ex.: `ISO/` ou `input/`, ambas ignoradas pelo Git).
-2. Extraia ExeFS, `exheader.bin`, `code.bin` (descomprimido) e RomFS para `game_data/`:
+2. Extraia ExeFS, `exheader.bin`, `code.bin` (descomprimido), `code.elf` (para o Hopper) e RomFS para `game_data/`:
    ```sh
    python3 tools/extract_cia.py "ISO/<seu jogo>.cia" game_data/
    ```
-   *(script disponível a partir da Etapa 2)*
 
-O `.cia` precisa estar **descriptografado** para que `ctrtool`/`3dstool` consigam extraí-lo.
+O extrator é Python puro (sem dependências externas) e exige um `.cia` **descriptografado**; ele avisa e aborta se o conteúdo estiver criptografado.
 
 ## Compilando
 
@@ -56,7 +54,7 @@ Cada função transcrita mantém o endereço virtual original em comentário (`/
 | Etapa | Descrição | Status |
 |---|---|---|
 | 1 | Bootstrap do repositório, licença, documentação | ✅ |
-| 2 | Pipeline de extração do `.cia` e preparação do binário para o Hopper | ⏳ |
+| 2 | Pipeline de extração do `.cia` e preparação do binário para o Hopper | ✅ |
 | 3 | Runtime, memória e HLE do Horizon OS | ⏳ |
 | 4 | Backend Vulkan e tradutor PICA200 | ⏳ |
 | 5 | Entry point (`_start` / `nnMain`) | ⏳ |

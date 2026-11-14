@@ -1,0 +1,4 @@
+# address,name,notes — DawnOfTermina symbol map for code.elf (re-apply in Hopper via REA set_addresses_names)
+0x00100000,_start,entry point; calls init chain then svcExitProcess
+0x00100024,__clear_bss,zeroes [0x006b0b64; 0x007ce49c)
+0x00103ec0,svcExitProcess,svc 0x03

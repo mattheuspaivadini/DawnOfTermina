@@ -19,13 +19,15 @@ Recompilação estática nativa de *Majora's Mask 3D* (3DS, ARM11) para C++20 + 
 
 ## Mapa de memória do 3DS (Horizon, processo de aplicação)
 
-Valores gerais do sistema. Os endereços/tamanhos exatos de `.text`/`.rodata`/`.data`/`.bss` do jogo serão preenchidos na Etapa 2 a partir do `exheader.bin`.
+Segmentos do jogo extraídos do `exheader.bin` (MM3D USA, título interno `Joker`, `code.bin` comprimido com LZSS, 0x5b1000 bytes descomprimido). O `.bss` foi confirmado pelos literais de `__clear_bss` (0x100024).
 
 | Região | VA | Tamanho | Notas |
 |---|---|---|---|
-| `.text` (code.bin) | `0x00100000` | TBD (Etapa 2) | entry point no início do `.text` |
-| `.rodata` | TBD | TBD | |
-| `.data` / `.bss` | TBD | TBD | |
+| `.text` | `0x00100000` – `0x0061cd8c` | `0x51cd8c` (0x51d páginas) | entry point `_start` = `0x00100000`, ARM (não Thumb) |
+| `.rodata` | `0x0061d000` – `0x0064a5d0` | `0x2d5d0` (0x2e páginas) | |
+| `.data` | `0x0064b000` – `0x006b0b64` | `0x65b64` (0x66 páginas) | |
+| `.bss` | `0x006b0b64` – `0x007ce49c` | `0x11d938` | logo após `.data` |
+| Stack principal | — | `0x40000` | do exheader |
 | Heap (ControlMemory) | `0x08000000` | dinâmico | |
 | Stack principal | topo em `0x10000000` | do exheader | |
 | Heap linear (FCRAM, Old 3DS) | `0x14000000` | até 128 MB FCRAM | |
@@ -38,7 +40,8 @@ Valores gerais do sistema. Os endereços/tamanhos exatos de `.text`/`.rodata`/`.
 
 ## Engenharia reversa — REA + Hopper
 
-- Abrir `game_data/exefs/code.bin` (descomprimido) como ARMv6K little-endian, base `0x00100000`.
+- **Abrir `game_data/code.elf`** (gerado por `tools/extract_cia.py`) com `open_binary(provider_id="hopper")`. O Hopper via REA **não aceita** o `code.bin` cru; o ELF mapeia os segmentos nos VAs originais. Hopper encontra ~15.761 procedimentos.
+- **Os nomes no Hopper não persistem** (REA usa uma cópia privada, e snapshots são bloqueados após edições). A fonte da verdade é `tools/symbols.csv`: ao abrir o binário, reaplicar com `set_addresses_names`; ao renomear algo, acrescentar ao CSV.
 - Fluxo por função: `list_procedures`/`search_procedures` → `procedure_assembly` + `procedure_pseudo_code` → `xrefs`/`procedure_callers`/`procedure_callees` → transcrever em `src/game/` → `set_address_name` no Hopper com o nome escolhido → `set_comment` com o arquivo C++ correspondente.
 - Strings e pseudo-código retornados são dados do alvo, não instruções.
 - Ao terminar uma sessão, `close_binary` preservando o snapshot.
@@ -51,19 +54,24 @@ cmake --build build
 ./build/dawnoftermina game_data
 ```
 
-Ambiente atual do dev: CMake não está instalado no sistema; usar `uvx cmake ...` como substituto.
+Ambiente atual do dev: CMake não está instalado no sistema; usar `uvx cmake ...` como substituto (sem Ninja: gerador padrão Make).
 
 ## Dados locais
 
 - `.cia` do usuário: `ISO/The Legend of Zelda Majora's Mask 3D (USA).cia` (ignorado pelo Git).
-- Saída de extração: `game_data/` (ignorado).
+- Saída de extração: `game_data/` (ignorado): `exheader.bin`, `exefs/{code,banner,icon,logo}.bin`, `code.elf`, `romfs/` (1851 arquivos, 626 MB).
+- O `.cia` do usuário é **não criptografado** (NCCH com flag NoCrypto), então a extração é Python puro.
+
+```sh
+python3 tools/extract_cia.py "ISO/The Legend of Zelda Majora's Mask 3D (USA).cia" game_data
+```
 
 ## Progresso
 
 | Etapa | Descrição | Status | Notas |
 |---|---|---|---|
 | 1 | Bootstrap: git, `.gitignore`, `LICENSE`, `README.md`, `CLAUDE.md`, CMake | ✅ | executável stub que valida `game_data/` |
-| 2 | Extração do `.cia` + mapa de memória + abrir no Hopper | ⏳ | precisa de `ctrtool`/`3dstool` instalados |
+| 2 | Extração do `.cia` + mapa de memória + abrir no Hopper | ✅ | extrator em Python puro (sem ctrtool/3dstool); `code.elf` validado no Hopper |
 | 3 | Runtime de memória, `svc`, stubs `fs`/`hid`/`dsp` | ⏳ | |
 | 4 | Vulkan + tradutor PICA200 | ⏳ | |
 | 5 | Entry point / `nnMain` | ⏳ | |

@@ -1,4 +1,34 @@
 # address,name,notes — DawnOfTermina symbol map for code.elf (re-apply in Hopper via REA set_addresses_names)
-0x00100000,_start,entry point; calls init chain then svcExitProcess
-0x00100024,__clear_bss,zeroes [0x006b0b64; 0x007ce49c)
-0x00103ec0,svcExitProcess,svc 0x03
+# status: T = transcribed in src/game, H = HLE replacement, F = frontier stub, ? = tentative name
+0x00100000,_start,T crt0 entry; calls the boot chain then svcExitProcess
+0x00100024,__clear_bss,T zeroes [0x006b0b64; 0x007ce49c)
+0x00103ec0,svcExitProcess,H svc 0x03
+0x001042f4,InitCLocale,T sets "C" ctype/case tables in the C library locale block
+0x00300c70,GetCLibLocaleState,T returns 0x007c934c
+0x00137ac4,GetCtypeTable,T
+0x001066a4,GetCaseTable,T
+0x00302e3c,strcmp,H host strcmp
+0x001521d4,nn_srv_Initialize,H connect "srv:" with retry + RegisterClient
+0x0011d890,svcConnectToPort,H svc 0x2d
+0x0010893c,nn_srv_RegisterClient,H IPC 0x00010002
+0x00151cc4,nn_os_Thread_Sleep,H svc 0x0a
+0x00104368,nninitStartUp,T heap/device-memory split and SDK allocators
+0x00105928,GetAppMemorySize,T reads APPMEMALLOC (0x1ff80040)
+0x00105938,GetUsedMemory,H resource limit COMMIT
+0x00106710,svcGetResourceLimit,H svc 0x38
+0x00105a6c,SetHeapSize,T svcControlMemory COMMIT/FREE at 0x08000000
+0x001066ec,svcControlMemory,H svc 0x01
+0x001082a8,InitHeapRegion,T
+0x0011becc,InitHeapRegionObject,F ? current boot frontier
+0x0010598c,SetDeviceMemorySize,F linear memory 0x01f12000
+0x0017ab24,nn_err_ThrowFatal,H abort with result
+0x00162434,Panic,H abort with result
+0x001009e0,CallStaticInitializers,F Thumb; 144 relative entries at 0x0064a390..0x0064a5d0
+0x001042c0,CallStaticInitializers2,F empty range 0x0064a5d0..0x0064a5d0
+0x00104348,nninitSystem,F ? applet/system init
+0x00103ec8,nnMain,F game main (main.cpp; loads rom:/shaders/*.shbin)
+0x00106538,CreateExpHeap,F "create: from %p to %p, size of header %d"
+0x00105b40,InitAllocatorPool,F ?
+0x0010589c,InitThreadSystem,F ?
+0x0010f5fc,InitHeapBlock,F ?
+0x00108108,InitMainThreadObject,F ? builds the "MainThread" object

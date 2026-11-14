@@ -23,12 +23,15 @@
 #include <vector>
 
 #include "core/loader.h"
+#include "game/crt0.h"
+#include "game/guest.h"
 #include "gfx/pica/texture.h"
 #include "gfx/vulkan/context.h"
 #include "hle/dsp.h"
 #include "hle/fs.h"
 #include "hle/hid.h"
 #include "hle/srv.h"
+#include "hle/svc.h"
 
 // Bottom screen placeholder until the game renders: the title's own SMDH icon
 // (48x48 tiled RGB565 at 0x24C0), scaled 3x and centred. Exercises the PICA texture
@@ -62,8 +65,16 @@ int main(int argc, char** argv) {
                 code->text.addr, code->text.size, code->rodata.addr, code->rodata.size,
                 code->data.addr, code->data.size, code->bss_size, code->text.addr);
 
-    hle::srv::Initialize();
+    hle::svc::InitProcess(mem, code->image_bytes());
     hle::dsp::Initialize();
+
+    // Run the transcribed boot until it reaches code that is not transcribed yet.
+    game::bind(mem);
+    try {
+        game::crt0::_start();
+    } catch (const game::Frontier& f) {
+        std::printf("boot: reached the transcription frontier: %s\n", f.what());
+    }
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD) || !hle::hid::Initialize()) {
         std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;

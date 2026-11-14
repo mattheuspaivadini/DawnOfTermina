@@ -60,7 +60,7 @@ Cada função transcrita mantém o endereço virtual original em comentário (`/
 | 2 | Pipeline de extração do `.cia` e preparação do binário para o Hopper | ✅ |
 | 3 | Runtime, memória e HLE do Horizon OS | ✅ |
 | 4 | Backend Vulkan e tradutor PICA200 | 🟡 4a concluída (apresentação, texturas, command lists); 4b em aberto (GSP, shaders, draws) |
-| 5 | Entry point (`_start` / `nnMain`) | ⏳ |
+| 5 | Entry point (`_start` / `nnMain`) | ✅ boot do crt0 transcrito até a fronteira atual |
 | 6+ | Subsistemas do jogo (cenas, loop, áudio, colisão, atores, HUD) | ⏳ |
 
 ## Licença

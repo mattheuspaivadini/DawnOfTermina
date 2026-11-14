@@ -35,6 +35,13 @@ constexpr Result ERR_OUT_OF_MEMORY = 0xD86007F3;
 constexpr Result ERR_INVALID_COMBINATION = 0xE0E01BEE;
 constexpr Result ERR_INVALID_ADDRESS = 0xE0E01BF5;
 
+// Kernel-side process setup: fills config memory (memory-region sizes for the Old 3DS
+// 64 MB application mode) and accounts the loaded image (code + data + bss + stack)
+// as already-committed memory.
+void InitProcess(core::Memory& mem, u32 image_bytes);
+// What svcGetResourceLimitCurrentValues(COMMIT) reports for the process.
+u32 CommittedMemory();
+
 // svc 0x01
 Result ControlMemory(core::Memory& mem, u32* out_addr, u32 addr0, u32 addr1, u32 size, u32 op,
                      u32 perm);

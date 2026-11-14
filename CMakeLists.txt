@@ -20,6 +20,8 @@ add_library(dot_runtime STATIC
     src/gfx/pica/texture.cpp
     src/gfx/pica/command_processor.cpp
     src/gfx/vulkan/context.cpp
+    src/game/guest.cpp
+    src/game/crt0.cpp
 )
 target_include_directories(dot_runtime PUBLIC src)
 target_link_libraries(dot_runtime PUBLIC SDL3::SDL3 Vulkan::Vulkan)

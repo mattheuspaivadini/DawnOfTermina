@@ -31,6 +31,12 @@ struct Segment {
 struct CodeSet {
     Segment text, rodata, data;
     u32 bss_size, stack_size;
+
+    // Memory the kernel charges to the process for the loaded image.
+    u32 image_bytes() const {
+        auto pages = [](u32 n) { return (n + Memory::PAGE - 1) & ~(Memory::PAGE - 1); };
+        return (text.pages + rodata.pages) * Memory::PAGE + pages(data.size + bss_size) + pages(stack_size);
+    }
 };
 
 // Reads game_data/exheader.bin + exefs/code.bin, maps .text/.rodata (read-only),

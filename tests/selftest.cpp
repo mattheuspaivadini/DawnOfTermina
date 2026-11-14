@@ -24,6 +24,8 @@
 #include <fstream>
 
 #include "core/loader.h"
+#include "game/crt0.h"
+#include "game/guest.h"
 #include "hle/fs.h"
 #include "hle/hid.h"
 #include "hle/svc.h"
@@ -97,6 +99,33 @@ static void test_loader(Memory& mem, const stdfs::path& data) {
     assert(mem.read<u32>(cs->data.addr + cs->data.size) == 0);  // .bss starts zeroed
 }
 
+// Runs the transcribed boot on a fresh address space and checks how far it gets.
+// Update the expected frontier whenever the boot advances.
+static void test_boot(const stdfs::path& data) {
+    if (!stdfs::exists(data / "exefs" / "code.bin")) return;
+    Memory mem;
+    auto cs = core::load_code(mem, data);
+    assert(cs);
+    hle::svc::InitProcess(mem, cs->image_bytes());
+    game::bind(mem);
+    u32 frontier = 0;
+    try {
+        game::crt0::_start();
+    } catch (const game::Frontier& f) {
+        frontier = f.va;
+    }
+    namespace va = game::crt0::va;
+    assert(frontier == 0x0011BECC);
+    assert(game::r32(va::CLIB_LOCALE_STATE + 4) == va::CTYPE_TABLE_C + 1);
+    assert(game::r32(va::CLIB_LOCALE_STATE + 0xC) == va::CASE_TABLE_C);
+    assert(game::r32(va::SRV_REFCOUNT) == 1);
+    const u32 heap = game::r32(va::HEAP_SIZE);
+    assert(heap > (16u << 20) && heap % Memory::PAGE == 0);
+    assert(heap + cs->image_bytes() + game::crt0::DEVICE_MEMORY_SIZE <= 0x04000000);
+    game::w32(Memory::HEAP_BASE + heap - 4, 1);  // whole heap is mapped
+    std::printf("selftest: boot frontier 0x%08X, heap %u KiB\n", frontier, heap >> 10);
+}
+
 void test_pica();  // tests/pica_test.cpp
 
 int main(int argc, char** argv) {
@@ -106,6 +135,7 @@ int main(int argc, char** argv) {
     test_hid();
     test_pica();
     test_loader(mem, argc > 1 ? argv[1] : "game_data");
+    test_boot(argc > 1 ? argv[1] : "game_data");
     std::puts("selftest: OK");
     return 0;
 }

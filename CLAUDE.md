@@ -38,6 +38,19 @@ Recompilação estática nativa de *Majora's Mask 3D* (3DS, ARM11) para C++20 + 
 - **`gfx::pica::CommandProcessor`** (`src/gfx/pica/command_processor.*`): parser de command lists (`[valor][cabeçalho: id 0-15, máscara de bytes 16-19, extras 20-30, consecutivo 31]`, padding de 8 bytes), banco de 0x300 registradores, uploads do vertex shader (código 0x2CB/0x2CC, swizzle 0x2D5/0x2D6, uniforms float f24/f32 0x2C0/0x2C1 com auto-incremento, int 0x2B1, bool 0x2B0), gatilhos de draw 0x22E/0x22F via `on_draw`.
 - **Falta (4b):** GSP HLE (`gsp::Gpu`: framebuffers, `DisplayTransfer`, `MemoryFill`, submissão de command lists, conversão PA↔VA: VRAM PA `0x18000000`↔VA `0x1F000000`, FCRAM PA `0x20000000`↔heap linear VA `0x14000000`); leitura de vertex arrays/índices; tradutor PICA VS → GLSL → SPIR-V (glslang, disponível em `/usr/lib/libglslang.so`); TEV 6 estágios → fragment shader; estado de blend/depth/stencil/cull; render passes/pipelines com cache; render targets na VRAM; geometry shader e atributos fixos (0x232).
 
+## Código do jogo (Etapa 5+)
+
+- **`src/game/guest.h`**: `game::bind(mem)` + acessores `r8/r16/r32/w8/w16/w32/cstr(va)`. Dados do jogo ficam nos VAs originais; funções transcritas recebem/retornam ponteiros do guest como `u32`.
+- **Fronteira de transcrição:** função ainda não transcrita = stub de uma linha `{ untranscribed(0xVA); }`, que lança `game::Frontier`. O `main` e o self-test rodam `crt0::_start()` até a fronteira. **Fronteira atual: `0x0011BECC` (`InitHeapRegionObject`)**, dentro de `nninitStartUp` → `SetHeapSize` → `InitHeapRegion`. Ao avançar, atualizar o valor esperado em `tests/selftest.cpp::test_boot`.
+- **SDK vs. jogo:** funções do CTR-SDK (srv, svc wrappers, err/panic) viram **HLE** (comentário `HLE replacement`, chamando `src/hle/`); código do jogo é **transcrito**. Classificação de cada símbolo em `tools/symbols.csv` (T/H/F/?).
+- **Cadeia de boot** (`src/game/crt0.cpp`): `_start` → `__clear_bss` → `InitCLocale` → `nn_srv_Initialize` (H) → `nninitStartUp` (heap = APPMEMALLOC − commit − 0x1F12000 de device memory, ≈ 26 MB) → `CallStaticInitializers` (Thumb, 144 construtores em `.init_array` com offsets relativos) → `CallStaticInitializers2` → `nninitSystem` → `nnMain` (`0x103EC8`, carrega `rom:/shaders/GzwShader.shbin` e `LayoutShader.shbin`) → `svcExitProcess`.
+- `hle::svc::InitProcess` preenche a config memory (APPMEMALLOC 64 MB, SYSMEMALLOC, BASEMEMALLOC) e contabiliza a imagem carregada como memória já reservada.
+- **Escala:** o Hopper encontra 15.761 procedimentos; cada função do SDK abre um leque de outras (mutexes, threads, `operator new`, printf). Ver a seção "Decisão pendente" abaixo.
+
+## Decisão pendente: transcrição manual × recompilador automático
+
+Transcrever à mão toda a cadeia de boot até o primeiro frame significa centenas a milhares de funções. Projetos de static recompilation (N64Recomp, XenonRecomp) usam um **tradutor automático ARM→C++** para todo o binário (cada função vira C++ operando sobre um contexto de registradores + memória do guest), com **overrides HLE** para SDK/svc e **transcrição limpa manual** só onde vale (subsistemas do jogo, hot paths). A infraestrutura atual (fronteira, `guest.h`, HLE) é compatível com os dois caminhos. A decisão é do usuário.
+
 ## Mapa de memória do 3DS (Horizon, processo de aplicação)
 
 Segmentos do jogo extraídos do `exheader.bin` (MM3D USA, título interno `Joker`, `code.bin` comprimido com LZSS, 0x5b1000 bytes descomprimido). O `.bss` foi confirmado pelos literais de `__clear_bss` (0x100024).
@@ -98,5 +111,5 @@ python3 tools/extract_cia.py "ISO/The Legend of Zelda Majora's Mask 3D (USA).cia
 | 2 | Extração do `.cia` + mapa de memória + abrir no Hopper | ✅ | extrator em Python puro (sem ctrtool/3dstool); `code.elf` validado no Hopper |
 | 3 | Runtime de memória, `svc`, stubs `fs`/`hid`/`dsp` | ✅ | HLE no nível do SDK, sem IPC; `tests/selftest.cpp` via ctest |
 | 4 | Vulkan + tradutor PICA200 | 🟡 | **4a ✅** contexto Vulkan + apresentação das 2 telas, decodificador de texturas, command processor. **4b ⏳** GSP, shaders VS/TEV, pipelines de draw |
-| 5 | Entry point / `nnMain` | ⏳ | |
+| 5 | Entry point / `nnMain` | ✅ | crt0 transcrito até a fronteira `0x0011BECC`; srv/svc/err em HLE; 29 símbolos nomeados |
 | 6+ | Subsistemas do jogo | ⏳ | |

@@ -30,6 +30,16 @@ using core::Memory;
 static u32 linear_next = Memory::LINEAR_BASE;
 static u32 committed = 0;
 
+void InitProcess(Memory& mem, u32 image_bytes) {
+    mem.write<u32>(Memory::CONFIG_MEM + 0x40, 0x04000000);  // APPMEMALLOC
+    mem.write<u32>(Memory::CONFIG_MEM + 0x44, 0x02C00000);  // SYSMEMALLOC
+    mem.write<u32>(Memory::CONFIG_MEM + 0x48, 0x01400000);  // BASEMEMALLOC
+    committed = image_bytes;
+    linear_next = Memory::LINEAR_BASE;
+}
+
+u32 CommittedMemory() { return committed; }
+
 Result ControlMemory(Memory& mem, u32* out_addr, u32 addr0, u32 /*addr1*/, u32 size, u32 op,
                      u32 perm) {
     if (size % Memory::PAGE) return ERR_INVALID_ADDRESS;

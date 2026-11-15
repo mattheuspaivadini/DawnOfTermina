@@ -61,9 +61,16 @@ add_library(dot_runtime STATIC
     src/hle/service/dsp.cpp
     src/recomp/hooks.cpp
     src/recomp/dekui.cpp
+    src/recomp/dekui_settings.cpp
+    ${CMAKE_BINARY_DIR}/dekui_presentation.cpp
     src/recomp/runtime.cpp
     src/recomp/svc.cpp
 )
+# DekUI's default presentation.json, embedded (src/recomp/dekui_settings.cpp).
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS resources/dekui/presentation.json)
+file(READ resources/dekui/presentation.json DOT_DEKUI_PRESENTATION)
+file(CONFIGURE OUTPUT ${CMAKE_BINARY_DIR}/dekui_presentation.cpp @ONLY CONTENT
+    "extern const char* const kDekuiPresentation;\nconst char* const kDekuiPresentation = R\"json(@DOT_DEKUI_PRESENTATION@)json\";\n")
 target_include_directories(dot_runtime PUBLIC src)
 target_include_directories(dot_runtime SYSTEM PRIVATE src/dekui)  # DekUI's headers, verbatim (GPL-2.0-or-later)
 target_link_libraries(dot_runtime PUBLIC SDL3::SDL3 Vulkan::Vulkan
@@ -117,6 +124,7 @@ enable_testing()
 add_executable(dot_selftest tests/selftest.cpp tests/pica_test.cpp tests/shader_test.cpp
     tests/recomp_test.cpp tests/audio_test.cpp)
 target_link_libraries(dot_selftest PRIVATE dot_runtime)
+target_include_directories(dot_selftest SYSTEM PRIVATE src/dekui)
 add_test(NAME selftest COMMAND dot_selftest ${CMAKE_SOURCE_DIR}/game_data)
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)

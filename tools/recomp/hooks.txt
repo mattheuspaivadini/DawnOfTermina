@@ -82,21 +82,97 @@
 0x0018d570 fov_projection insn  # vldr s0, [r4, #0x18]: camera FOV when building the projection (DekUI)
 0x0018d584 fov_projection insn  # same, second branch of the function
 0x00120648 pause_capture_sync insn  # add r0, r7, r8, lsl #2: the CPU reads the top framebuffer for the pause backdrop
-# DekUI single-screen inventory (src/recomp/dekui.cpp; PCs from DekUI's NativeInventory,
-# ItemPreview and InventoryNavigation, verified against this code.bin by CodeMatches at runtime).
-0x0059e3e8 dekui_capture_page insn    # mov r4, r0: Items/Masks page
-0x005c250c dekui_enter_page insn      # mov r4, r0: Items/Masks page, icon array built (r1 controller)
+# DekUI's single-screen interface (src/recomp/dekui.cpp): the instructions DekUI swaps for SVCs
+# (MemoryReadCode chain of its arm_dynarmic.cpp), checked by each module's CodeMatches at runtime;
+# tools/dekui_coverage.py lists what is still missing. Targets: local labels the hook may continue
+# at (the next instruction after a call it makes, jumps); `patch` = DekUI's non-SVC substitutions.
+0x0059e3e8 dekui_capture_page insn    # mov r4, r0: Items/Masks page (NativeInventory)
+0x00126814 dekui_layout_pass insn     # mov r4, r0: draw one screen's layout queue (r1 = screen)
+0x001262f0 dekui_layout_begin insn    # add r2, r4, #8: before drawing layout r4
+0x001262fc dekui_layout_end insn      # str r0, [r6]: after drawing it
+0x005c250c dekui_enter_page insn      # mov r4, r0: Items/Masks page, icon array built (ItemPreview)
 0x005c27dc dekui_leave_page insn      # mov r4, r0: Items/Masks page leaves
 0x00111c6c dekui_model_frame insn     # mov r4, r0: menu item model frame
 0x001122e4 dekui_model_begin insn     # mov r1, r6: before the model matrix (r6) is used
 0x001122ec dekui_model_end insn       # nop: after it
-0x00161c9c dekui_dialogue_begin insn  # add r0, r4, #8: MessageWindow r4 about to be posed
-0x00161ca4 dekui_dialogue_end insn    # add sp, sp, #8: after
 0x005a6b44 dekui_capture_gear insn    # mov r4, r0: Gear page
 0x005a5fc8 dekui_close_gear insn      # mov r5, r0: Gear page closes
-0x00126814 dekui_layout_pass insn     # mov r4, r0: draw one screen's layout queue (r1 = screen)
-0x001262f0 dekui_layout_begin insn    # add r2, r4, #8: before drawing layout r4
-0x001262fc dekui_layout_end insn      # str r0, [r6]: after drawing it
-0x005a0e88 dekui_nav_vertical insn 0x005a0eb0    # ldrb r1, [r4, #0x19]
+0x00161c9c dekui_dialogue_begin insn  # add r0, r4, #8: MessageWindow r4 about to be posed (DialogueScale)
+0x00161ca4 dekui_dialogue_end insn    # add sp, sp, #8: after
+0x005a0e88 dekui_nav_vertical insn 0x005a0eb0    # ldrb r1, [r4, #0x19] (InventoryNavigation)
 0x005a1498 dekui_nav_horizontal insn 0x005a14c0  # ldrb r1, [r4, #0x18]
 0x005a56c0 dekui_nav_gear insn 0x005a56e0 0x005a574c  # orr r2, r2, r12
+0x00596c24 dekui_map_0 insn           # mov r4, r0: Map page (DungeonMap)
+0x00596cb8 dekui_map_1 insn 0x00596cbc  # bleq: draw the map
+0x00596cbc dekui_map_2 insn           # ldrb r0, [r4, #0x74c]: after it
+0x00594480 dekui_map_3 insn           # ldrbne r0, [r6, #0xc]: A on the map
+0x00596cec dekui_map_4 insn 0x00596cf0 0x00596ff4  # ldr r0, [r4, #0x1c]: world map step
+0x005944d4 dekui_map_5 insn 0x005944d8  # bl SetZoom
+0x00597604 dekui_map_6 insn           # moveq r0, #1: zoom on entry
+0x00594c28 dekui_map_7 insn 0x00594c2c 0x00594b68  # add r0, r5, #0x35c: overview cursor
+0x005a6194 dekui_backdrop_0 insn      # strh r6, [r1, r7]: pause flags (MenuBackdrop)
+0x0059930c dekui_backdrop_1 insn      # strh r0, [r1, r5]
+0x00599350 dekui_backdrop_2 insn      # strh r0, [r1, r5]
+0x005970b0 dekui_backdrop_4 insn 0x005970b4 0x005970b8  # mov r4, r0: Map closes
+0x005a6a1c dekui_backdrop_5 insn 0x005a6a20  # bl: Gear image import
+0x005a5ff8 dekui_backdrop_6 insn 0x005a5ff8 0x005a5ffc 0x005a6000  # ldr r0, [r4, #0x100]: Gear photo
+0x0010fd58 dekui_menu_memory_0 insn 0x0010fd5c  # blx r2: open a page (MenuMemory)
+0x0010fd7c dekui_menu_memory_1 insn   # strb r0, [r4, #0x10]
+0x005a61a0 dekui_menu_memory_2 insn   # strb r6, [r0, #0x186]
+0x00104dd0 dekui_page_switch_0 insn   # mov r4, r0: menu context tick (MenuPageSwitch)
+0x0010fda4 dekui_page_switch_1 insn 0x0010fda8  # blx r2
+0x00161aec dekui_page_switch_2 insn   # mov r4, r0: layout step
+0x005c27b8 dekui_page_switch_3 insn 0x005c27b8  # b: Items/Masks capture release (tail call)
+0x005c2468 dekui_page_switch_4 insn 0x005c246c  # blne
+0x005a5ff4 dekui_page_switch_5 insn 0x005a5ff8 0x005a6000  # bl
+0x005a5ef0 dekui_page_switch_6 insn   # vldr s1: Gear backdrop alpha
+0x0059730c dekui_page_switch_7 insn 0x00597310  # bl: Map close sound
+0x0013921c dekui_menu_sound insn      # strbls r0, [r4] (MenuSound)
+0x005bc790 dekui_present_intro insn 0x005bc794  # bl: "give an item" intro (NativeItemPresent)
+0x00188de0 dekui_photo_0 insn         # ldr r3, [sp, #4] (PhotoCapture)
+0x00188fb0 dekui_photo_1 insn         # ldr r0, [sp, #0xc]
+0x00609fbc dekui_photo_2 insn         # add r2, r4, #0xc
+0x001b6d38 dekui_photo_3 insn         # mov r5, r1
+0x00141d88 dekui_pause_1 insn         # add r12, r0, #0x1c (PauseCapture)
+0x00198868 dekui_pause_2 insn         # mov r4, r0
+0x005eda9c dekui_startup_enter insn   # mov r5, r0: title (NativeStartup)
+0x005edad8 dekui_startup_matrix insn  # ldr r0, [r5, #0xc]
+0x005abbfc dekui_schedule_enter insn  # mov r4, r0: notebook schedule (ScheduleRows)
+0x005b24c4 dekui_schedule_stop insn   # mov r2, #0
+0x005b2618 dekui_schedule_stop insn   # mov r2, #0
+0x005abc18 patch 0xe2416001           # begin = first - one buffer
+0x005abc20 patch 0xe2817007           # exclusive end = first + seven
+0x005abc48 patch 0xe3580001           # slot one remains attached when stopped
+0x005b25f8 patch 0xe3520006           # scroll at last visible row
+0x005b2624 patch 0xe2400005           # pending first = selected - five
+0x005aabbc patch 0xe2800007           # alarm-mode down arrow
+0x005af230 patch 0xe2800007           # ordinary down arrow
+0x005ab324 dekui_notebook_rows_enter insn  # mov r4, r0 (NotebookRows)
+0x005ab850 dekui_notebook_rows_leave insn  # mov r0, r4
+0x005b36f4 dekui_notebook_sync insn   # mov r4, r0
+0x005b3ffc dekui_notebook insn        # mov r4, r0 (NativeNotebook)
+0x007d04c4 dekui_notebook_map_input insn       # tst r3, #4
+0x007d04b0 dekui_notebook_schedule_input insn  # tst r3, #0x800
+0x005a745c dekui_song_nav insn        # cmp r1, r2: song list cursor (SongList)
+0x007d1498 dekui_text insn            # ldr r3, [r0, #4]: message loaded (SingleScreenText)
+0x005a31c0 dekui_options_draw insn    # mov r4, r0 (OptionsMenu)
+0x005a1e30 dekui_options_select insn  # mov r4, r0
+0x005a1c14 patch 0xe3a00000           # options page: mov r0, #0
+0x005a1c18 patch 0xe12fff1e           #               bx lr
+0x005a2cec patch 0xea000014           # skip the calibration entry
+0x0059b344 dekui_minimap_before insn  # nop: before the gameplay map (NativeMinimap)
+0x0059b34c dekui_minimap_after insn   # ldr r0, [r4, #0x38]: after it
+0x007cfbc0 dekui_stick_pad insn 0x007cfbc4 0x007cfbf0  # strh r2, [r5]: Restoration pad (StickControls)
+0x007d06c4 dekui_stick_map insn 0x007d06c8 0x007d06d4 0x007d0708  # tst r1, r5: ZR+Select map
+0x007d06dc dekui_minimap_shortcut insn 0x007d06e0 0x007d06f8  # mov r0, #5 (MinimapShortcut)
+0x005a5798 patch 0xe3a02000           # MenuClose
+0x005a57b4 patch 0xe3100006           # MenuClose
+0x00599890 patch 0xe3100006           # MenuClose
+0x007d42c8 patch 0xe3a03000           # HudButtons visibility
+0x007d42fc patch 0xe35c0001
+0x007d430c patch 0xe35c0002
+0x007d4348 patch 0xe35c0001
+0x007d4374 patch 0xe35c0001
+0x007d4380 patch 0xe35c0002
+0x007d43bc patch 0xe35c0001
+0x007d44e4 patch 0x13a03000

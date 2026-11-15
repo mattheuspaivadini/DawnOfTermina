@@ -137,6 +137,9 @@ int main(int argc, char** argv) {
     // config.toml lives next to game_data/ (like saves/ and cache/); DOT_* variables override it.
     const std::filesystem::path config_file = std::filesystem::absolute(data).parent_path() / "config.toml";
     core::Config config = core::load_config(config_file);
+    // DekUI's single-screen layout: its defaults, or a presentation.json (DekUI's format) next to config.toml.
+    const auto presentation = config_file.parent_path() / "presentation.json";
+    recomp::hooks::dekui_load_presentation(std::filesystem::exists(presentation) ? presentation.c_str() : nullptr);
     core::apply_env_defaults(config);
 
     core::Memory mem;
@@ -245,12 +248,14 @@ int main(int argc, char** argv) {
             // play loop (0x15F644) from the touch-screen menu state; set with the Items/Masks menus,
             // clear through boot, title and cutscenes (savestate diffs + trace). Same .data offset in
             // v1.0, v1.1 and Project Restoration (2 code references each).
-            // A menu page that DekUI's NativeInventory drew on the top screen needs no pop-up.
-            gfx::g_bottom_modal = (mem.read<u32>(code->data.addr + 0x58A18) & 1) && !recomp::hooks::dekui_inventory_routed();
+            // DekUI's single-screen modules draw every bottom-screen menu and the minimap on the top
+            // screen: no pop-up and no corner pieces (F3 still forces the pop-up).
+            const bool dekui = recomp::hooks::dekui_active();
+            gfx::g_bottom_modal = (mem.read<u32>(code->data.addr + 0x58A18) & 1) && !dekui;
             // Halfword at 0x68D300 (v1.0, 31 code references; same offset in the other versions):
             // 0 only while the bottom screen shows the gameplay HUD (1 through boot, title, opening
             // cutscenes and menus). The HUD pieces are hidden otherwise.
-            gfx::g_hud_visible = mem.read<u16>(code->data.addr + 0x42300) == 0;
+            gfx::g_hud_visible = mem.read<u16>(code->data.addr + 0x42300) == 0 && !dekui;
 #endif
             ui::frame();  // before fetching the screens: a resolution change destroys their images
 #ifdef DOT_HAVE_RECOMP

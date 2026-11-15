@@ -41,7 +41,7 @@ O código ARM11 original (`code.bin` do ExeFS) é traduzido automaticamente para
    python3 tools/extract_cia.py "ISO/<seu jogo>.cia" game_data/ --update "ISO/<update v1.1>.cia" \
        --restoration mm3d_project_restoration_plus_hd_hud_v1.5.9-5-g8bb2a7b.7z --romfs mm3d_big_screen_layout_779512b.7z
    ```
-   Com esse build, os menus **Items, Masks e Gear abrem na tela de cima** (porte do inventário do DekUI), navegáveis por D-pad/analógico; `DOT_DEKUI=0` volta aos menus originais.
+   Com esse build o jogo **dispensa a tela de baixo** (porte da parte "tela única" do DekUI): título, seleção de arquivo e opções, inventário (**SELECT** abre; **L/R** trocam entre Gear, Masks, Items e Map), Bomber's Notebook, lista de músicas da Ocarina, Song of Time/Double Time, menus de dar item, minimapa (ZR+SELECT liga/desliga) e os textos que citavam a tela de toque, tudo na tela de cima e por botões. As posições são as do DekUI (`presentation.json` dele embutido); um `presentation.json` no formato do DekUI ao lado do `config.toml` as substitui. `DOT_DEKUI=0` volta aos menus originais.
 
    `--romfs <arquivo|pasta>` (repetível) aplica qualquer mod de RomFS: os arquivos são acrescentados ou substituídos dentro do `romfs.bin` por `tools/romfs_patch.py` (a imagem é regravada, ~650 MB).
 
@@ -129,7 +129,8 @@ Cada função transcrita mantém o endereço virtual original em comentário (`/
 | 12 | Hooks nativos para rotinas da libc (memcpy/memset/strlen/strcmp/sinf/cosf/atan2f) | ✅ infraestrutura; ganho medido dentro do ruído |
 | 5E | Experiência de PC: `config.toml`, menu ImGui (F1), tela única N64/tela única/dupla, câmera no mouse (C-stick), atalhos de toque | ✅ |
 | 13 | Savestates: F5 salva, F9 carrega (`states/slot1.state`), `DOT_LOAD_STATE=<arquivo>` no boot | ✅ |
-| 14+ | Subsistemas do jogo (cenas, loop, colisão, atores, HUD) | ⏳ |
+| 14 | Tela única: toda a interface da tela de toque na tela de cima (porte do DekUI, build HD HUD) | 🟡 |
+| 15+ | Subsistemas do jogo (cenas, loop, colisão, atores, HUD) | ⏳ |
 
 ## Contribuindo
 
@@ -138,7 +139,7 @@ O desenvolvimento acontece na branch `dev` (ou em branches derivadas dela). Nada
 ## Créditos
 
 - **[Project Restoration](https://restoration.zora.re/)** ([código](https://github.com/leoetlino/project-restoration)), de **leoetlino** e colaboradores (GPL-2.0): o mod de jogabilidade que o extrator aplica com `--restoration` a partir do pacote oficial fornecido pelo usuário. Nenhum arquivo do mod é distribuído aqui.
-- **[DekUI](https://gamebanana.com/mods/723825)** ([código](https://github.com/tgacquin/mm3d-dekui)), de **Thomas (tgacquin)** e dos *MM3D presentation contributors*, sobre o Azahar e o Project Restoration: inventário na tela de cima (headers do DekUI copiados sem modificação em `src/dekui/`, cola em `src/recomp/dekui.cpp`), correção do fundo da pausa (PC do `PauseCapture`), base da interpolação de câmera do modo 60 FPS (ponto médio rígido por quaternion e detecção de cortes, `src/gfx/camera_midpoint.h`) e do FOV ajustável (hook em `0x18D570`/`0x18D584`, `src/recomp/hooks.cpp`). Trechos portados do código GPL-2.0-or-later do DekUI, com atribuição nos arquivos.
+- **[DekUI](https://gamebanana.com/mods/723825)** ([código](https://github.com/tgacquin/mm3d-dekui)), de **Thomas (tgacquin)** e dos *MM3D presentation contributors*, sobre o Azahar e o Project Restoration: toda a interface de tela única (headers do DekUI copiados sem modificação em `src/dekui/`, cola em `src/recomp/dekui.cpp`, padrões de `resources/dekui/presentation.json` lidos por uma transcrição do `Settings::Load` dele em `src/recomp/dekui_settings.cpp`), correção do fundo da pausa (PC do `PauseCapture`), base da interpolação de câmera do modo 60 FPS (ponto médio rígido por quaternion e detecção de cortes, `src/gfx/camera_midpoint.h`) e do FOV ajustável (hook em `0x18D570`/`0x18D584`, `src/recomp/hooks.cpp`). Trechos portados do código GPL-2.0-or-later do DekUI, com atribuição nos arquivos.
 - **[Citra](https://github.com/citra-emu/citra) / [Azahar](https://github.com/azahar-emu/azahar)** e **[3dbrew](https://www.3dbrew.org/)**: referência para o PICA200, o DSP e os serviços do Horizon.
 
 ## Licença

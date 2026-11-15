@@ -33,6 +33,8 @@
 #include "gfx/layout.h"
 #include "hle/hid.h"
 #include "hle/svc.h"
+#include "mm3d/dungeon_map.h"
+#include "recomp/hooks.h"
 
 using core::Memory;
 namespace stdfs = std::filesystem;
@@ -206,6 +208,26 @@ static void test_camera() {
     assert(!rigid(scaled));
 }
 
+// DekUI presentation settings (src/recomp/dekui_settings.cpp): the built-in presentation.json
+// parses and reaches the modules; a user file overrides it; a malformed one is refused.
+static void test_dekui_presentation() {
+    using recomp::hooks::dekui_load_presentation;
+    assert(dekui_load_presentation(nullptr));
+    assert(std::abs(MM3D::DungeonMap::poses[0].x.load() - 40.2f) < 1e-3f);  // "dungeon_map_0_x": 40.2
+    assert(MM3D::DungeonMap::enabled.load());                                // "dungeon_map_top": true
+    const auto path = stdfs::temp_directory_path() / "dot_presentation_test.json";
+    std::ofstream(path) << R"({"version": 1, "fullscreen_draws": [{"a": [1, "]"]}], "dungeon_map_0_x": -12.5,
+                              "dungeon_map_top": false, "note": "x\"y"})";
+    assert(dekui_load_presentation(path.c_str()));
+    assert(MM3D::DungeonMap::poses[0].x.load() == -12.5f && !MM3D::DungeonMap::enabled.load());
+    for (const char* bad : {R"({"version": 2})", R"({"version": 1, "x": })", "[1]", R"({"version": 1)"}) {
+        std::ofstream(path) << bad;
+        assert(!dekui_load_presentation(path.c_str()));
+    }
+    stdfs::remove(path);
+    assert(dekui_load_presentation(nullptr));
+}
+
 void test_pica();                     // tests/pica_test.cpp
 void test_shaders(const char* data);  // tests/shader_test.cpp
 void test_recomp_runtime();            // tests/recomp_test.cpp
@@ -217,6 +239,7 @@ int main(int argc, char** argv) {
     test_fs();
     test_hid();
     test_camera();
+    test_dekui_presentation();
     test_pica();
     test_recomp_runtime();
     test_audio();

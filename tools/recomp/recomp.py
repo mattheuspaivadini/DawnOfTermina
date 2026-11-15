@@ -36,6 +36,7 @@ class Image:
         manifest = game_data / "manifest.json"
         if manifest.exists() and (r := json.loads(manifest.read_text()).get("restoration_code")):
             self.code_ranges.append((r[0], r[1] - r[0]))
+        self.patches = {}  # VA -> instruction word decoded in place of the original (hooks.txt `patch`)
         self.segs = []  # (va, size, file offset)
         off = 0
         for va, pages, size in (self.text, self.rodata, self.data):
@@ -56,6 +57,8 @@ class Image:
         return next((i for i, (va, size) in enumerate(self.code_ranges) if va <= a and a + n <= va + size), None)
 
     def read32(self, a):
+        if a in self.patches:
+            return self.patches[a]
         return struct.unpack_from("<I", self.code, self._off(a, 4))[0]
 
     def read16(self, a):
@@ -321,12 +324,13 @@ class Recompiler:
     def emit_function(self, key, insns, labels, out):
         t = bool(key & 1)
         resume = self.resume_points(insns, labels)
-        labels |= resume
         addrs = {i.addr for i in insns}
         for a in addrs & self.insn_hooks.keys():  # an instruction hook's jump targets are local labels
             if missing := [h(x) for x in self.insn_hooks[a][1] if x not in addrs]:
                 raise SystemExit(f"hooks.txt: {h(a)} jumps outside its function: {', '.join(missing)}")
-            labels |= set(self.insn_hooks[a][1])
+            # also resume points: a hook may call a function itself and continue at a target
+            resume |= set(self.insn_hooks[a][1])
+        labels |= resume
         out.append(f"u32 {self.name(key)}(recomp::Context* c) {{")
         out.append("    u32 jt = 0;")
         out.append("    u32 entry_lr = c->r[14];  // a computed jump here is a return (e.g. pop {r3}; bx r3)")
@@ -337,16 +341,23 @@ class Recompiler:
             if insn.addr in labels:
                 out.append(f"L_{insn.addr:08X}:")
             stmt = self.emit_insn(insn, by_addr)
-            if insn.addr in self.insn_hooks and not insn.thumb:  # replaces the instruction (keeps its condition)
+            hooked = insn.addr in self.insn_hooks and not insn.thumb
+            if hooked:  # replaces the instruction (keeps its condition); 0 = continue at the next one
                 name, targets = self.insn_hooks[insn.addr]
-                stmt = (f"{{ u32 t = recomp::hooks::{name}(c); if (t) {{ jt = t; goto dispatch; }} }}" if targets
-                        else f"recomp::hooks::{name}(c);")
+                # The hook returns 0 or its new pc: a listed target is a local jump; anything else is a
+                # call when the hooked instruction was one or the hook set lr (DekUI's r14/r15
+                # convention), otherwise a jump out (return or tail call).
+                local = " || ".join(f"t == {h(x)}" for x in targets)
+                call = "true" if insn.kind in ("call", "icall") else "c->r[14] != lr0"
+                stmt = (f"{{ const u32 lr0 = c->r[14]; u32 t = recomp::hooks::{name}(c); (void)lr0; if (t) {{ "
+                        f"if (!({local}) && ({call})) t = recomp::call(c, t); jt = t; goto dispatch; }} }}"
+                        if targets else f"recomp::hooks::{name}(c);")
             if "recomp::svc(" in insn.code:  # savestates resume a thread parked in a syscall here
                 stmt = f"c->r[15] = {h(insn.addr | t)}; {stmt}"
             if insn.cond != AL and insn.kind != "branch" or (insn.kind == "branch" and insn.cond != AL):
                 stmt = f"if ({COND[insn.cond]}) {{ {stmt} }}"
             out.append(f"    {stmt} // {insn.addr:08X} {insn.asm}")
-            falls = insn.cond != AL or insn.kind in ("normal", "call", "icall")
+            falls = insn.cond != AL or insn.kind in ("normal", "call", "icall") or hooked
             nxt = insns[idx + 1].addr if idx + 1 < len(insns) else None
             if falls and nxt != insn.next:
                 target = insn.next
@@ -431,9 +442,10 @@ def init_array_seeds(image):
 
 def select_hooks(text: str, code_sha256: str):
     """hooks.txt section whose `[<version> <sha256>]` header matches the code.bin hash ->
-    (version, {entry: hook}, {instruction VA: (hook, branch targets)}); (None, {}, {}) when no
-    section matches. `<VA> <hook> insn [<target>...]` hooks one instruction instead of a whole
-    function; with targets, the hook returns 0 (fall through) or one of them (a jump)."""
+    (version, {entry: hook}, {instruction VA: (hook, branch targets)}, {VA: word}); (None, {}, {}, {})
+    when no section matches. `<VA> <hook> insn [<target>...]` hooks one instruction instead of a
+    whole function; with targets, the hook returns 0 (fall through) or one of them (a jump).
+    `<VA> patch <word>` decodes another ARM instruction there (DekUI's non-SVC substitutions)."""
     sections, cur = {}, None
     for line in text.splitlines():
         line = line.split("#")[0].split()
@@ -441,15 +453,17 @@ def select_hooks(text: str, code_sha256: str):
             continue
         if line[0].startswith("["):
             version, sha = " ".join(line).strip("[]").split()
-            cur = sections[sha.lower()] = (version, {}, {})
+            cur = sections[sha.lower()] = (version, {}, {}, {})
         elif cur is None:
             raise SystemExit("hooks.txt: hook outside a [<version> <sha256>] section")
         else:
-            if line[2:3] == ["insn"]:
+            if line[1] == "patch":
+                cur[3][int(line[0], 16)] = int(line[2], 16)
+            elif line[2:3] == ["insn"]:
                 cur[2][int(line[0], 16)] = (line[1], tuple(int(t, 16) for t in line[3:]))
             else:
                 cur[1][int(line[0], 16)] = line[1]
-    return sections.get(code_sha256.lower(), (None, {}, {}))
+    return sections.get(code_sha256.lower(), (None, {}, {}, {}))
 
 
 def main():
@@ -462,7 +476,10 @@ def main():
     args = ap.parse_args()
 
     image = Image(args.game_data)
+    sha = hashlib.sha256(image.code).hexdigest()
+    version, hooks, insn_hooks, image.patches = select_hooks(args.hooks.read_text(), sha)  # -> src/recomp/hooks.cpp
     rc = Recompiler(image)
+    rc.insn_hooks = insn_hooks
     seeds = [image.text[0]] + init_array_seeds(image)
     if args.extra.exists():
         for line in args.extra.read_text().splitlines():
@@ -488,14 +505,17 @@ def main():
             break
         rc.discover(extra)
 
-    sha = hashlib.sha256(image.code).hexdigest()
-    version, hooks, rc.insn_hooks = select_hooks(args.hooks.read_text(), sha)  # -> src/recomp/hooks.cpp
-    print(f"code.bin {sha}: " + (f"v{version}, {len(hooks)} native hooks, {len(rc.insn_hooks)} instruction hooks"
+    print(f"code.bin {sha}: " + (f"v{version}, {len(hooks)} native hooks, {len(rc.insn_hooks)} instruction hooks, "
+                                 f"{len(image.patches)} patches"
           if version else "unknown version, building without native hooks"), file=sys.stderr)
     if missing := [h(a) for a in hooks if a not in rc.entries]:
         raise SystemExit(f"hooks.txt [{version}]: not a function entry: {', '.join(missing)}")
-    if bad := [h(a) for a in rc.insn_hooks if (a, False) not in rc.seen or rc.decode(a, False).kind != "normal"]:
-        raise SystemExit(f"hooks.txt [{version}]: not a decoded ARM data instruction: {', '.join(bad)}")
+    if bad := [h(a) for a in rc.insn_hooks if (a, False) not in rc.seen or rc.decode(a, False).kind == "trap" or
+               rc.decode(a, False).kind != "normal" and not rc.insn_hooks[a][1]]:
+        raise SystemExit(f"hooks.txt [{version}]: not a decoded ARM instruction, or a branch/call hooked "
+                         f"without targets (its hook must return where to go): {', '.join(bad)}")
+    if bad := [h(a) for a in image.patches if (a, False) not in rc.seen]:
+        raise SystemExit(f"hooks.txt [{version}]: patch outside decoded ARM code: {', '.join(bad)}")
 
     funcs = {}
     for key in sorted(rc.entries):

@@ -36,6 +36,7 @@
 #include "gfx/pica/pixel.h"
 #include "gfx/pica/shader_gen.h"
 #include "gfx/pica/shader_interp.h"
+#include "gfx/camera_midpoint.h"
 #include "gfx/pica/texture.h"
 #include "gfx/pica/vertex_loader.h"
 #include "gfx/vulkan/context.h"
@@ -318,7 +319,7 @@ struct Renderer::Impl {
     std::vector<Op> frame_ops, prev_ops;
     std::map<u64, u32> key_counts;
     std::shared_ptr<pica::ShaderState> last_vs;
-    u64 interp_frames = 0, interp_skipped = 0;
+    u64 interp_frames = 0, interp_skipped = 0, interp_camera_draws = 0;
     // Widescreen: the colour buffers that feed the top screen get W times more rows (rows are
     // the screen's horizontal axis). DOT_WIDESCREEN=<w>:<h> or "window" (follows the window).
     float wide_aspect = 0;  // top screen aspect; 0 = off, < 0 = window
@@ -1070,11 +1071,13 @@ struct Renderer::Impl {
         if (!d.image.img) {
             d.width = screen_w, d.height = out_w * scale;
             d.image = make_general(d.width, d.height, VK_FORMAT_R8G8B8A8_UNORM,
-                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                   VK_IMAGE_ASPECT_COLOR_BIT);
         }
         if (replaying && !d.interp.img)
             d.interp = make_general(d.width, d.height, VK_FORMAT_R8G8B8A8_UNORM,
-                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                   VK_IMAGE_ASPECT_COLOR_BIT);
         const Image& dst_img = replaying ? d.interp : d.image;
         begin();
         VkDescriptorSet set;
@@ -1395,6 +1398,42 @@ struct Renderer::Impl {
         frame_ops.push_back(std::move(op));
     }
 
+    // World-shader draws (see gfx/camera_midpoint.h): c0-c3 a perspective projection (last row
+    // 0 0 -1 0) and a rigid camera-to-world matrix in c70-c72.
+    static bool camera_draw(const pica::ShaderState& vs, camera::Mat& cam) {
+        const pica::Vec4& p = vs.float_uniforms[3];
+        if (p.x != 0 || p.y != 0 || p.z != -1 || p.w != 0) return false;
+        for (int i = 0; i < 3; ++i) {
+            const pica::Vec4& v = vs.float_uniforms[70 + i];
+            cam[i] = {v.x, v.y, v.z, v.w};
+        }
+        return camera::rigid(cam);
+    }
+
+    // Halfway uniforms of a world-shader draw: the camera moves along the rigid midpoint and each
+    // bone halfway in world space, then goes back to the halfway camera's view space.
+    static void camera_midpoint(const pica::ShaderState& a, pica::ShaderState& b, const camera::Mat& ca,
+                                const camera::Mat& cb) {
+        const camera::Mat mid = camera::midpoint(ca, cb), view = camera::inverse_rigid(mid);
+        auto row = [](const pica::ShaderState& s, int r) {
+            const pica::Vec4& v = s.float_uniforms[r];
+            return std::array<double, 4>{v.x, v.y, v.z, v.w};
+        };
+        for (int bone = 0; bone < 10; ++bone) {
+            camera::Mat ma, mb;
+            for (int i = 0; i < 3; ++i) ma[i] = row(a, 20 + 3 * bone + i), mb[i] = row(b, 20 + 3 * bone + i);
+            const camera::Mat wa = camera::mul(ca, ma), wb = camera::mul(cb, mb);
+            camera::Mat w;
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 4; ++j) w[i][j] = (wa[i][j] + wb[i][j]) / 2;
+            const camera::Mat out = camera::mul(view, w);
+            for (int i = 0; i < 3; ++i)
+                b.float_uniforms[20 + 3 * bone + i] = {float(out[i][0]), float(out[i][1]), float(out[i][2]), float(out[i][3])};
+        }
+        for (int i = 0; i < 3; ++i)
+            b.float_uniforms[70 + i] = {float(mid[i][0]), float(mid[i][1]), float(mid[i][2]), float(mid[i][3])};
+    }
+
     // End of a top-screen frame (its transfer was just recorded and run): replay it halfway
     // between the previous frame and this one.
     void end_frame(Memory& mem) {
@@ -1402,7 +1441,7 @@ struct Renderer::Impl {
         std::map<u64, const Op*> prev;
         for (const Op& op : prev_ops)
             if (op.kind == Op::Draw) prev[op.key] = &op;
-        u32 draws = 0, matched = 0;
+        u32 draws = 0, matched = 0, camera_draws = 0, camera_cuts = 0;
         std::vector<float> change;  // per matched draw: relative change of its float uniforms
         for (const Op& op : frame_ops) {
             if (op.kind != Op::Draw) continue;
@@ -1417,6 +1456,8 @@ struct Renderer::Impl {
             for (u32 i = 0; i < 96 * 4; ++i)
                 if (std::isfinite(a[i]) && std::isfinite(b[i])) num += std::fabs(a[i] - b[i]), den += std::fabs(a[i]) + std::fabs(b[i]);
             change.push_back(den > 0 ? float(num / den) : 0.0f);
+            camera::Mat ca, cb;
+            if (camera_draw(*it->second->vs, ca) && camera_draw(*op.vs, cb)) ++camera_draws, camera_cuts += camera::cut(ca, cb);
         }
         // A scene change matches few draws. A camera cut matches most of them (same objects, new
         // camera), but their matrices jump: measured median change 0.05-0.93 at cuts against
@@ -1427,6 +1468,7 @@ struct Renderer::Impl {
             std::nth_element(change.begin(), change.begin() + change.size() / 2, change.end());
             cut = change[change.size() / 2] > 0.025f;
         }
+        cut |= camera_cuts * 2 > camera_draws;  // the world camera jumped (DekUI's test)
         if (draws && matched * 2 >= draws && !cut) {
             replaying = true;
             pica::ShaderState vs;
@@ -1434,12 +1476,18 @@ struct Renderer::Impl {
                 switch (op.kind) {
                 case Op::Draw: {
                     vs = *op.vs;
-                    if (auto it = prev.find(op.key); it != prev.end())
+                    if (auto it = prev.find(op.key); it != prev.end()) {
                         for (u32 i = 0; i < 96; ++i) {
                             const pica::Vec4& a = it->second->vs->float_uniforms[i];
                             pica::Vec4& b = vs.float_uniforms[i];
                             b = {(a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f, (a.z + b.z) * 0.5f, (a.w + b.w) * 0.5f};
                         }
+                        camera::Mat ca, cb;
+                        if (camera_draw(*it->second->vs, ca) && camera_draw(*op.vs, cb)) {
+                            camera_midpoint(*it->second->vs, vs, ca, cb);
+                            ++interp_camera_draws;
+                        }
+                    }
                     draw(mem, op.regs, vs, op.indexed);
                     break;
                 }
@@ -1775,12 +1823,12 @@ bool Renderer::display(core::Memory& mem, u32 va, GpuScreen& out, bool consume) 
     // even pacing at any monitor refresh, also when the game drops to 20 or 15 frames/s.
     if (consume && d.interp_fresh) {
         if (std::chrono::steady_clock::now() - d.ready < d.period / 2) {
-            out = {d.interp.img, d.width, d.height};
+            out = {d.interp.img, d.width, d.height, d.interp.view};
             return true;
         }
         d.interp_fresh = false;
     }
-    out = {d.image.img, d.width, d.height};
+    out = {d.image.img, d.width, d.height, d.image.view};
     return true;
 }
 
@@ -1870,6 +1918,7 @@ void Renderer::set_interpolate(bool on) {
 Renderer::Stats Renderer::stats() const {
     Stats s = impl_->stats;
     s.interpolated = impl_->interp_frames, s.not_interpolated = impl_->interp_skipped;
+    s.camera_draws = impl_->interp_camera_draws;
     return s;
 }
 

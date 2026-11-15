@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <map>
@@ -95,6 +96,8 @@ void file_command(const std::shared_ptr<HostFile>& file, core::Memory& mem, u32 
         const u32 size = c[3], addr = c[5];
         std::fseek(file->f, long(file->base + offset), SEEK_SET);
         const u32 n = u32(std::fread(mem.host(addr), 1, size, file->f));
+        static const bool trace = std::getenv("DOT_TRACE_FS");
+        if (trace) std::fprintf(stderr, "fs: read %s +%#llx %#x -> %#x\n", file->path.c_str(), (unsigned long long)offset, size, n);
         c.reply(2, 2);
         c.set(2, n), c.set(3, size << 4 | 0xC), c.set(4, addr);
         return;
@@ -151,9 +154,9 @@ Handle open_file_session(const stdfs::path& path, const std::string& label, u64 
     return file_session(file, label);
 }
 
-// Offset of the IVFC level 3 (the actual RomFS) inside romfs.bin.
-u64 romfs_level3_offset() {
-    std::FILE* f = std::fopen((g_game_data / "romfs.bin").c_str(), "rb");
+// Offset of the IVFC level 3 (the actual RomFS) inside a raw RomFS image.
+u64 romfs_level3_offset(const stdfs::path& image) {
+    std::FILE* f = std::fopen(image.c_str(), "rb");
     if (!f) return 0;
     u8 ivfc[0x60] = {};
     const size_t n = std::fread(ivfc, 1, sizeof ivfc, f);
@@ -169,13 +172,16 @@ u64 romfs_level3_offset() {
 // Opens a file inside an archive. Returns 0 if not found or unsupported (with `err`).
 Handle open_in_archive(core::Memory& mem, u32 archive_id, u32 file_path_type, u32 file_path, u32 file_path_size,
                        Result* err) {
-    if (archive_id == 0x3 && file_path_type == 2 && file_path_size >= 4 && mem.read<u32>(file_path) == 0) {
-        // SelfNCCH, binary path {type 0 = RomFS}: the guest sees the image from the IVFC
-        // level 3 header on (the SDK parses level 3 itself; hash levels are not exposed).
-        const Handle h = open_file_session(g_game_data / "romfs.bin", "fs:romfs", romfs_level3_offset());
+    const u32 self_type = file_path_type == 2 && file_path_size >= 4 ? mem.read<u32>(file_path) : ~0u;
+    if (archive_id == 0x3 && (self_type == 0 || self_type == 5)) {
+        // SelfNCCH, binary path {0 = RomFS, 5 = the installed update's RomFS}: the guest sees
+        // the image from the IVFC level 3 header on (the SDK parses level 3 itself; hash
+        // levels are not exposed). No update extracted -> not found, as on a console without it.
+        const stdfs::path image = g_game_data / (self_type == 0 ? "romfs.bin" : "update_romfs.bin");
+        const Handle h = open_file_session(image, "fs:romfs", romfs_level3_offset(image));
         *err = h ? RESULT_OK : ERR_NOT_FOUND;
-        if (!h) std::fprintf(stderr, "fs: %s missing (re-run tools/extract_cia.py)\n",
-                             (g_game_data / "romfs.bin").c_str());
+        if (!h && self_type == 0)
+            std::fprintf(stderr, "fs: %s missing (re-run tools/extract_cia.py)\n", image.c_str());
         return h;
     }
     throw kernel::Unimplemented("fs: open file in archive " + hex(archive_id) + " path type " +

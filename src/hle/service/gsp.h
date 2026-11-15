@@ -42,6 +42,10 @@ bool gpu_screen(int screen, gfx::vulkan::GpuScreen& out);
 // The screen as pixels for DOT_DUMP_FRAMES: read back from the GPU (scaled) or from memory.
 bool screen_dump(int screen, std::vector<u32>& rgba, u32& width, u32& height, bool interp = false);
 
+// The CPU side is about to read guest memory [start, end) directly (no GX command announces it):
+// transfers and surfaces the renderer kept on the GPU are written back first.
+void cpu_read(u32 start, u32 end);
+
 // Counters for diagnostics.
 struct Stats {
     u64 vblanks, command_lists, draws, memory_fills, display_transfers;

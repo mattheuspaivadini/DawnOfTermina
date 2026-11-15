@@ -128,6 +128,13 @@ void svc(Context* c, u32 imm) {
         return;
     }
     case 0x32: r[0] = k::send_sync_request(r[0]); return;
+    case 0x33: {  // OpenProcess(pid r1) -> r1 handle; only our own (Project Restoration's startup)
+        if (r[1] != 0x28) break;
+        Handle out = 0;
+        r[0] = k::duplicate_handle(0xFFFF8001, &out);
+        r[1] = out;
+        return;
+    }
     case 0x35: r[0] = RESULT_OK, r[1] = 0x28; return;  // GetProcessId: any stable application pid
     case 0x37: {  // GetThreadId(handle r1) -> r1
         u32 id = 0;
@@ -145,12 +152,19 @@ void svc(Context* c, u32 imm) {
     case 0x3A: r[0] = k::get_resource_limit_values(r[0], r[1], r[2], r[3], true); return;
     case 0x3C: hle::svc::Break(r[0]);
     case 0x3D: hle::svc::OutputDebugString(*g_mem, r[0], r[1]); return;
-    default: {
+    case 0x70:  // ControlProcessMemory(process r0, addr0 r1, addr1 r2, size r3, op r4, perm r5)
+        // Project Restoration makes its code RWX at boot. PROTECT is a no-op here: guest pages are
+        // always readable/writable and code runs recompiled, never from guest memory.
+        if (r[4] != 6) break;
+        r[0] = RESULT_OK;
+        return;
+    default: break;
+    }
+    {
         char msg[96];
         std::snprintf(msg, sizeof msg, "svc 0x%02X (r0=0x%08X r1=0x%08X) not implemented, LR=0x%08X", imm, r[0],
                       r[1], r[14]);
         throw Trap(c->r[14], msg);
-    }
     }
 }
 

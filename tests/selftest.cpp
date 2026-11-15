@@ -19,6 +19,7 @@
 
 #undef NDEBUG
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -28,9 +29,12 @@
 #include "game/crt0.h"
 #include "game/guest.h"
 #include "hle/fs.h"
+#include "gfx/camera_midpoint.h"
 #include "gfx/layout.h"
 #include "hle/hid.h"
 #include "hle/svc.h"
+#include "mm3d/dungeon_map.h"
+#include "recomp/hooks.h"
 
 using core::Memory;
 namespace stdfs = std::filesystem;
@@ -106,14 +110,32 @@ static void test_hid() {
     assert(!window_to_touch(1700, 900, 1920, 1080, tx, ty));
     gfx::g_show_bottom = true, gfx::g_top_width = 400.0f;
     assert(window_to_touch(1488, 756, 1920, 1080, tx, ty) && tx == 0);  // 5:3 top pillarboxed, same overlay
+    // N64 layout, 16:9 top filling 1920x1080 (4.5 px per top row, HUD scale 0.6 -> 2.7 px per
+    // bottom pixel, margin 27): item II (53x53 from (265,185)) at (1749.9, 97.2), 143.1 wide.
+    gfx::g_n64 = true, gfx::g_top_width = 240.0f * 16 / 9;
+    assert(window_to_touch(1749.9f + 71.5f, 97.2f + 71.5f, 1920, 1080, tx, ty) && tx == 291 && ty == 211);
+    assert(!window_to_touch(960, 540, 1920, 1080, tx, ty));  // game view: no touch
+    gfx::g_hud_visible = false;  // cutscene: no HUD pieces
+    assert(!window_to_touch(1749.9f + 71.5f, 97.2f + 71.5f, 1920, 1080, tx, ty));
+    gfx::g_hud_visible = true;
+    gfx::g_minimap = false;  // minimap (192x204 at 0.75 scale) right-bottom, hidden by Tab
+    assert(!window_to_touch(1920 - 30, 1080 - 27 - 110 * 2.025f - 30, 1920, 1080, tx, ty));
+    gfx::g_minimap = true;
+    assert(window_to_touch(1920 - 30, 1080 - 27 - 110 * 2.025f - 30, 1920, 1080, tx, ty) && tx > 240 && ty > 220);
+    gfx::g_bottom_modal = true;  // menu pop-up: 1152x864 centred at (384, 108)
+    assert(window_to_touch(384, 108, 1920, 1080, tx, ty) && tx == 0 && ty == 0);
+    assert(window_to_touch(1535.9f, 971.9f, 1920, 1080, tx, ty) && tx == 319 && ty == 239);
+    assert(!window_to_touch(1821, 168, 1920, 1080, tx, ty));  // HUD pieces are gone
+    gfx::g_bottom_modal = false, gfx::g_n64 = false, gfx::g_top_width = 400.0f;
 
     // config.toml round trip
     core::Config c = core::parse_config("[display]\nresolution = \"720p\" # x\nvsync = false\nfps = 30\n"
                                         "[audio]\nvolume = 150\n[keys]\nA = \"K\"\n");
     assert(c.resolution == "720p" && !c.vsync && c.fps == 30 && c.volume == 100 && c.keys["A"] == "K");
-    assert(c.layout == "single" && c.widescreen == "16:9");  // defaults kept
+    assert(c.layout == "n64" && c.widescreen == "16:9" && c.minimap && c.hud_scale == 0.6f);  // defaults kept
     const core::Config d = core::parse_config(core::format_config(c));
-    assert(d.resolution == c.resolution && d.vsync == c.vsync && d.fps == c.fps && d.keys == c.keys);
+    assert(d.resolution == c.resolution && d.vsync == c.vsync && d.fps == c.fps && d.keys == c.keys &&
+           d.layout == c.layout && d.hud_scale == c.hud_scale && d.hud_opacity == c.hud_opacity && d.minimap == c.minimap);
 
     std::vector<ScriptEvent> ev;
     assert(parse_input_script("20:START,21.5:A,30:T160x120", ev) && ev.size() == 3);
@@ -165,6 +187,47 @@ static void test_boot(const stdfs::path& data) {
     std::printf("selftest: boot frontier 0x%08X, heap %u KiB\n", frontier, heap >> 10);
 }
 
+// Interpolated camera (gfx/camera_midpoint.h): the midpoint of two yaws is the half yaw, rigid,
+// translation averaged; cuts by distance and angle.
+static void test_camera() {
+    using namespace gfx::camera;
+    auto yaw = [](double deg, double x) {
+        const double r = deg * 3.14159265358979323846 / 180;
+        return Mat{{{std::cos(r), 0, std::sin(r), x}, {0, 1, 0, 5}, {-std::sin(r), 0, std::cos(r), 0}}};
+    };
+    const Mat a = yaw(0, 0), b = yaw(40, 100), m = midpoint(a, b), want = yaw(20, 50);
+    assert(rigid(a) && rigid(m));
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 4; ++j) assert(std::abs(m[i][j] - want[i][j]) < 1e-9);
+    const Mat id = mul(inverse_rigid(b), b);
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 4; ++j) assert(std::abs(id[i][j] - (i == j)) < 1e-9);
+    assert(!cut(a, b) && cut(a, yaw(50, 0)) && cut(a, yaw(0, 300)));
+    Mat scaled = a;
+    scaled[0][0] = 2;
+    assert(!rigid(scaled));
+}
+
+// DekUI presentation settings (src/recomp/dekui_settings.cpp): the built-in presentation.json
+// parses and reaches the modules; a user file overrides it; a malformed one is refused.
+static void test_dekui_presentation() {
+    using recomp::hooks::dekui_load_presentation;
+    assert(dekui_load_presentation(nullptr));
+    assert(std::abs(MM3D::DungeonMap::poses[0].x.load() - 40.2f) < 1e-3f);  // "dungeon_map_0_x": 40.2
+    assert(MM3D::DungeonMap::enabled.load());                                // "dungeon_map_top": true
+    const auto path = stdfs::temp_directory_path() / "dot_presentation_test.json";
+    std::ofstream(path) << R"({"version": 1, "fullscreen_draws": [{"a": [1, "]"]}], "dungeon_map_0_x": -12.5,
+                              "dungeon_map_top": false, "note": "x\"y"})";
+    assert(dekui_load_presentation(path.c_str()));
+    assert(MM3D::DungeonMap::poses[0].x.load() == -12.5f && !MM3D::DungeonMap::enabled.load());
+    for (const char* bad : {R"({"version": 2})", R"({"version": 1, "x": })", "[1]", R"({"version": 1)"}) {
+        std::ofstream(path) << bad;
+        assert(!dekui_load_presentation(path.c_str()));
+    }
+    stdfs::remove(path);
+    assert(dekui_load_presentation(nullptr));
+}
+
 void test_pica();                     // tests/pica_test.cpp
 void test_shaders(const char* data);  // tests/shader_test.cpp
 void test_recomp_runtime();            // tests/recomp_test.cpp
@@ -175,6 +238,8 @@ int main(int argc, char** argv) {
     test_memory_and_svc(mem);
     test_fs();
     test_hid();
+    test_camera();
+    test_dekui_presentation();
     test_pica();
     test_recomp_runtime();
     test_audio();

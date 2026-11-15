@@ -36,9 +36,12 @@ namespace hle::hid {
 // bottom-left (still empty there, so its action is not yet confirmed), the Map tab.
 constexpr u16 TOUCH_ITEM_I_X = 293, TOUCH_ITEM_I_Y = 27, TOUCH_ITEM_II_X = 293, TOUCH_ITEM_II_Y = 213;
 constexpr u16 TOUCH_OCARINA_X = 27, TOUCH_OCARINA_Y = 213, TOUCH_MAP_X = 160, TOUCH_MAP_Y = 220;
+constexpr u16 TOUCH_ITEMS_X = 220, TOUCH_ITEMS_Y = 223, TOUCH_MASKS_X = 100, TOUCH_MASKS_Y = 223;
+constexpr u16 TOUCH_GEAR_X = 28, TOUCH_GEAR_Y = 120;
 
 // Keyboard: K/J/I/U = A/B/X/Y, Q/E = L/R, 1/3 = ZL/ZR, arrows = D-pad, WASD = circle pad,
-// F/G = item buttons I/II, O = Ocarina, M = map (touch-screen buttons of the bottom screen).
+// F/G = item buttons I/II, O = Ocarina, M = map,
+// C/V/Z = Items/Masks/Gear menus (touch-screen buttons of the bottom screen).
 // shortcut: fixed touch points; a screen that moves these buttons needs its own.
 static KeyBinding KEYS[] = {
     {"A", "A", SDL_SCANCODE_K, A},
@@ -63,6 +66,9 @@ static KeyBinding KEYS[] = {
     {"ITEM_II", "Item II (touch)", SDL_SCANCODE_G, 0, 0, 0, TOUCH_ITEM_II_X, TOUCH_ITEM_II_Y, true, SDL_GAMEPAD_BUTTON_RIGHT_STICK},
     {"OCARINA", "Ocarina (touch)", SDL_SCANCODE_O, 0, 0, 0, TOUCH_OCARINA_X, TOUCH_OCARINA_Y, true, SDL_GAMEPAD_BUTTON_MISC1},
     {"MAP", "Map (touch)", SDL_SCANCODE_M, 0, 0, 0, TOUCH_MAP_X, TOUCH_MAP_Y, true, SDL_GAMEPAD_BUTTON_TOUCHPAD},
+    {"ITEMS", "Items menu (touch)", SDL_SCANCODE_C, 0, 0, 0, TOUCH_ITEMS_X, TOUCH_ITEMS_Y, true},
+    {"MASKS", "Masks menu (touch)", SDL_SCANCODE_V, 0, 0, 0, TOUCH_MASKS_X, TOUCH_MASKS_Y, true},
+    {"GEAR", "Gear menu (touch)", SDL_SCANCODE_Z, 0, 0, 0, TOUCH_GEAR_X, TOUCH_GEAR_Y, true},
 };
 
 std::span<KeyBinding> key_bindings() { return KEYS; }
@@ -150,6 +156,15 @@ bool Initialize() {
 bool window_to_touch(float wx, float wy, int win_w, int win_h, u16& tx, u16& ty) {
     gfx::Rect top, bottom;
     gfx::screen_layout(float(win_w), float(win_h), top, bottom);
+    if (gfx::g_n64 && !gfx::bottom_modal()) {  // a click on a HUD piece touches its spot of the bottom screen
+        for (const auto& p : gfx::HUD_PIECES) {
+            const gfx::Rect r = gfx::hud_rect(top, p);
+            if (r.w <= 0 || wx < r.x || wy < r.y || wx >= r.x + r.w || wy >= r.y + r.h) continue;
+            tx = u16(p.src.x + (wx - r.x) / r.w * p.src.w), ty = u16(p.src.y + (wy - r.y) / r.h * p.src.h);
+            return true;
+        }
+        return false;
+    }
     if (bottom.w <= 0 || bottom.h <= 0) return false;
     const float x = (wx - bottom.x) / bottom.w * 320, y = (wy - bottom.y) / bottom.h * 240;
     if (x < 0 || y < 0 || x >= 320 || y >= 240) return false;

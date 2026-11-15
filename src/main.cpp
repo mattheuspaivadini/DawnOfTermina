@@ -45,6 +45,7 @@
 #include "hle/service/services.h"
 #include "hle/svc.h"
 #include "recomp/runtime.h"
+#include "recomp/hooks.h"
 #include "ui/menu.h"
 
 #ifdef DOT_HAVE_RECOMP
@@ -132,9 +133,13 @@ int main(int argc, char** argv) {
                      "rebuild (cmake --build build) and start it again.");
 #endif
     }
+    gfx::g_hd_hud = fs::exists(data / "romfs" / "layout" / "Joker.Main.New.gar");  // extract_cia.py --romfs
     // config.toml lives next to game_data/ (like saves/ and cache/); DOT_* variables override it.
     const std::filesystem::path config_file = std::filesystem::absolute(data).parent_path() / "config.toml";
     core::Config config = core::load_config(config_file);
+    // DekUI's single-screen layout: its defaults, or a presentation.json (DekUI's format) next to config.toml.
+    const auto presentation = config_file.parent_path() / "presentation.json";
+    recomp::hooks::dekui_load_presentation(std::filesystem::exists(presentation) ? presentation.c_str() : nullptr);
     core::apply_env_defaults(config);
 
     core::Memory mem;
@@ -238,6 +243,20 @@ int main(int argc, char** argv) {
             auto pad = hle::hid::ReadPad();
             if (pad.trigger || pad.release)
                 std::printf("pad hold=%08x stick=(%d,%d)\n", pad.hold, pad.stick_x, pad.stick_y);
+#ifdef DOT_HAVE_RECOMP
+            // N64 layout: bit 0 of 0x6A3A18 (v1.0) = the world is paused, written each frame by the
+            // play loop (0x15F644) from the touch-screen menu state; set with the Items/Masks menus,
+            // clear through boot, title and cutscenes (savestate diffs + trace). Same .data offset in
+            // v1.0, v1.1 and Project Restoration (2 code references each).
+            // DekUI's single-screen modules draw every bottom-screen menu and the minimap on the top
+            // screen: no pop-up and no corner pieces (F3 still forces the pop-up).
+            const bool dekui = recomp::hooks::dekui_active();
+            gfx::g_bottom_modal = (mem.read<u32>(code->data.addr + 0x58A18) & 1) && !dekui;
+            // Halfword at 0x68D300 (v1.0, 31 code references; same offset in the other versions):
+            // 0 only while the bottom screen shows the gameplay HUD (1 through boot, title, opening
+            // cutscenes and menus). The HUD pieces are hidden otherwise.
+            gfx::g_hud_visible = mem.read<u16>(code->data.addr + 0x42300) == 0 && !dekui;
+#endif
             ui::frame();  // before fetching the screens: a resolution change destroys their images
 #ifdef DOT_HAVE_RECOMP
             // DOT_SAVE_STATE_AT=<guest seconds> (DOT_INPUT's clock): one automatic save to states/slot1.state.
@@ -260,14 +279,15 @@ int main(int argc, char** argv) {
                     last_vblanks = st.vblanks;
                     const auto rs = renderer.stats();
                     std::printf("gsp: vblanks %llu, frames %llu, command lists %llu, draws %llu, fills %llu, transfers %llu | "
-                                "rendered %llu, skipped %llu, pipelines %llu, shaders %llu, readbacks %llu, interpolated %llu/%llu\n",
+                                "rendered %llu, skipped %llu, pipelines %llu, shaders %llu, readbacks %llu, interpolated %llu/%llu (camera draws %llu)\n",
                                 (unsigned long long)st.vblanks, (unsigned long long)st.frames, (unsigned long long)st.command_lists,
                                 (unsigned long long)st.draws, (unsigned long long)st.memory_fills,
                                 (unsigned long long)st.display_transfers, (unsigned long long)rs.draws,
                                 (unsigned long long)rs.skipped, (unsigned long long)rs.pipelines,
                                 (unsigned long long)rs.shaders,
                                 (unsigned long long)rs.readbacks, (unsigned long long)rs.interpolated,
-                                (unsigned long long)(rs.interpolated + rs.not_interpolated));
+                                (unsigned long long)(rs.interpolated + rs.not_interpolated),
+                                (unsigned long long)rs.camera_draws);
                 }
             }
             // Screens the renderer produced on the GPU are presented from there; otherwise from memory.
@@ -290,6 +310,9 @@ int main(int argc, char** argv) {
                         write_ppm(std::filesystem::path(dir) / ("interp_" + id + ".ppm"), px, w, h);
                     if (hle::service::gsp::screen_dump(1, px, w, h))
                         write_ppm(std::filesystem::path(dir) / ("bottom_" + id + ".ppm"), px, w, h);
+                    // DOT_DUMP_WINDOW: also the composed window (layout, HUD, menu), as presented.
+                    if (std::getenv("DOT_DUMP_WINDOW"))
+                        gpu.dump_next_frame((std::filesystem::path(dir) / ("window_" + id + ".ppm")).string());
                     // Guest time of each dump, in the units of DOT_INPUT, to line scripts up with frames.
                     if (std::FILE* f = std::fopen((std::filesystem::path(dir) / "frames.txt").c_str(), "a")) {
                         std::fprintf(f, "%s %.1f\n", id.c_str(), hle::service::gsp::stats().vblanks / 59.83);

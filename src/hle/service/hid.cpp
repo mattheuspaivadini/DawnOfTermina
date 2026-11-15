@@ -17,6 +17,7 @@
 // hid:USER — input through shared memory: a ring of 8 pad states (buttons + circle pad)
 // and touch states, refreshed periodically from the host input (hle::hid; the mouse is the stylus).
 
+#include "recomp/hooks.h"
 #include "hle/hid.h"
 #include "core/savestate.h"
 #include "hle/ipc.h"
@@ -63,7 +64,9 @@ void update() {
     if (!g_pad0) return;
     const u32 base = g_shared ? kernel::shared_memory(g_shared).addr : 0;
     if (base) {
-        const auto pad = hle::hid::ReadPad();
+        auto pad = hle::hid::ReadPad();
+        recomp::hooks::dekui_filter_pad(pad.hold, pad.stick_x, pad.stick_y);
+        if (recomp::hooks::dekui_touch_blocked()) pad.touch = false;
         const u64 tick = hle::svc::GetSystemTick();
 
         // Pad header: ring header, pad[2], f32 3D slider, u32 buttons, u32 raw circle pad, pad;

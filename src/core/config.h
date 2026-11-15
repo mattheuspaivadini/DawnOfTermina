@@ -29,10 +29,17 @@ struct Config {
     // [display]
     std::string resolution = "1080p";  // 1080p | 720p | native (240p: 1x render scale)
     std::string widescreen = "16:9";   // off | 16:9 | 16:10 | 21:9 | window
-    std::string layout = "single";     // single (top screen fills the window) | dual
+    std::string layout = "n64";        // n64 (HUD in the corners, menus pop up) | single (bottom overlay) | dual
     bool fullscreen = false;
     bool vsync = true;
     int fps = 30;                      // 30 (native) or 60 (frame interpolation; needs GPU headroom)
+    // [hud] (n64 layout)
+    float hud_scale = 0.6f;            // size of the bottom-screen pieces in the corners
+    float hud_opacity = 0.9f;
+    bool minimap = true;               // Tab
+    // [camera] vertical FOV in degrees, 45 (original) to 70; v1.0 and Restoration builds only
+    float fov = 45.0f;
+    float cutscene_fov = 45.0f;
     // [audio]
     int volume = 100;                  // percent
     // [input]

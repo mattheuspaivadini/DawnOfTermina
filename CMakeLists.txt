@@ -60,10 +60,19 @@ add_library(dot_runtime STATIC
     src/hle/service/hid.cpp
     src/hle/service/dsp.cpp
     src/recomp/hooks.cpp
+    src/recomp/dekui.cpp
+    src/recomp/dekui_settings.cpp
+    ${CMAKE_BINARY_DIR}/dekui_presentation.cpp
     src/recomp/runtime.cpp
     src/recomp/svc.cpp
 )
+# DekUI's default presentation.json, embedded (src/recomp/dekui_settings.cpp).
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS resources/dekui/presentation.json)
+file(READ resources/dekui/presentation.json DOT_DEKUI_PRESENTATION)
+file(CONFIGURE OUTPUT ${CMAKE_BINARY_DIR}/dekui_presentation.cpp @ONLY CONTENT
+    "extern const char* const kDekuiPresentation;\nconst char* const kDekuiPresentation = R\"json(@DOT_DEKUI_PRESENTATION@)json\";\n")
 target_include_directories(dot_runtime PUBLIC src)
+target_include_directories(dot_runtime SYSTEM PRIVATE src/dekui)  # DekUI's headers, verbatim (GPL-2.0-or-later)
 target_link_libraries(dot_runtime PUBLIC SDL3::SDL3 Vulkan::Vulkan
     glslang::glslang glslang::SPIRV glslang::glslang-default-resource-limits)
 target_compile_options(dot_runtime PUBLIC -Wall -Wextra -Wno-missing-field-initializers)
@@ -108,15 +117,19 @@ endif()
 # Self-contained folder: cmake --install build --prefix dist. With game data configured the
 # executable holds the recompiled game code: personal use only, never commit or share it.
 install(TARGETS dawnoftermina RUNTIME DESTINATION .)
-install(FILES tools/extract_cia.py DESTINATION tools)
+install(FILES tools/extract_cia.py tools/bps_patch.py tools/romfs_patch.py DESTINATION tools)
 install(FILES LICENSE README.md DESTINATION .)
 
 enable_testing()
 add_executable(dot_selftest tests/selftest.cpp tests/pica_test.cpp tests/shader_test.cpp
     tests/recomp_test.cpp tests/audio_test.cpp)
 target_link_libraries(dot_selftest PRIVATE dot_runtime)
+target_include_directories(dot_selftest SYSTEM PRIVATE src/dekui)
 add_test(NAME selftest COMMAND dot_selftest ${CMAKE_SOURCE_DIR}/game_data)
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
     add_test(NAME recomp_lifter COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tools/recomp/test_lifter.py)
+    add_test(NAME tool_versions COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tools/test_versions.py)
+    add_test(NAME tool_bps COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tools/test_bps.py)
+    add_test(NAME tool_romfs COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tools/test_romfs.py)
 endif()

@@ -111,6 +111,10 @@ Cada função transcrita mantém o endereço virtual original em comentário (`/
 | 13 | Savestates: F5 salva, F9 carrega (`states/slot1.state`), `DOT_LOAD_STATE=<arquivo>` no boot | ✅ |
 | 14+ | Subsistemas do jogo (cenas, loop, colisão, atores, HUD) | ⏳ |
 
+## Contribuindo
+
+O desenvolvimento acontece na branch `dev` (ou em branches derivadas dela). Nada é commitado direto na `main`: as mudanças entram por Pull Request de `dev` para `main`.
+
 ## Licença
 
 O código-fonte original deste projeto é distribuído sob a **GNU General Public License v3.0 ou posterior** — veja [`LICENSE`](LICENSE).

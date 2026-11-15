@@ -8,6 +8,7 @@ Recompilação estática nativa de *Majora's Mask 3D* (3DS, ARM11) para C++20 + 
 2. **Commits sem co-autoria de IA.** Nenhum `Co-Authored-By`, trailer ou assinatura de IA. Apenas a autoria do `git config` do usuário.
 3. **Um commit por etapa/módulo**, somente após o build passar. Atualizar este arquivo (e a tabela de status do `README.md`) antes do commit.
 4. **Licença GPL-3.0-or-later.** Todo arquivo-fonte original começa com o cabeçalho GPL (modelo em `src/main.cpp`).
+5. **Fluxo de branches.** Nenhum commit de desenvolvimento direto na `main`. Todo trabalho ocorre na `dev` (ou em branches de feature derivadas dela), com commits limpos por etapa. Para integrar: `gh pr create --base main --head dev` e aguardar aprovação/merge. A `main` está protegida no GitHub (PR obrigatório, 0 aprovações exigidas, administrador isento: `enforce_admins` desligado).
 
 ## Convenções de código
 

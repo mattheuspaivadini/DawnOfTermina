@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "hle/service/gsp.h"
 #include "hle/svc.h"
 
 // Only what callers can observe under AAPCS is reproduced: the result register and the
@@ -63,9 +64,8 @@ u32 atan2f(Context* c) { set_fs(c, 0, std::atan2(fs(c, 0), fs(c, 1))); return c-
 
 std::atomic<float> fov{45.f}, cutscene_fov{45.f};
 
-// Pointer chains below run during the title screen too: read only mapped memory.
-static bool readable(u32 va, u32 bytes) {
-    if (va < 0x100000 || va & 3 || va > 0x40000000 - bytes) return false;
+bool readable(u32 va, u32 bytes) {
+    if (va < 0x100000 || va > 0x40000000 - bytes) return false;
     const hle::svc::MemoryInfo m = hle::svc::QueryMemory(va);
     return m.state != 0 && va + bytes <= u64(m.base) + m.size;
 }
@@ -73,7 +73,7 @@ static bool readable(u32 va, u32 bytes) {
 // Play's camera array: four 0x198-byte cameras at +0x408, active index at +0xA7A, Camera::setting
 // at +0x156; settings 9/10 (DEMO0/FREE0) are scripted cutscene cameras.
 static bool scripted_camera() {
-    if (!readable(0x72F5C0, 4)) return false;
+    if (!readable(0x72F5C0, 4)) return false;  // runs during the title screen too
     const u32 context = r32(0x72F5C0);
     if (!readable(context + 0x16C, 4)) return false;
     const u32 game = r32(context + 0x16C);
@@ -101,6 +101,17 @@ void fov_projection(Context* c) {
                                             std::tan(45.f * half_rad)) / half_rad);
     }
     c->s[0] = bits;
+}
+
+// add r0, r7, r8, lsl #2 where the pause menu starts copying the top screen into its backdrop
+// texture (0x120648 v1.0/Restoration, 0x120748 v1.1; DekUI's PauseCapture PC): the CPU reads the
+// linear framebuffer (RGB8, 400 rows of 240 * 3 bytes) at owner + 0xC + index * 4 (+8 for the
+// right eye) directly, which the renderer cannot see, so the GPU-side frame is written back first.
+// Without it the paused world behind the menus was black.
+void pause_capture_sync(Context* c) {
+    const u32 entry = c->r[7] + (c->r[8] << 2), fb = r32(entry + (c->r[4] ? 0x14 : 0xC));
+    if (fb) hle::service::gsp::cpu_read(fb, fb + 400 * 240 * 3);
+    c->r[0] = entry;
 }
 
 }  // namespace recomp::hooks

@@ -60,10 +60,12 @@ add_library(dot_runtime STATIC
     src/hle/service/hid.cpp
     src/hle/service/dsp.cpp
     src/recomp/hooks.cpp
+    src/recomp/dekui.cpp
     src/recomp/runtime.cpp
     src/recomp/svc.cpp
 )
 target_include_directories(dot_runtime PUBLIC src)
+target_include_directories(dot_runtime SYSTEM PRIVATE src/dekui)  # DekUI's headers, verbatim (GPL-2.0-or-later)
 target_link_libraries(dot_runtime PUBLIC SDL3::SDL3 Vulkan::Vulkan
     glslang::glslang glslang::SPIRV glslang::glslang-default-resource-limits)
 target_compile_options(dot_runtime PUBLIC -Wall -Wextra -Wno-missing-field-initializers)

@@ -28,6 +28,7 @@
 0x001e4f78 atan2f            # atan2f(y = s0, x = s1) -> s0
 0x0018d570 fov_projection insn  # vldr s0, [r4, #0x18]: camera FOV when building the projection (DekUI)
 0x0018d584 fov_projection insn  # same, second branch of the function
+0x00120648 pause_capture_sync insn  # add r0, r7, r8, lsl #2: the CPU reads the top framebuffer for the pause backdrop
 
 [1.1 a1d1724df4857a68df200d2543ab6c96df172738fe511f58168b77c58fe36e05]
 0x0030029c aeabi_memcpy
@@ -42,6 +43,7 @@
 0x0022a39c sinf
 0x0022a224 cosf
 0x001e4f68 atan2f
+0x00120748 pause_capture_sync insn  # same, v1.1
 
 # Project Restoration 1.5.9 over v1.1 (or v1.0): the patched code.bin keeps the v1.0 layout and
 # leaves these 12 routines byte-identical, so the v1.0 addresses apply.
@@ -60,6 +62,7 @@
 0x001e4f78 atan2f            # atan2f(y = s0, x = s1) -> s0
 0x0018d570 fov_projection insn  # vldr s0, [r4, #0x18]: camera FOV when building the projection (DekUI)
 0x0018d584 fov_projection insn  # same, second branch of the function
+0x00120648 pause_capture_sync insn  # add r0, r7, r8, lsl #2: the CPU reads the top framebuffer for the pause backdrop
 
 # Project Restoration 1.5.9 + HD HUD (mm3d_project_restoration_plus_hd_hud_v1.5.9-5-g8bb2a7b, the
 # build DekUI uses; every v100/v101/v110 variant yields this code.bin): same addresses.
@@ -78,3 +81,16 @@
 0x001e4f78 atan2f            # atan2f(y = s0, x = s1) -> s0
 0x0018d570 fov_projection insn  # vldr s0, [r4, #0x18]: camera FOV when building the projection (DekUI)
 0x0018d584 fov_projection insn  # same, second branch of the function
+0x00120648 pause_capture_sync insn  # add r0, r7, r8, lsl #2: the CPU reads the top framebuffer for the pause backdrop
+# DekUI single-screen inventory (src/recomp/dekui.cpp; PCs from DekUI's NativeInventory,
+# ItemPreview and InventoryNavigation, verified against this code.bin by CodeMatches at runtime).
+0x0059e3e8 dekui_capture_page insn    # mov r4, r0: Items/Masks page
+0x005c250c dekui_capture_page insn    # mov r4, r0: Items/Masks page, icon array built
+0x005a6b44 dekui_capture_gear insn    # mov r4, r0: Gear page
+0x005a5fc8 dekui_close_gear insn      # mov r5, r0: Gear page closes
+0x00126814 dekui_layout_pass insn     # mov r4, r0: draw one screen's layout queue (r1 = screen)
+0x001262f0 dekui_layout_begin insn    # add r2, r4, #8: before drawing layout r4
+0x001262fc dekui_layout_end insn      # str r0, [r6]: after drawing it
+0x005a0e88 dekui_nav_vertical insn 0x005a0eb0    # ldrb r1, [r4, #0x19]
+0x005a1498 dekui_nav_horizontal insn 0x005a14c0  # ldrb r1, [r4, #0x18]
+0x005a56c0 dekui_nav_gear insn 0x005a56e0 0x005a574c  # orr r2, r2, r12

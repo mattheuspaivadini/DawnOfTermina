@@ -41,6 +41,8 @@ O código ARM11 original (`code.bin` do ExeFS) é traduzido automaticamente para
    python3 tools/extract_cia.py "ISO/<seu jogo>.cia" game_data/ --update "ISO/<update v1.1>.cia" \
        --restoration mm3d_project_restoration_plus_hd_hud_v1.5.9-5-g8bb2a7b.7z --romfs mm3d_big_screen_layout_779512b.7z
    ```
+   Com esse build, os menus **Items, Masks e Gear abrem na tela de cima** (porte do inventário do DekUI), navegáveis por D-pad/analógico; `DOT_DEKUI=0` volta aos menus originais.
+
    `--romfs <arquivo|pasta>` (repetível) aplica qualquer mod de RomFS: os arquivos são acrescentados ou substituídos dentro do `romfs.bin` por `tools/romfs_patch.py` (a imagem é regravada, ~650 MB).
 
 Alternativa: abra o jogo sem `game_data/`; uma tela pede o seu `.cia` (sugere um que esteja em `ISO/`) e faz a extração para `game_data/` ao lado do projeto. O executável procura `game_data/` no diretório atual e ao lado do binário (`build/../game_data`), então também abre por duplo clique.
@@ -136,7 +138,7 @@ O desenvolvimento acontece na branch `dev` (ou em branches derivadas dela). Nada
 ## Créditos
 
 - **[Project Restoration](https://restoration.zora.re/)** ([código](https://github.com/leoetlino/project-restoration)), de **leoetlino** e colaboradores (GPL-2.0): o mod de jogabilidade que o extrator aplica com `--restoration` a partir do pacote oficial fornecido pelo usuário. Nenhum arquivo do mod é distribuído aqui.
-- **[DekUI](https://gamebanana.com/mods/723825)** ([código](https://github.com/tgacquin/mm3d-dekui)), de **Thomas (tgacquin)** e dos *MM3D presentation contributors*, sobre o Azahar e o Project Restoration: base da interpolação de câmera do modo 60 FPS (ponto médio rígido por quaternion e detecção de cortes, `src/gfx/camera_midpoint.h`) e do FOV ajustável (hook em `0x18D570`/`0x18D584`, `src/recomp/hooks.cpp`). Trechos portados do código GPL-2.0-or-later do DekUI, com atribuição nos arquivos.
+- **[DekUI](https://gamebanana.com/mods/723825)** ([código](https://github.com/tgacquin/mm3d-dekui)), de **Thomas (tgacquin)** e dos *MM3D presentation contributors*, sobre o Azahar e o Project Restoration: inventário na tela de cima (headers do DekUI copiados sem modificação em `src/dekui/`, cola em `src/recomp/dekui.cpp`), correção do fundo da pausa (PC do `PauseCapture`), base da interpolação de câmera do modo 60 FPS (ponto médio rígido por quaternion e detecção de cortes, `src/gfx/camera_midpoint.h`) e do FOV ajustável (hook em `0x18D570`/`0x18D584`, `src/recomp/hooks.cpp`). Trechos portados do código GPL-2.0-or-later do DekUI, com atribuição nos arquivos.
 - **[Citra](https://github.com/citra-emu/citra) / [Azahar](https://github.com/azahar-emu/azahar)** e **[3dbrew](https://www.3dbrew.org/)**: referência para o PICA200, o DSP e os serviços do Horizon.
 
 ## Licença

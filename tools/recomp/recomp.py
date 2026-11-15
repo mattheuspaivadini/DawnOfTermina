@@ -322,6 +322,11 @@ class Recompiler:
         t = bool(key & 1)
         resume = self.resume_points(insns, labels)
         labels |= resume
+        addrs = {i.addr for i in insns}
+        for a in addrs & self.insn_hooks.keys():  # an instruction hook's jump targets are local labels
+            if missing := [h(x) for x in self.insn_hooks[a][1] if x not in addrs]:
+                raise SystemExit(f"hooks.txt: {h(a)} jumps outside its function: {', '.join(missing)}")
+            labels |= set(self.insn_hooks[a][1])
         out.append(f"u32 {self.name(key)}(recomp::Context* c) {{")
         out.append("    u32 jt = 0;")
         out.append("    u32 entry_lr = c->r[14];  // a computed jump here is a return (e.g. pop {r3}; bx r3)")
@@ -333,7 +338,9 @@ class Recompiler:
                 out.append(f"L_{insn.addr:08X}:")
             stmt = self.emit_insn(insn, by_addr)
             if insn.addr in self.insn_hooks and not insn.thumb:  # replaces the instruction (keeps its condition)
-                stmt = f"recomp::hooks::{self.insn_hooks[insn.addr]}(c);"
+                name, targets = self.insn_hooks[insn.addr]
+                stmt = (f"{{ u32 t = recomp::hooks::{name}(c); if (t) {{ jt = t; goto dispatch; }} }}" if targets
+                        else f"recomp::hooks::{name}(c);")
             if "recomp::svc(" in insn.code:  # savestates resume a thread parked in a syscall here
                 stmt = f"c->r[15] = {h(insn.addr | t)}; {stmt}"
             if insn.cond != AL and insn.kind != "branch" or (insn.kind == "branch" and insn.cond != AL):
@@ -424,8 +431,9 @@ def init_array_seeds(image):
 
 def select_hooks(text: str, code_sha256: str):
     """hooks.txt section whose `[<version> <sha256>]` header matches the code.bin hash ->
-    (version, {entry: hook}, {instruction VA: hook}); (None, {}, {}) when no section matches.
-    A line ending in `insn` hooks one instruction instead of a whole function."""
+    (version, {entry: hook}, {instruction VA: (hook, branch targets)}); (None, {}, {}) when no
+    section matches. `<VA> <hook> insn [<target>...]` hooks one instruction instead of a whole
+    function; with targets, the hook returns 0 (fall through) or one of them (a jump)."""
     sections, cur = {}, None
     for line in text.splitlines():
         line = line.split("#")[0].split()
@@ -437,7 +445,10 @@ def select_hooks(text: str, code_sha256: str):
         elif cur is None:
             raise SystemExit("hooks.txt: hook outside a [<version> <sha256>] section")
         else:
-            cur[2 if line[2:] == ["insn"] else 1][int(line[0], 16)] = line[1]
+            if line[2:3] == ["insn"]:
+                cur[2][int(line[0], 16)] = (line[1], tuple(int(t, 16) for t in line[3:]))
+            else:
+                cur[1][int(line[0], 16)] = line[1]
     return sections.get(code_sha256.lower(), (None, {}, {}))
 
 

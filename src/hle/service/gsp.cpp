@@ -449,6 +449,8 @@ bool screen_dump(int screen, std::vector<u32>& rgba, u32& width, u32& height, bo
 
 Stats stats() { return {g_vblanks, g_lists, g_draws, g_fills, g_transfers, g_frames}; }
 
+void cpu_read(u32 start, u32 end) { settle(start, end); }
+
 }  // namespace gsp
 
 }  // namespace hle::service

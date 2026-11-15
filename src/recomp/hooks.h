@@ -38,12 +38,30 @@ u32 sinf(Context* c);
 u32 cosf(Context* c);
 u32 atan2f(Context* c);
 
-// Instruction hooks (`insn` in hooks.txt): run in place of one instruction.
+// Whether [va, va + bytes) is mapped guest memory (pointer chains followed by hooks).
+bool readable(u32 va, u32 bytes);
+
+// Instruction hooks (`insn` in hooks.txt): run in place of one instruction; those declared with
+// jump targets return 0 (fall through) or the target.
 // Camera FOV (port of DekUI's CameraLive): replaces `vldr s0, [r4, #0x18]` where the game builds a
 // camera projection from its vertical FOV. 45° is the original gameplay FOV; a larger setting
 // widens every camera by the same factor in projection space. Settings in degrees, 45..70
 // (45 = original); cutscene_fov applies while the live top-screen camera is scripted.
 extern std::atomic<float> fov, cutscene_fov;
 void fov_projection(Context* c);
+
+void pause_capture_sync(Context* c);
+
+// DekUI single-screen inventory (src/recomp/dekui.cpp): Items/Masks/Gear on the top screen.
+void dekui_capture_page(Context* c);
+void dekui_capture_gear(Context* c);
+void dekui_close_gear(Context* c);
+void dekui_layout_pass(Context* c);
+void dekui_layout_begin(Context* c);
+void dekui_layout_end(Context* c);
+u32 dekui_nav_vertical(Context* c);
+u32 dekui_nav_horizontal(Context* c);
+u32 dekui_nav_gear(Context* c);
+bool dekui_inventory_routed();  // this frame's inventory page was moved to the top screen
 
 }  // namespace recomp::hooks

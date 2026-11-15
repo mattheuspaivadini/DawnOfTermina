@@ -45,6 +45,7 @@
 #include "hle/service/services.h"
 #include "hle/svc.h"
 #include "recomp/runtime.h"
+#include "recomp/hooks.h"
 #include "ui/menu.h"
 
 #ifdef DOT_HAVE_RECOMP
@@ -244,7 +245,8 @@ int main(int argc, char** argv) {
             // play loop (0x15F644) from the touch-screen menu state; set with the Items/Masks menus,
             // clear through boot, title and cutscenes (savestate diffs + trace). Same .data offset in
             // v1.0, v1.1 and Project Restoration (2 code references each).
-            gfx::g_bottom_modal = mem.read<u32>(code->data.addr + 0x58A18) & 1;
+            // A menu page that DekUI's NativeInventory drew on the top screen needs no pop-up.
+            gfx::g_bottom_modal = (mem.read<u32>(code->data.addr + 0x58A18) & 1) && !recomp::hooks::dekui_inventory_routed();
             // Halfword at 0x68D300 (v1.0, 31 code references; same offset in the other versions):
             // 0 only while the bottom screen shows the gameplay HUD (1 through boot, title, opening
             // cutscenes and menus). The HUD pieces are hidden otherwise.

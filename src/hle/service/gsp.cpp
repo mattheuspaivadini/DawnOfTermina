@@ -99,6 +99,7 @@ void vblank() {
         }
     }
     ++g_vblanks;
+    if (auto* r = g_renderer.load()) r->vblank();
     signal_interrupt(PDC0);
     signal_interrupt(PDC1);
 }

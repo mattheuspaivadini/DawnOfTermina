@@ -24,7 +24,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
+#include <fstream>
+#include <map>
+#include <set>
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
@@ -39,6 +43,7 @@
 #include "hle/dsp.h"
 #include "hle/hid.h"
 #include "hle/kernel.h"
+#include "hle/service/gsp.h"
 #include "recomp/hooks.h"
 
 namespace ui {
@@ -80,7 +85,7 @@ void apply(const core::Config& c, const core::Config* prev) {
         if (g_renderer && g_mem) g_renderer->set_scale(*g_mem, c.render_scale());
     }
     if (g_renderer && prev->widescreen != c.widescreen) g_renderer->set_widescreen(aspect(c.widescreen));
-    if (g_renderer && prev->fps != c.fps) g_renderer->set_interpolate(c.fps >= 60);
+    if (g_renderer && prev->fps != c.fps) g_renderer->set_frame_rate(c.fps);
 }
 
 void save() {
@@ -128,8 +133,13 @@ void draw_menu() {
             }
             ImGui::Checkbox("Fullscreen (F11)", &c.fullscreen);
             ImGui::Checkbox("VSync", &c.vsync);
-            int fps = c.fps >= 60 ? 1 : 0;
-            if (ImGui::Combo("Frame rate", &fps, "30 FPS (original)\0" "60 FPS (interpolated)\0")) c.fps = fps ? 60 : 30;
+            int fps = c.fps / 30 - 1;
+            if (ImGui::Combo("Frame rate", &fps, "30 FPS (original)\0" "60 FPS (interpolated)\0" "90 FPS (interpolated)\0" "120 FPS (interpolated)\0"))
+                c.fps = (fps + 1) * 30;
+            choice("Performance overlay", c.perf, {{"off", "Off"}, {"fps", "FPS only"}, {"full", "Full (FPS, 1% low, CPU, GPU, RAM)"}});
+            ImGui::BeginDisabled(c.perf == "off");
+            ImGui::SliderFloat("Overlay opacity", &c.perf_opacity, 0.1f, 1.0f, "%.2f");
+            ImGui::EndDisabled();
             ImGui::SliderFloat("Camera FOV", &c.fov, 45.0f, 70.0f, "%.0f deg");
             ImGui::SliderFloat("Cutscene FOV", &c.cutscene_fov, 45.0f, 70.0f, "%.0f deg");
             ImGui::TextDisabled("45 = original. Game v1.0 / Project Restoration only.");
@@ -170,7 +180,7 @@ void draw_menu() {
         c.fullscreen != g_cfg->fullscreen || c.vsync != g_cfg->vsync || c.fps != g_cfg->fps ||
         c.volume != g_cfg->volume || c.mouse_sensitivity != g_cfg->mouse_sensitivity || c.hud_scale != g_cfg->hud_scale ||
         c.hud_opacity != g_cfg->hud_opacity || c.minimap != g_cfg->minimap || c.fov != g_cfg->fov ||
-        c.cutscene_fov != g_cfg->cutscene_fov) {
+        c.cutscene_fov != g_cfg->cutscene_fov || c.perf != g_cfg->perf || c.perf_opacity != g_cfg->perf_opacity) {
         apply(c, g_cfg);
         *g_cfg = c;
         save();
@@ -198,6 +208,85 @@ void draw_hud() {
         dl->AddImage(tex, ImVec2(r.x, r.y), ImVec2(r.x + r.w, r.y + r.h), ImVec2(p.src.x / 320, p.src.y / 240),
                      ImVec2((p.src.x + p.src.w) / 320, (p.src.y + p.src.h) / 240), tint);
     }
+}
+
+// Performance overlay (top-left). Sampled once per second: game FPS = top-screen buffer swaps
+// (30 even when presenting 60 interpolated), CPU = process CPU time / wall time (100% = one core),
+// GPU = DRM fdinfo engine time of this process (i915/xe/amdgpu; "n/a" elsewhere), RAM = RSS.
+// The 1% low is the average FPS of the slowest 1% of presented frames in the last ~10 s.
+struct PerfSample {
+    double game_fps = 0, shown_fps = 0, low1 = 0, cpu = 0, gpu = -1, ram_mb = 0;
+};
+
+double drm_engine_ns() {  // busiest engine, summed over this process's distinct DRM clients
+    std::map<std::string, double> engines;
+    std::set<std::string> clients;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator("/proc/self/fdinfo", ec)) {
+        std::ifstream f(e.path());
+        std::string line, id;
+        std::map<std::string, double> mine;
+        while (std::getline(f, line)) {
+            if (line.rfind("drm-client-id:", 0) == 0) id = line.substr(14);
+            else if (line.rfind("drm-engine-", 0) == 0 && line.find("capacity") == std::string::npos)
+                mine[line.substr(0, line.find(':'))] = std::atof(line.c_str() + line.find(':') + 1);
+        }
+        if (id.empty() || !clients.insert(id).second) continue;
+        for (auto& [k, v] : mine) engines[k] += v;
+    }
+    double best = -1;
+    for (auto& [k, v] : engines) best = std::max(best, v);
+    return best;
+}
+
+void draw_perf(const core::Config& c) {
+    static PerfSample s;
+    static std::vector<float> dts;  // presented frame times (s), ~10 s
+    static double t0 = 0, cpu0 = 0, gpu0 = 0;
+    static u64 frames0 = 0;
+    static int n = 0;
+    const double now = double(SDL_GetTicksNS()) * 1e-9;
+    dts.push_back(ImGui::GetIO().DeltaTime);
+    if (dts.size() > 600) dts.erase(dts.begin());
+    if (now - t0 >= 1.0) {
+        timespec ts;
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+        const double cpu = ts.tv_sec + ts.tv_nsec * 1e-9, gpu = drm_engine_ns();
+        const u64 frames = hle::service::gsp::stats().frames;
+        if (t0 > 0) {
+            const double dt = now - t0;
+            s.game_fps = double(frames - frames0) / dt;
+            s.cpu = (cpu - cpu0) / dt * 100;
+            s.gpu = gpu >= 0 && gpu0 >= 0 ? std::min(100.0, (gpu - gpu0) * 1e-9 / dt * 100) : -1;
+            s.shown_fps = n ? double(n) / dt : 0;
+            std::vector<float> sorted = dts;
+            std::sort(sorted.rbegin(), sorted.rend());
+            const size_t k = std::max<size_t>(1, sorted.size() / 100);
+            double sum = 0;
+            for (size_t i = 0; i < k; ++i) sum += sorted[i];
+            s.low1 = double(k) / sum;
+            if (FILE* f = std::fopen("/proc/self/statm", "r")) {
+                long pages = 0, rss = 0;
+                if (std::fscanf(f, "%ld %ld", &pages, &rss) == 2) s.ram_mb = double(rss) * double(sysconf(_SC_PAGESIZE)) / 1048576.0;
+                std::fclose(f);
+            }
+        }
+        t0 = now, cpu0 = cpu, gpu0 = gpu, frames0 = frames, n = 0;
+    }
+    ++n;
+    char buf[256];
+    if (c.perf == "fps") std::snprintf(buf, sizeof buf, "%.0f FPS", s.game_fps);
+    else {
+        char gpu[24] = "n/a";
+        if (s.gpu >= 0) std::snprintf(gpu, sizeof gpu, "%.0f%%", s.gpu);
+        std::snprintf(buf, sizeof buf, "Game  %.0f FPS\nShown %.0f FPS (1%% low %.0f)\nCPU   %.0f%%\nGPU   %s\nRAM   %.0f MB",
+                      s.game_fps, s.shown_fps, s.low1, s.cpu, gpu, s.ram_mb);
+    }
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    const ImVec2 sz = ImGui::CalcTextSize(buf), pos(12, 12);
+    const float a = c.perf_opacity;
+    dl->AddRectFilled(ImVec2(pos.x - 6, pos.y - 4), ImVec2(pos.x + sz.x + 6, pos.y + sz.y + 4), IM_COL32(0, 0, 0, int(a * 160)), 4);
+    dl->AddText(pos, IM_COL32(255, 255, 255, int(a * 255)), buf);
 }
 
 bool imgui_init(SDL_Window* window, gfx::vulkan::Context& gpu) {
@@ -471,7 +560,8 @@ void frame() {
         state_status = st;
         SDL_SetWindowTitle(g_window, ("DawnOfTermina - " + st).c_str());
     }
-    if (!g_visible && !gfx::g_n64) {
+    const bool perf = g_cfg->perf != "off";
+    if (!g_visible && !gfx::g_n64 && !perf) {
         g_gpu->set_overlay(nullptr);
         return;
     }
@@ -480,6 +570,7 @@ void frame() {
     ImGui::NewFrame();
     if (gfx::g_n64) draw_hud();
     if (g_visible) draw_menu();
+    if (perf) draw_perf(*g_cfg);
     ImGui::Render();
     g_gpu->set_overlay([](VkCommandBuffer cmd) { ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd); });
 }

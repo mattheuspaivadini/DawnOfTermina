@@ -144,13 +144,16 @@ class Recompiler:
     def jump_table(self, insn):
         """Case targets of the two ARMCC switch idioms, bounded by an earlier `cmp rX, #N`:
         `addls pc, pc, rX, lsl #2` (a table of branches right after) and
-        `ldrlo pc, [pc, rX, lsl #2]` (a table of absolute addresses right after)."""
+        `ldrlo pc, [pc, rX, lsl #2]` (a table of absolute addresses right after).
+        `add pc, pc, rX, lsl #2` with any other condition is also handled: a table of branches,
+        or (libgcc's __udivsi3/__divsi3 in mod code: `addne pc, pc, r3, lsl #2`) a jump into
+        an unrolled loop, where every following instruction up to the first branch is a target."""
         out = []
         for kind, rm, pc in insn.extra_targets:
-            if insn.thumb or insn.cond not in (3, 9):  # LO: N cases, LS: N + 1 cases
+            if insn.thumb or (kind == "abs_table" and insn.cond not in (3, 9)):  # LO: N cases, LS: N + 1
                 continue
             bound = None
-            for back in range(1, 17):  # the compiler interleaves independent instructions
+            for back in range(1, 17) if insn.cond in (3, 9) else ():  # the compiler interleaves independent instructions
                 p = insn.addr - 4 * back
                 if not self.image.in_text(p):
                     break
@@ -174,6 +177,10 @@ class Recompiler:
                                                 abs(word - pc) > 0x100000):
                         break  # absolute slots: nearby, aligned code addresses
                     count += 1
+                if kind == "table" and count == 0:  # unrolled code: up to the first non-data instruction
+                    while count < 128 and self.image.in_text(pc + 4 * count) and \
+                            self.decode(pc + 4 * count, False).kind == "normal":
+                        count += 1
             if kind == "table":
                 out += [pc + 4 * k for k in range(count)]
             else:  # abs_table: words at pc

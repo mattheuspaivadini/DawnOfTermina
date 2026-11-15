@@ -60,14 +60,16 @@ public:
     // the transfer is not one the GPU path handles (the caller then runs it on the CPU).
     bool display_transfer(core::Memory& mem, u32 in, u32 out, u32 in_dim, u32 out_dim, u32 flags);
     // The screen image last transferred to `va`, if guest memory there is unchanged since.
-    // With frame interpolation (DOT_FPS=60), a presenting call (`consume`) returns the
-    // in-between frame during the first 60 Hz period after a new frame, then the real one.
+    // With frame interpolation (DOT_FPS=60/90/120), a presenting call (`consume`) for the top
+    // screen returns the real or in-between image due now on the presentation timeline.
     bool display(core::Memory& mem, u32 va, GpuScreen& out, bool consume = true);
+    // Guest VBlank (GSP): the clock the presentation timeline runs on.
+    void vblank();
     // Reads a screen image back (DOT_DUMP_FRAMES), RGBA8 rows top first.
     bool read_display(u32 va, std::vector<u32>& rgba, u32& width, u32& height, bool interp = false);
     u32 scale() const;
-    // Runtime settings (menu): top screen aspect (0 = off, < 0 = the window's), DOT_FPS=60
-    // frame interpolation and the resolution scale (1-8). A new scale writes GPU-only surfaces
+    // Runtime settings (menu): top screen aspect (0 = off, < 0 = the window's), frame rate
+    // (30 = off, 60/90/120 = 1/2/3 interpolated frames per game frame) and the resolution scale (1-8). A new scale writes GPU-only surfaces
     // back to guest memory and drops every cached render target; the next draws recreate them.
     // Call it from the presenting thread before it fetches the screens (their images die here).
     void set_scale(core::Memory& mem, u32 scale);
@@ -76,12 +78,14 @@ public:
     void flush(core::Memory& mem);
     void drop_targets();
     void set_widescreen(float aspect);
-    void set_interpolate(bool on);
+    void set_frame_rate(u32 fps);
 
     struct Stats {
         u64 draws, skipped, pipelines, readbacks, shaders;  // shaders = GLSL compiled (not from the disk cache)
-        u64 interpolated, not_interpolated;                 // DOT_FPS=60: in-between frames made / skipped (cuts)
-        u64 camera_draws;                                   // in-between draws moved along the rigid camera midpoint
+        u64 interpolated, not_interpolated;                 // DOT_FPS>=60: game frames interpolated / not (cuts)
+        u64 camera_draws;                                   // in-between draws moved along the rigid camera path
+        u64 uv_wrapped, uv_stepped;                         // in-between UV translations: shortest way round / cell switch
+        u64 smooth, repeated, skipped_shots;                // top-screen presents: next image / same again / one jumped
     };
     Stats stats() const;
 

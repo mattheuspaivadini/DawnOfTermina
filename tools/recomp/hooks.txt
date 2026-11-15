@@ -36,3 +36,19 @@
 0x0022a39c sinf
 0x0022a224 cosf
 0x001e4f68 atan2f
+
+# Project Restoration 1.5.9 over v1.1 (or v1.0): the patched code.bin keeps the v1.0 layout and
+# leaves these 12 routines byte-identical, so the v1.0 addresses apply.
+[1.0+restoration-1.5.9 f3d8b649adeaef0eab43288726a824f607d301bbf5a1b48ff9873404e241be3f]
+0x00300154 aeabi_memcpy      # RVCT __aeabi_memcpy(dst, src, n)
+0x00300144 memcpy_src_dst    # swaps r0/r1, then __aeabi_memcpy
+0x001f28e8 aeabi_memcpy4     # word-aligned variant
+0x0014c364 aeabi_memmove4    # word-aligned memmove (backward copy when overlapping)
+0x00137ed4 aeabi_memset      # __aeabi_memset(dst, n, c)
+0x0016e63c aeabi_memclr      # __aeabi_memclr(dst, n)
+0x00300338 aeabi_memclr4     # word-aligned variant
+0x003028e0 strlen
+0x00302e3c strcmp
+0x0022a3ac sinf              # hard-float: s0 -> s0
+0x0022a234 cosf
+0x001e4f78 atan2f            # atan2f(y = s0, x = s1) -> s0

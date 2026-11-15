@@ -12,6 +12,7 @@ The output is derived from the game binary: it lives in the build tree, never in
 import argparse
 import collections
 import hashlib
+import json
 import struct
 import sys
 from pathlib import Path
@@ -30,6 +31,11 @@ class Image:
         self.code = (game_data / "exefs" / "code.bin").read_bytes()
         seg = lambda o: struct.unpack_from("<III", exh, o)  # addr, pages, size
         self.text, self.rodata, self.data = seg(0x10), seg(0x20), seg(0x30)
+        # Code ranges: .text, plus the code a mod appended to .data (manifest.json, Project Restoration).
+        self.code_ranges = [(self.text[0], self.text[2])]
+        manifest = game_data / "manifest.json"
+        if manifest.exists() and (r := json.loads(manifest.read_text()).get("restoration_code")):
+            self.code_ranges.append((r[0], r[1] - r[0]))
         self.segs = []  # (va, size, file offset)
         off = 0
         for va, pages, size in (self.text, self.rodata, self.data):
@@ -43,8 +49,11 @@ class Image:
         return None
 
     def in_text(self, a, n=4):
-        va, size, _ = self.segs[0]
-        return va <= a and a + n <= va + size
+        return self.region(a, n) is not None
+
+    def region(self, a, n=4):
+        """Index of the code range holding [a, a + n), or None."""
+        return next((i for i, (va, size) in enumerate(self.code_ranges) if va <= a and a + n <= va + size), None)
 
     def read32(self, a):
         return struct.unpack_from("<I", self.code, self._off(a, 4))[0]
@@ -85,7 +94,17 @@ class Recompiler:
             return False
         return self.decode(addr, t).kind != "trap"
 
-    def plausible_walk(self, key, limit=512):
+    def walk_ok(self, key):
+        """plausible_walk, stricter in a mod's code range (not .text), which also holds the mod's
+        data: zero words (padding, tables) decode as valid instructions there, and constants
+        such as 0x7FFFFF land in it, so a walk through a zero word or a Thumb start inside a
+        word already decoded as ARM is rejected."""
+        a, t = key & ~1, bool(key & 1)
+        if self.image.region(a) in (0, None):
+            return self.plausible_walk(key)
+        return not (t and (a & ~3, False) in self.seen) and self.plausible_walk(key, no_zero=True)
+
+    def plausible_walk(self, key, limit=512, no_zero=False):
         """Stronger check for candidates found in data: following control flow from `key`
         must decode cleanly (no trap, no exit from .text) until it reaches a return/jump or
         `limit` instructions have been decoded (long functions)."""
@@ -101,6 +120,8 @@ class Recompiler:
                 return False
             seen.add(a)
             budget -= 1
+            if no_zero and (self.image.read16(a) if t else self.image.read32(a)) == 0:
+                return False
             insn = self.decode(a, t)
             if insn.kind == "trap":
                 return False
@@ -188,14 +209,20 @@ class Recompiler:
                 new = []
                 if insn.kind == "branch":
                     self.branch_targets.add(insn.target)
-                if insn.kind == "call" or (insn.kind == "branch" and bool(insn.target & 1) != t):
+                # A branch that changes mode or code range is a tail call: a mod's hook stub returns
+                # with `b` into the middle of the original function, which must not be inlined into it.
+                if insn.kind == "call" or (insn.kind == "branch" and (bool(insn.target & 1) != t or
+                                           self.image.region(a) != self.image.region(insn.target & ~1))):
                     new.append(insn.target)
+                lit = None
                 if insn.literal is not None:
                     v = self.image.read32(insn.literal)
                     if self.image.in_text(v & ~1):
                         new.append(v)
+                        lit = v
                 for k in new:
-                    if k not in self.entries and self.plausible(k):
+                    ok = self.walk_ok(k) if k == lit and self.image.region(k & ~1) else self.plausible(k)
+                    if k not in self.entries and ok:
                         self.entries.add(k)
                         work.append(k)
                 if insn.pointer is not None:
@@ -212,7 +239,7 @@ class Recompiler:
             return False  # inside code already decoded (tail-call targets excepted)
         if (a - 2, True) in self.seen and self.decode(a - 2, True).size == 4:
             return False  # second half of a Thumb BL/BLX pair
-        return self.plausible_walk(v)
+        return self.walk_ok(v)
 
     def pc_relative_pointers(self):
         """Code addresses computed position-independently: `ldr rX, =offset` followed
@@ -237,7 +264,7 @@ class Recompiler:
                 insn = self.decode(p, t)
                 if insn.literal is not None and insn.code.startswith(f"c->r[{rd}] = "):
                     v = (self.image.read32(insn.literal) + pcv) & 0xFFFFFFFF
-                    if self.image.in_text(v & ~1) and v not in self.entries and self.plausible_walk(v):
+                    if self.image.in_text(v & ~1) and v not in self.entries and self.walk_ok(v):
                         found.append(v)
                     break
         return found

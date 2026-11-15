@@ -6,18 +6,31 @@ LZSS-decompressed), code.elf (code.bin at its original VAs, for Hopper), romfs/ 
 raw romfs.bin image (served to the game by the fs:USER HLE).
 Pure Python, no ctrtool/3dstool needed.
 
-usage: extract_cia.py <game.cia> [out_dir=game_data] [--update <update.cia>]
+usage: extract_cia.py <game.cia> [out_dir=game_data] [--update <update.cia>] [--restoration <mod>]
 
 --update applies the official update (title 0004000E..., v1.1 recommended) on top of the base:
 exheader.bin and code.bin are replaced, its RomFS goes to update_romfs.bin (base romfs.bin kept). The resulting
 version and code.bin SHA-256 go to out_dir/manifest.json.
+
+--restoration applies Project Restoration (https://restoration.zora.re/) last, on top of v1.1: the
+release archive (.zip, or .7z with 7z/bsdtar installed) or a folder with code.bps, exheader.bin or
+exheader.bps, and optionally romfs/. The code.bps whose source CRC32 matches code.bin is picked
+(the release has one per game version; its 3ds/ variant is preferred over citra/).
 """
 import argparse
 import hashlib
 import json
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
+import zipfile
+import zlib
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))  # run with python3 -I, which leaves the script dir out
+from bps_patch import BPSError, bps_apply, bps_info  # noqa: E402
 
 MEDIA_UNIT = 0x200
 
@@ -271,11 +284,93 @@ def extract(cia: Path, out: Path, romfs_image="romfs.bin"):
     return cs
 
 
+def unpack_mod(src: Path, tmp: Path) -> Path:
+    """Folder as is; .zip with zipfile (it drops absolute and ".." member paths); anything else
+    (the official release is a .7z) with 7z or bsdtar, which refuse ".." paths too."""
+    if src.is_dir():
+        return src
+    if not src.is_file():
+        raise ValueError(f"--restoration: {src} not found")
+    if zipfile.is_zipfile(src):
+        with zipfile.ZipFile(src) as z:
+            z.extractall(tmp)
+        return tmp
+    for cmd in (["7z", "x", "-y", f"-o{tmp}", str(src)], ["bsdtar", "-xf", str(src), "-C", str(tmp)]):
+        if shutil.which(cmd[0]):
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+            return tmp
+    raise ValueError(f"--restoration: can't unpack {src.name} (install 7z or bsdtar, or extract it "
+                     "and pass the folder)")
+
+
+def find_restoration(root: Path, code: bytes) -> Path:
+    """Folder of the code.bps that patches this code.bin (3ds/ before citra/: the citra variant
+    keeps the mod in .bss, which our loader does not fill from code.bin)."""
+    patches = sorted(root.rglob("code.bps"), key=lambda p: ("citra" in p.parts, str(p)))
+    if not patches:
+        raise ValueError("--restoration: no code.bps found")
+    crc = zlib.crc32(code)
+    for p in patches:
+        src_size, _, src_crc, _ = bps_info(p.read_bytes())
+        if (src_size, src_crc) == (len(code), crc):
+            return p.parent
+    raise ValueError(f"--restoration: no code.bps matches this code.bin (CRC32 {crc:08X}). "
+                     "Project Restoration requires the game updated to v1.1: pass --update <update_v1.1.cia>")
+
+
+def apply_restoration(mod: Path, out: Path, cs_before):
+    """code.bps over the decompressed code.bin, exheader.bps (or the shipped exheader.bin) over
+    exheader.bin, romfs/ files over romfs/. -> (new code set, [start, end) of the mod's code)."""
+    code_path, exh_path = out / "exefs" / "code.bin", out / "exheader.bin"
+    d = find_restoration(mod, code_path.read_bytes())
+    code = bps_apply(code_path.read_bytes(), (d / "code.bps").read_bytes())
+    if (d / "exheader.bps").is_file():
+        exh = bps_apply(exh_path.read_bytes(), (d / "exheader.bps").read_bytes())
+    elif (d / "exheader.bin").is_file():
+        exh = (d / "exheader.bin").read_bytes()
+    else:
+        raise ValueError(f"--restoration: {d} has no exheader.bps or exheader.bin")
+    cs = parse_codeset(exh)
+    expect = (cs["text"]["pages"] + cs["rodata"]["pages"]) * 0x1000 + cs["data"]["size"]
+    if len(exh) != exh_path.stat().st_size or len(code) < expect:
+        raise ValueError("--restoration: patched exheader.bin and code.bin don't match")
+    # The mod's code is appended to .data after the original .bss, which becomes zeros in
+    # code.bin; the recompiler treats it as code too. Its start is the first non-zero page past
+    # the original .data: the patched layout is v1.0's even from v1.1, so the pre-patch sizes
+    # can't give it.
+    d_addr, d_size = cs["data"]["addr"], cs["data"]["size"]
+    d_off = (cs["text"]["pages"] + cs["rodata"]["pages"]) * 0x1000
+    scan = cs_before["data"]["addr"] + cs_before["data"]["size"] - d_addr
+    tail = code[d_off + scan : d_off + d_size].lstrip(b"\0") if 0 <= scan < d_size else b""
+    if not tail:
+        raise ValueError("--restoration: patched .data does not grow past the original .bss")
+    start, end = (d_addr + d_size - len(tail)) & ~0xFFF, d_addr + d_size
+    exh_path.write_bytes(exh)
+    code_path.write_bytes(code)
+    write_elf(code, cs, out / "code.elf")
+    n = 0
+    if (d / "romfs").is_dir():
+        # shortcut: the game reads romfs.bin, not romfs/, so these files are not loaded yet;
+        # rebuild romfs.bin (IVFC level 3) when a release ships RomFS files.
+        for f in (d / "romfs").rglob("*"):
+            if f.is_file():
+                dst = out / "romfs" / f.relative_to(d / "romfs")
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(f, dst)
+                n += 1
+        print(f"warning: {n} romfs/ files copied to {out / 'romfs'}, but RomFS mods are not loaded "
+              "by the game yet (it reads romfs.bin)")
+    print(f"Project Restoration applied from {d}: code.bin {len(code):#x}, mod code {start:#x}-{end:#x}")
+    return cs, [start, end]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cia", type=Path, help="decrypted base game .cia")
     ap.add_argument("out", type=Path, nargs="?", default=Path("game_data"))
     ap.add_argument("--update", type=Path, help="decrypted update .cia (v1.1, recommended)")
+    ap.add_argument("--restoration", type=Path,
+                    help="Project Restoration release (.zip/.7z) or folder; needs --update v1.1")
     args = ap.parse_args()
     try:
         with open(args.cia, "rb") as f:
@@ -287,11 +382,20 @@ def main():
             if upd_encrypted:
                 raise ValueError(f"{args.update.name}: content is CIA-encrypted (title key); "
                                  "decrypt the update .cia first")
-    except (ValueError, struct.error) as e:
+        if args.restoration and not (args.update and version_name(upd_ver) == "1.1"):
+            raise ValueError("--restoration: Project Restoration requires the game updated to v1.1; "
+                             "pass the v1.1 update .cia with --update")
+        if args.restoration:
+            tmp = tempfile.TemporaryDirectory(prefix="dot_restoration_")
+            mod = unpack_mod(args.restoration, Path(tmp.name))
+            if not any(mod.rglob("code.bps")):
+                raise ValueError(f"--restoration: no code.bps in {args.restoration}")
+    except (ValueError, struct.error, subprocess.CalledProcessError, zipfile.BadZipFile) as e:
         sys.exit(f"error: {e}")
 
     args.out.mkdir(parents=True, exist_ok=True)
-    (args.out / "update_romfs.bin").unlink(missing_ok=True)  # from an earlier --update run
+    for stale in ("update_romfs.bin", "manifest.json"):  # from an earlier run
+        (args.out / stale).unlink(missing_ok=True)
     base_sha = None
     cs = extract(args.cia, args.out)
     version = base_ver
@@ -300,13 +404,23 @@ def main():
         print(f"\napplying update {upd_tid:016X} v{version_name(upd_ver)}")
         cs = extract(args.update, args.out, "update_romfs.bin")
         version = upd_ver
+    mod_code = None
+    if args.restoration:
+        print("\napplying Project Restoration")
+        try:
+            cs, mod_code = apply_restoration(mod, args.out, cs)
+        except (ValueError, BPSError) as e:
+            sys.exit(f"error: {e}")
     code_sha = hashlib.sha256((args.out / "exefs" / "code.bin").read_bytes()).hexdigest()
     manifest = {
         "title_id": f"{base_tid:016X}",
         "game_version": version_name(version),
         "title_version": version,
         "code_sha256": code_sha,
+        "restoration_enabled": bool(args.restoration),
     }
+    if mod_code:
+        manifest["restoration_code"] = mod_code  # read by tools/recomp (extra code range)
     if base_sha:
         manifest["base_code_sha256"] = base_sha
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

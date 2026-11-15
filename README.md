@@ -30,6 +30,12 @@ O código ARM11 original (`code.bin` do ExeFS) é traduzido automaticamente para
    ```
    `--update` é opcional, mas **recomendado**: aplica a atualização oficial v1.1 (correções da Nintendo; pré-requisito de mods como o *Project Restoration*) por cima do jogo base: novo `code.bin`, e o RomFS do update fica em `game_data/update_romfs.bin`, ao lado do RomFS do jogo base. O extrator confere que o `.cia` é mesmo a atualização deste jogo e desta região (Title ID `0004000E` + o mesmo ID do jogo) antes de escrever qualquer coisa. A versão e o SHA-256 do `code.bin` ficam em `game_data/manifest.json`.
 
+   **Project Restoration (opcional):** acrescente `--restoration <arquivo>` com o pacote oficial de [restoration.zora.re](https://restoration.zora.re/) (`.zip`; `.7z` precisa de `7z` ou `bsdtar` instalados) ou uma pasta já extraída com `code.bps`, `exheader.bps`/`exheader.bin` e, opcionalmente, `romfs/`:
+   ```sh
+   python3 tools/extract_cia.py "ISO/<seu jogo>.cia" game_data/ --update "ISO/<update v1.1>.cia" --restoration "<Project Restoration>.zip"
+   ```
+   A ordem é sempre jogo base → update v1.1 → mod. O mod **exige a v1.1**: sem `--update`, ou se nenhum `code.bps` do pacote tiver o CRC32 do `code.bin` extraído, o extrator para com erro antes de aplicar. Os patches BPS são aplicados por `tools/bps_patch.py` (Python puro, confere tamanhos e CRC32 de origem, patch e destino). O `manifest.json` registra `restoration_enabled`. Depois de mudar o `game_data/`, recompile (`cmake --build build`): o código do mod é recompilado junto com o jogo. Arquivos de `romfs/` do mod são copiados para `game_data/romfs/`, mas ainda **não** são lidos pelo jogo (ele lê o `romfs.bin`); a versão 1.5.9 não traz nenhum.
+
 Alternativa: abra o jogo sem `game_data/`; uma tela pede o seu `.cia` (sugere um que esteja em `ISO/`) e faz a extração para `game_data/` ao lado do projeto. O executável procura `game_data/` no diretório atual e ao lado do binário (`build/../game_data`), então também abre por duplo clique.
 
 O extrator é Python puro (sem dependências externas) e exige `.cia`s **descriptografados** (jogo e update); ele avisa e aborta se o conteúdo estiver criptografado. Updates baixados da eShop costumam vir criptografados: decifre-os antes (por exemplo, com o GodMode9 no seu próprio console).
@@ -97,7 +103,7 @@ Cada função transcrita mantém o endereço virtual original em comentário (`/
 | Etapa | Descrição | Status |
 |---|---|---|
 | 1 | Bootstrap do repositório, licença, documentação | ✅ |
-| 2 | Pipeline de extração do `.cia` (com update v1.1 opcional via `--update`) e preparação do binário para o Hopper | ✅ |
+| 2 | Pipeline de extração do `.cia` (com update v1.1 opcional via `--update` e Project Restoration via `--restoration`) e preparação do binário para o Hopper | ✅ |
 | 3 | Runtime, memória e HLE do Horizon OS | ✅ |
 | 4 | Backend Vulkan e tradutor PICA200 | 🟡 draws em lote, vertex shaders na GPU e iluminação por fragmento; cenas com personagens renderizadas; cache de shaders/pipelines em disco (sem engasgos), fog e stencil; faltam sombras |
 | 5 | Entry point (`_start` / `nnMain`) | ✅ boot do crt0 transcrito até a fronteira atual |

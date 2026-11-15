@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 
@@ -87,19 +88,26 @@ inline std::array<double, 4> rotation(const Mat& m) {  // quaternion w, x, y, z
     return q;
 }
 
-// Halfway rigid motion: normalized quaternion sum (= slerp at 1/2), translations averaged.
-inline Mat midpoint(const Mat& a, const Mat& b) {
-    const auto qa = rotation(a), qb = rotation(b);
+// Rigid motion a fraction t of the way from a to b: rotation by slerp (constant angular speed,
+// so 2 or 3 in-between frames are evenly spaced), translation linearly.
+inline Mat lerp(const Mat& a, const Mat& b, double t) {
+    const auto qa = rotation(a);
+    auto qb = rotation(b);
     double dot = 0, len = 0;
     for (int i = 0; i < 4; ++i) dot += qa[i] * qb[i];
+    if (dot < 0)
+        for (double& v : qb) v = -v;
+    dot = std::min(std::abs(dot), 1.0);
+    const double angle = std::acos(dot), s = std::sin(angle);
+    const double ka = s > 1e-6 ? std::sin((1 - t) * angle) / s : 1 - t, kb = s > 1e-6 ? std::sin(t * angle) / s : t;
     std::array<double, 4> q;
-    for (int i = 0; i < 4; ++i) q[i] = qa[i] + (dot < 0 ? -qb[i] : qb[i]), len += q[i] * q[i];
+    for (int i = 0; i < 4; ++i) q[i] = ka * qa[i] + kb * qb[i], len += q[i] * q[i];
     for (double& v : q) v /= std::sqrt(len);
     const auto [w, x, y, z] = q;
     Mat r{{{1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w), 0},
            {2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w), 0},
            {2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y), 0}}};
-    for (int i = 0; i < 3; ++i) r[i][3] = (a[i][3] + b[i][3]) / 2;
+    for (int i = 0; i < 3; ++i) r[i][3] = a[i][3] + t * (b[i][3] - a[i][3]);
     return r;
 }
 

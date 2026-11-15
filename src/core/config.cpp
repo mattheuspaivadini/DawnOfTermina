@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
+#include <string>
 
 namespace core {
 
@@ -68,10 +69,12 @@ Config parse_config(const std::string& text) {
         else if (k == "display.layout") c.layout = v;
         else if (k == "display.fullscreen") c.fullscreen = v == "true";
         else if (k == "display.vsync") c.vsync = v == "true";
-        else if (k == "display.fps") c.fps = std::atoi(v.c_str()) >= 60 ? 60 : 30;
+        else if (k == "display.fps") c.fps = std::clamp(std::atoi(v.c_str()) / 30, 1, 4) * 30;
         else if (k == "hud.scale") c.hud_scale = std::clamp(std::strtof(v.c_str(), nullptr), 0.3f, 1.5f);
         else if (k == "hud.opacity") c.hud_opacity = std::clamp(std::strtof(v.c_str(), nullptr), 0.1f, 1.0f);
         else if (k == "hud.minimap") c.minimap = v == "true";
+        else if (k == "performance.mode") c.perf = v == "fps" || v == "full" ? v : "off";
+        else if (k == "performance.opacity") c.perf_opacity = std::clamp(std::strtof(v.c_str(), nullptr), 0.1f, 1.0f);
         else if (k == "camera.fov") c.fov = std::clamp(std::strtof(v.c_str(), nullptr), 45.0f, 70.0f);
         else if (k == "camera.cutscene_fov") c.cutscene_fov = std::clamp(std::strtof(v.c_str(), nullptr), 45.0f, 70.0f);
         else if (k == "audio.volume") c.volume = std::clamp(std::atoi(v.c_str()), 0, 100);
@@ -91,9 +94,10 @@ std::string format_config(const Config& c) {
       << "layout = \"" << c.layout << "\"  # n64 | single | dual\n"
       << "fullscreen = " << b(c.fullscreen) << "\n"
       << "vsync = " << b(c.vsync) << "\n"
-      << "fps = " << c.fps << "  # 30 | 60 (interpolated)\n\n"
+      << "fps = " << c.fps << "  # 30 | 60 | 90 | 120 (interpolated)\n\n"
       << "[hud]  # n64 layout\nscale = " << c.hud_scale << "\nopacity = " << c.hud_opacity
       << "\nminimap = " << b(c.minimap) << "\n\n"
+      << "[performance]\nmode = \"" << c.perf << "\"  # off | fps | full\nopacity = " << c.perf_opacity << "\n\n"
       << "[camera]  # vertical FOV in degrees: 45 (original) to 70\nfov = " << c.fov
       << "\ncutscene_fov = " << c.cutscene_fov << "\n\n"
       << "[audio]\nvolume = " << c.volume << "\n\n"
@@ -127,7 +131,7 @@ void apply_env_defaults(const Config& c) {
     setenv("DOT_WINDOW", win.c_str(), 0);
     setenv("DOT_RES_SCALE", std::to_string(c.render_scale()).c_str(), 0);
     if (c.widescreen != "off") setenv("DOT_WIDESCREEN", c.widescreen.c_str(), 0);
-    setenv("DOT_FPS", c.fps >= 60 ? "60" : "30", 0);
+    setenv("DOT_FPS", std::to_string(c.fps).c_str(), 0);
 }
 
 }  // namespace core

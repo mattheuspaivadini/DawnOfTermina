@@ -32,11 +32,14 @@ struct Config {
     std::string layout = "n64";        // n64 (HUD in the corners, menus pop up) | single (bottom overlay) | dual
     bool fullscreen = false;
     bool vsync = true;
-    int fps = 30;                      // 30 (native) or 60 (frame interpolation; needs GPU headroom)
+    int fps = 30;                      // 30 (native) or 60/90/120 (frame interpolation; needs GPU/CPU headroom)
     // [hud] (n64 layout)
     float hud_scale = 0.6f;            // size of the bottom-screen pieces in the corners
     float hud_opacity = 0.9f;
     bool minimap = true;               // Tab
+    // [performance] on-screen stats
+    std::string perf = "off";         // off | fps | full
+    float perf_opacity = 0.8f;
     // [camera] vertical FOV in degrees, 45 (original) to 70; v1.0 and Restoration builds only
     float fov = 45.0f;
     float cutscene_fov = 45.0f;

@@ -285,7 +285,8 @@ int main(int argc, char** argv) {
                     last_vblanks = st.vblanks;
                     const auto rs = renderer.stats();
                     std::printf("gsp: vblanks %llu, frames %llu, command lists %llu, draws %llu, fills %llu, transfers %llu | "
-                                "rendered %llu, skipped %llu, pipelines %llu, shaders %llu, readbacks %llu, interpolated %llu/%llu (camera draws %llu)\n",
+                                "rendered %llu, skipped %llu, pipelines %llu, shaders %llu, readbacks %llu, interpolated %llu/%llu (camera draws %llu), "
+                                "presents smooth %llu repeated %llu skipped %llu, uv wrapped %llu stepped %llu\n",
                                 (unsigned long long)st.vblanks, (unsigned long long)st.frames, (unsigned long long)st.command_lists,
                                 (unsigned long long)st.draws, (unsigned long long)st.memory_fills,
                                 (unsigned long long)st.display_transfers, (unsigned long long)rs.draws,
@@ -293,7 +294,9 @@ int main(int argc, char** argv) {
                                 (unsigned long long)rs.shaders,
                                 (unsigned long long)rs.readbacks, (unsigned long long)rs.interpolated,
                                 (unsigned long long)(rs.interpolated + rs.not_interpolated),
-                                (unsigned long long)rs.camera_draws);
+                                (unsigned long long)rs.camera_draws, (unsigned long long)rs.smooth,
+                                (unsigned long long)rs.repeated, (unsigned long long)rs.skipped_shots,
+                                (unsigned long long)rs.uv_wrapped, (unsigned long long)rs.uv_stepped);
                 }
             }
             // Screens the renderer produced on the GPU are presented from there; otherwise from memory.
@@ -311,7 +314,7 @@ int main(int argc, char** argv) {
                     u32 w = 0, h = 0;
                     if (hle::service::gsp::screen_dump(0, px, w, h))
                         write_ppm(std::filesystem::path(dir) / ("top_" + id + ".ppm"), px, w, h);
-                    // DOT_DUMP_INTERP: also the frame-interpolation in-between image (DOT_FPS=60).
+                    // DOT_DUMP_INTERP: also the frame-interpolation in-between image (DOT_FPS>=60).
                     if (std::getenv("DOT_DUMP_INTERP") && hle::service::gsp::screen_dump(0, px, w, h, true))
                         write_ppm(std::filesystem::path(dir) / ("interp_" + id + ".ppm"), px, w, h);
                     if (hle::service::gsp::screen_dump(1, px, w, h))

@@ -243,10 +243,7 @@ struct Renderer::Impl {
     };
     struct Display {  // DisplayTransfer output, screen-oriented, scaled
         Image image;
-        Image interp;              // frame interpolation: the in-between frame shown before `image`
-        bool interp_fresh = false;  // `interp` goes with the current `image`
-        std::chrono::steady_clock::time_point ready;  // when `image` and `interp` were both done
-        std::chrono::steady_clock::duration period{std::chrono::microseconds(33'430)};  // between real frames
+        std::array<Image, 3> interp;  // frame interpolation: the in-between frames leading up to `image`
         u32 width = 0, height = 0, bytes = 0;
         u64 ram_hash = 0;  // guest memory at the output when the transfer ran
     };
@@ -301,13 +298,13 @@ struct Renderer::Impl {
     std::map<u32, Image> scratch;                 // guest-size staging images, by width << 16 | height
     Surface* cur = nullptr;                       // current render target
 
-    // Frame interpolation (DOT_FPS=60): the game simulates at 30 Hz (one step per 2 VBlanks,
-    // fixed-step logic). Every GPU operation of a top-screen frame is recorded; when the frame
-    // ends (its DisplayTransfer to the 400-row framebuffer) it is replayed with the vertex
-    // shaders' float uniforms (camera, model and bone matrices) averaged with the matching
-    // draw of the previous frame, into an extra screen image shown one VBlank before the real
-    // frame. Guest memory still holds everything the frame used at that point (the real GPU
-    // reads it asynchronously, so the game cannot have reused it yet).
+    // Frame interpolation (DOT_FPS=60/90/120): the game simulates at 30 Hz (one step per 2
+    // VBlanks, fixed-step logic). Every GPU operation of a top-screen frame is recorded; when
+    // the frame ends (its DisplayTransfer to the 400-row framebuffer) it is replayed samples-1
+    // times with the vertex shaders' float uniforms (camera, model and bone matrices) a
+    // fraction k/samples of the way from the matching draw of the previous frame, into extra
+    // screen images. Guest memory still holds everything the frame used at that point (the
+    // real GPU reads it asynchronously, so the game cannot have reused it yet).
     struct Op {
         enum Kind : u8 { Draw, Fill, Transfer } kind;
         bool indexed = false, gpu = true;  // gpu: the original ran on the GPU path (else skipped)
@@ -317,9 +314,55 @@ struct Renderer::Impl {
         u64 key = 0;  // draws: what it draws (program, buffers, texture) (no ordinal: end_frame pairs instances)
     };
     bool interpolate = false, replaying = false;
+    u32 samples = 1;     // images per game frame: DOT_FPS / 30 (1 = off)
+    u32 replay_k = 0;    // in-between frame being replayed (1..samples-1)
     std::vector<Op> frame_ops, prev_ops;
     std::shared_ptr<pica::ShaderState> last_vs;
     u64 interp_frames = 0, interp_skipped = 0, interp_camera_draws = 0;
+
+    // Presentation timeline of the top screen (interpolation on). Every image, real or
+    // in-between, is a Shot stamped with its content time in guest VBlanks: a real frame with
+    // the VBlank count when its transfer ran, in-betweens evenly between it and the previous
+    // one. The presenter shows the newest shot not later than a smoothed display clock running
+    // a fixed latency behind the guest VBlank clock (TriAevum's sample/alpha model). Showing
+    // each in-between for "half the frame time after it was ready" (the old way) missed most
+    // of them: the screen only switches to the new framebuffer at the next VBlank swap, and by
+    // then the window had often run out. Measured on the opening at 720p: 25% of presents
+    // advanced smoothly, the rest repeated or skipped an image.
+    // The presenter never takes `lock` for the top screen: the guest holds it through every
+    // replay (several ms) and the presenter missed vsyncs waiting for it.
+    struct Shot {
+        double t;
+        VkImage img;
+        VkImageView view;
+        u32 width, height;
+        u32 va = 0, bytes = 0;  // real frames: guest framebuffer and its hash (CPU writes)
+        u64 ram_hash = 0;
+    };
+    std::mutex shots_lock;
+    std::vector<Shot> shots;          // ascending t, the last ~8 VBlanks
+    double top_t[2] = {-1, -1};       // content time of the previous / last real top frame
+    double late = 1;                  // recent max of (all shots ready) - content time, VBlanks
+    std::atomic<u64> vb_count{0};     // guest VBlank clock (Renderer::vblank)
+    std::atomic<s64> vb_time{0}, vb_period{16'715'000};
+    // Presenter side (its thread only).
+    double clock_d = 0, host_step = 1, last_t = -1;
+    s64 clock_at = 0;
+    std::map<u32, GpuScreen> last_screen;  // non-top displays while the guest holds `lock` (shots_lock)
+    u64 cadence[3] = {};                   // presents: smooth, repeated image, skipped image
+
+    static s64 now_ns() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    double vblank_clock(s64 now) const {
+        const double f = double(now - vb_time.load()) / double(vb_period.load());
+        return double(vb_count.load()) + std::clamp(f, 0.0, 1.0);
+    }
+    // shots_lock held. A new image replaces whatever shot used the same VkImage before.
+    void publish(const Shot& s) {
+        std::erase_if(shots, [&](const Shot& o) { return o.img == s.img || o.t < s.t - 8; });
+        shots.insert(std::upper_bound(shots.begin(), shots.end(), s.t, [](double t, const Shot& o) { return t < o.t; }), s);
+    }
     // Widescreen: the colour buffers that feed the top screen get W times more rows (rows are
     // the screen's horizontal axis). DOT_WIDESCREEN=<w>:<h> or "window" (follows the window).
     float wide_aspect = 0;  // top screen aspect; 0 = off, < 0 = window
@@ -688,7 +731,7 @@ struct Renderer::Impl {
                                                : u32(std::clamp(std::atoi(e), 1, 8));
         }
         anisotropy = scale > 1 ? std::min(16.0f, ctx.max_anisotropy()) : 0.0f;
-        if (const char* e = std::getenv("DOT_FPS")) interpolate = std::atoi(e) >= 60;
+        if (const char* e = std::getenv("DOT_FPS")) samples = std::clamp(std::atoi(e) / 30, 1, 4), interpolate = samples > 1;
         std::printf("renderer: resolution scale %ux%s\n", scale, anisotropy > 1 ? ", anisotropic filtering" : "");
 
         // 1x1 white texture for disabled units.
@@ -1066,7 +1109,12 @@ struct Renderer::Impl {
         if (replaying && out_h != 400) return true;  // only the top screen is interpolated
         if (d.image.img && (d.width != screen_w || d.height != out_w * scale)) {
             submit_and_wait();
-            destroy(d.image), destroy(d.interp);
+            {
+                std::lock_guard slk(shots_lock);
+                shots.clear(), last_screen.erase(out);
+            }
+            destroy(d.image);
+            for (Image& i : d.interp) destroy(i);
         }
         if (!d.image.img) {
             d.width = screen_w, d.height = out_w * scale;
@@ -1074,11 +1122,11 @@ struct Renderer::Impl {
                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                                    VK_IMAGE_ASPECT_COLOR_BIT);
         }
-        if (replaying && !d.interp.img)
-            d.interp = make_general(d.width, d.height, VK_FORMAT_R8G8B8A8_UNORM,
-                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        Image& dst_img = replaying ? d.interp[replay_k - 1] : d.image;
+        if (!dst_img.img)
+            dst_img = make_general(d.width, d.height, VK_FORMAT_R8G8B8A8_UNORM,
+                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                                    VK_IMAGE_ASPECT_COLOR_BIT);
-        const Image& dst_img = replaying ? d.interp : d.image;
         begin();
         VkDescriptorSet set;
         VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -1108,12 +1156,17 @@ struct Renderer::Impl {
         memory_barrier();
         submit();  // the presenter's blit is queued after it (barrier, same queue): no CPU wait
         if (replaying) {
-            d.interp_fresh = true;
+            std::lock_guard slk(shots_lock);
+            publish({top_t[0] + (top_t[1] - top_t[0]) * replay_k / samples, dst_img.img, dst_img.view, d.width, d.height});
             return true;
         }
-        d.interp_fresh = false;  // a new real frame: its in-between frame comes from the replay
         d.bytes = out_w * out_h * pica::pixel::bytes_per_pixel(out_fmt);
         d.ram_hash = hash_ram(mem.host(out), d.bytes);
+        if (out_h == 400 && interpolate) {
+            std::lock_guard slk(shots_lock);
+            top_t[0] = top_t[1], top_t[1] = double(vb_count.load());
+            publish({top_t[1], d.image.img, d.image.view, d.width, d.height, out, d.bytes, d.ram_hash});
+        }
         if (cache_dirty && std::chrono::steady_clock::now() - cache_saved > std::chrono::seconds(10)) save_caches();
         return true;
     }
@@ -1409,11 +1462,11 @@ struct Renderer::Impl {
         return camera::rigid(cam);
     }
 
-    // Halfway uniforms of a world-shader draw: the camera moves along the rigid midpoint and each
-    // bone halfway in world space, then goes back to the halfway camera's view space.
-    static void camera_midpoint(const pica::ShaderState& a, pica::ShaderState& b, const camera::Mat& ca,
-                                const camera::Mat& cb) {
-        const camera::Mat mid = camera::midpoint(ca, cb), view = camera::inverse_rigid(mid);
+    // Uniforms of a world-shader draw a fraction t of the way from a to b: the camera moves as a
+    // rigid motion and each bone linearly in world space, then goes back to that camera's view space.
+    static void camera_lerp(const pica::ShaderState& a, pica::ShaderState& b, const camera::Mat& ca,
+                            const camera::Mat& cb, double t) {
+        const camera::Mat mid = camera::lerp(ca, cb, t), view = camera::inverse_rigid(mid);
         auto row = [](const pica::ShaderState& s, int r) {
             const pica::Vec4& v = s.float_uniforms[r];
             return std::array<double, 4>{v.x, v.y, v.z, v.w};
@@ -1424,7 +1477,7 @@ struct Renderer::Impl {
             const camera::Mat wa = camera::mul(ca, ma), wb = camera::mul(cb, mb);
             camera::Mat w;
             for (int i = 0; i < 3; ++i)
-                for (int j = 0; j < 4; ++j) w[i][j] = (wa[i][j] + wb[i][j]) / 2;
+                for (int j = 0; j < 4; ++j) w[i][j] = wa[i][j] + t * (wb[i][j] - wa[i][j]);
             const camera::Mat out = camera::mul(view, w);
             for (int i = 0; i < 3; ++i)
                 b.float_uniforms[20 + 3 * bone + i] = {float(out[i][0]), float(out[i][1]), float(out[i][2]), float(out[i][3])};
@@ -1433,8 +1486,6 @@ struct Renderer::Impl {
             b.float_uniforms[70 + i] = {float(mid[i][0]), float(mid[i][1]), float(mid[i][2]), float(mid[i][3])};
     }
 
-    // End of a top-screen frame (its transfer was just recorded and run): replay it halfway
-    // between the previous frame and this one.
     // Relative change of the float uniforms between two draws: sum |a-b| / sum (|a|+|b|).
     static float uniform_change(const pica::ShaderState& x, const pica::ShaderState& y) {
         static_assert(sizeof(pica::Vec4) == 16);
@@ -1446,6 +1497,94 @@ struct Renderer::Impl {
         return den > 0 ? float(num / den) : 0.0f;
     }
 
+    // Texture-coordinate translations (TriAevum's PicaTextureTranslation unwrap). A uniform that
+    // scrolls a repeating texture is wrapped by the game (0.95 -> 0.02); averaging it put the
+    // texture half a period away in the in-between frame, a flash on water, clouds and fire.
+    // A UV flipbook (atlas cell jumps) had the same problem. TriAevum proves the translation
+    // by recognising OoT3D's model shader; MM3D's GzwShader differs, so it is proven per draw
+    // here instead: adding 1.0 to the uniform component must move exactly one texture
+    // coordinate output by exactly +-1 on two vertices and leave every other output alone.
+    // Then a repeating axis (period 1, mirrored 2) takes the shortest way round, and a jump
+    // of more than 1/8 (a cell change, clamped atlases too) switches halfway, never blended.
+    struct UvFix {
+        u16 comp;      // float uniform component (row * 4 + xyzw)
+        bool step;     // a cell change: the old value before t = 1/2, the new one after
+        float a, d;    // else value = a + t * d
+    };
+    std::unordered_map<u64, s8> uv_proof;  // (draw key, component) -> texcoord semantic, or -1
+    u64 uv_wrapped = 0, uv_stepped = 0;
+
+    std::vector<UvFix> uv_fixes(Memory& mem, const Op& prev, const Op& op) {
+        std::vector<UvFix> fixes;
+        const float* fa = &prev.vs->float_uniforms[0].x;
+        const float* fb = &op.vs->float_uniforms[0].x;
+        std::vector<u16> cand;  // UV-sized values that moved by 1/16 or more
+        for (u16 i = 0; i < 96 * 4; ++i)
+            if (std::isfinite(fa[i]) && std::isfinite(fb[i]) && std::fabs(fb[i] - fa[i]) >= 0.0625f &&
+                std::fabs(fa[i]) <= 8 && std::fabs(fb[i]) <= 8)
+                cand.push_back(i);
+        const auto& regs = op.regs;
+        if (cand.empty() || (regs[TEX_CONFIG] >> 10 & 1)) return fixes;  // procedural textures read UVs too
+        const u32 entry = regs[VS_ENTRY] & 0xFFFF;
+        std::vector<pica::VertexInput> verts;
+        std::unique_ptr<pica::ShaderState> s;
+        pica::Vec4 base[2][16];
+        for (u16 c : cand) {
+            if (uv_proof.size() > 100'000) uv_proof.clear();
+            const auto [it, fresh] = uv_proof.try_emplace(op.key * 0x9E3779B97F4A7C15ull + c, s8(-1));
+            if (fresh) {
+                if (!s) {
+                    if (!pica::load_vertices(mem, regs, *op.vs, op.indexed, verts) || verts.empty()) return fixes;
+                    s = std::make_unique<pica::ShaderState>(*op.vs);
+                    for (int v = 0; v < 2; ++v) pica::run_vertex_shader(*s, entry, verts[v * (verts.size() / 2)].v, base[v]);
+                }
+                float* u = &s->float_uniforms[0].x + c;
+                const float keep = *u;
+                *u += 1.0f;
+                int sem = -1, sign = 0;
+                bool ok = true;
+                for (int v = 0; v < 2 && ok; ++v) {
+                    pica::Vec4 out[16];
+                    pica::run_vertex_shader(*s, entry, verts[v * (verts.size() / 2)].v, out);
+                    for (u32 reg = 0; reg < 7 && ok; ++reg)
+                        for (u32 k = 0; k < 4 && ok; ++k) {
+                            const u32 id = regs[OUTMAP + reg] >> (k * 8) & 0x1F;
+                            if (id == 0x1F) continue;
+                            const float x0 = (&base[v][reg].x)[k], diff = (&out[reg].x)[k] - x0;
+                            if (std::fabs(diff) <= 1e-4f * (1 + std::fabs(x0))) continue;
+                            const bool uv = (id >= 12 && id <= 15) || id == 22 || id == 23;
+                            const int sg = diff > 0 ? 1 : -1;
+                            ok = uv && std::fabs(std::fabs(diff) - 1) < 1e-3f && (sem < 0 || (sem == int(id) && sign == sg));
+                            sem = int(id), sign = sg;
+                        }
+                }
+                *u = keep;
+                if (ok && sem >= 0) it->second = s8(sem);
+            }
+            const int sem = it->second;
+            if (sem < 0) continue;
+            // Period of the axis over every enabled texture unit reading this coordinate set.
+            const int set = sem >= 22 ? 2 : (sem - 12) / 2, axis = sem & 1;
+            float period = 0;
+            bool read = false;
+            for (int unit = 0; unit < 3; ++unit) {
+                const int uses = unit < 2 ? unit : (regs[TEX_CONFIG] >> 13 & 1) ? 1 : 2;
+                if (!(regs[TEX_CONFIG] >> unit & 1) || uses != set) continue;
+                const u32 wrap = regs[unit == 0 ? 0x083 : unit == 1 ? 0x093 : 0x09B] >> (axis ? 8 : 12) & 7;
+                const float pu = wrap == 2 ? 1.0f : wrap == 3 ? 2.0f : 0.0f;
+                period = read && (period == 0 || pu == 0) ? 0.0f : std::max(period, pu);
+                read = true;
+            }
+            if (!read) continue;
+            const float d = fb[c] - fa[c], shortest = period > 0 ? d - period * std::round(d / period) : d;
+            if (std::fabs(shortest) > 0.125f) fixes.push_back({c, true, fa[c], d}), ++uv_stepped;
+            else if (shortest != d) fixes.push_back({c, false, fa[c], shortest}), ++uv_wrapped;
+        }
+        return fixes;
+    }
+
+    // End of a top-screen frame (its transfer was just recorded and run): replay it at
+    // k/samples of the way from the previous frame to this one, k = 1..samples-1.
     void end_frame(Memory& mem) {
         if (!interpolate || replaying) return;
         // Previous draws of the same mesh/atlas (one key). Each draw takes the unused one with the
@@ -1489,6 +1628,7 @@ struct Renderer::Impl {
             // ordinary motion measured < 0.02, mismatched pairs well above.
             if (best_change <= 0.05f) partner[n] = p;
         }
+        std::vector<std::vector<UvFix>> uv(frame_ops.size());
         // A scene change matches few draws. A camera cut matches most of them (same objects, new
         // camera), but their matrices jump: measured median change 0.05-0.93 at cuts against
         // 0.0001 (p90 0.0013, fast pans < 0.02) between ordinary frames. Averaging across a cut
@@ -1503,50 +1643,54 @@ struct Renderer::Impl {
         }
         cut |= camera_cuts * 2 > camera_draws;  // the world camera jumped (DekUI's test)
         if (draws && matched * 2 >= draws && !cut) {
+            for (size_t n = 0; n < frame_ops.size(); ++n)
+                if (partner[n]) uv[n] = uv_fixes(mem, *partner[n], frame_ops[n]);
             replaying = true;
             pica::ShaderState vs;
-            for (size_t n = 0; n < frame_ops.size(); ++n) {
-                const Op& op = frame_ops[n];
-                switch (op.kind) {
-                case Op::Draw: {
-                    vs = *op.vs;
-                    if (const Op* p = partner[n]) {
-                        for (u32 i = 0; i < 96; ++i) {
-                            const pica::Vec4& a = p->vs->float_uniforms[i];
-                            pica::Vec4& b = vs.float_uniforms[i];
-                            b = {(a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f, (a.z + b.z) * 0.5f, (a.w + b.w) * 0.5f};
+            for (replay_k = 1; replay_k < samples; ++replay_k) {
+                const float t = float(replay_k) / float(samples);
+                for (size_t n = 0; n < frame_ops.size(); ++n) {
+                    const Op& op = frame_ops[n];
+                    switch (op.kind) {
+                    case Op::Draw: {
+                        vs = *op.vs;
+                        if (const Op* p = partner[n]) {
+                            for (u32 i = 0; i < 96; ++i) {
+                                const pica::Vec4& a = p->vs->float_uniforms[i];
+                                pica::Vec4& b = vs.float_uniforms[i];
+                                b = {a.x + t * (b.x - a.x), a.y + t * (b.y - a.y), a.z + t * (b.z - a.z), a.w + t * (b.w - a.w)};
+                            }
+                            camera::Mat ca, cb;
+                            if (camera_draw(*p->vs, ca) && camera_draw(*op.vs, cb)) {
+                                camera_lerp(*p->vs, vs, ca, cb, t);
+                                ++interp_camera_draws;
+                            }
+                            for (const UvFix& f : uv[n])
+                                (&vs.float_uniforms[0].x)[f.comp] = f.step ? (t < 0.5f ? f.a : f.a + f.d) : f.a + t * f.d;
                         }
-                        camera::Mat ca, cb;
-                        if (camera_draw(*p->vs, ca) && camera_draw(*op.vs, cb)) {
-                            camera_midpoint(*p->vs, vs, ca, cb);
-                            ++interp_camera_draws;
-                        }
+                        draw(mem, op.regs, vs, op.indexed);
+                        break;
                     }
-                    draw(mem, op.regs, vs, op.indexed);
-                    break;
-                }
-                case Op::Fill:
-                    if (op.gpu) fill(mem, op.a[0], op.a[1]);
-                    break;
-                case Op::Transfer:
-                    if (op.gpu) display_transfer(mem, op.a[0], op.a[1], op.a[2], op.a[3], op.a[4]);
-                    break;
+                    case Op::Fill:
+                        if (op.gpu) fill(mem, op.a[0], op.a[1]);
+                        break;
+                    case Op::Transfer:
+                        if (op.gpu) display_transfer(mem, op.a[0], op.a[1], op.a[2], op.a[3], op.a[4]);
+                        break;
+                    }
                 }
             }
             replaying = false;
             ++interp_frames;
-            const auto now = std::chrono::steady_clock::now();
-            for (auto& [va, d] : displays)
-                if (d.interp_fresh) {
-                    d.period = std::clamp<std::chrono::steady_clock::duration>(now - d.ready, std::chrono::microseconds(16'715),
-                                                                                std::chrono::milliseconds(100));
-                    d.ready = now;
-                }
         } else {
             ++interp_skipped;
         }
         prev_ops.swap(frame_ops);
         frame_ops.clear();
+        // How long after its content time this frame's last shot was ready: the presenter's
+        // latency must cover it. Decays slowly so one slow frame does not keep it high.
+        std::lock_guard slk(shots_lock);
+        late = std::max(vblank_clock(now_ns()) - top_t[1], late - 0.005);
     }
 
     // Fragment shader text depends only on these registers (shader_gen.cpp: texture unit
@@ -1847,29 +1991,77 @@ bool Renderer::display_transfer(core::Memory& mem, u32 in, u32 out, u32 in_dim, 
 }
 
 bool Renderer::display(core::Memory& mem, u32 va, GpuScreen& out, bool consume) {
-    std::lock_guard lk(impl_->lock);
-    auto it = impl_->displays.find(va);
-    if (it == impl_->displays.end() || !it->second.image.img) return false;
-    Impl::Display& d = it->second;
-    if (hash_ram(mem.host(va), d.bytes) != d.ram_hash) return false;  // the CPU wrote the framebuffer since
-    // The in-between frame stays up for half the time between real frames, then the real one:
-    // even pacing at any monitor refresh, also when the game drops to 20 or 15 frames/s.
-    if (consume && d.interp_fresh) {
-        if (std::chrono::steady_clock::now() - d.ready < d.period / 2) {
-            out = {d.interp.img, d.width, d.height, d.interp.view};
+    Impl& m = *impl_;
+    if (consume) {  // the top screen while interpolating: from the timeline, without `lock`
+        std::unique_lock slk(m.shots_lock);
+        const auto real = std::find_if(m.shots.rbegin(), m.shots.rend(), [&](const Impl::Shot& s) { return s.va == va; });
+        if (real != m.shots.rend()) {
+            if (hash_ram(mem.host(va), real->bytes) != real->ram_hash) return false;  // the CPU wrote the framebuffer
+            // Display clock: `latency` VBlanks behind the guest clock, so the earliest in-between
+            // (content time one sample after the previous frame) is ready when its turn comes.
+            // It advances by the smoothed host refresh step and is pulled 5% towards the target
+            // per present: present-time jitter does not flip images at the switch points.
+            const s64 now = Impl::now_ns();
+            const double interval = std::clamp(m.top_t[1] - m.top_t[0], 1.0, 4.0);
+            const double latency = interval * (1.0 - 1.0 / m.samples) + std::min(m.late + 0.1, 2.0);
+            const double target = m.vblank_clock(now) - latency, dt = double(now - m.clock_at) / double(m.vb_period.load());
+            m.clock_at = now;
+            if (dt > 0 && dt < 4) m.host_step += 0.05 * (dt - m.host_step);
+            const double pred = m.clock_d + m.host_step;
+            const bool resync = std::abs(target - pred) > 2;
+            m.clock_d = resync ? target : pred + 0.05 * (target - pred);
+            // Newest shot not after the clock, else the oldest (the clock is still before them).
+            auto pick = m.shots.begin();
+            for (auto s = m.shots.begin(); s != m.shots.end(); ++s)
+                if (s->t <= m.clock_d) pick = s;
+            out = {pick->img, pick->width, pick->height, pick->view};
+            // Cadence: each present should move on by one host step (or by one shot when shots
+            // are further apart than that).
+            const double spacing = interval / m.samples, delta = pick->t - m.last_t;
+            if (!resync && m.last_t >= 0)
+                ++m.cadence[delta == 0 && m.host_step > 0.75 * spacing    ? 1
+                            : delta > 1.5 * std::max(m.host_step, spacing) ? 2
+                                                                           : 0];
+            m.last_t = pick->t;
             return true;
         }
-        d.interp_fresh = false;
     }
+    // Other screens (and no interpolation). The guest holds `lock` through whole replays: the
+    // presenter shows what it last got rather than wait and miss a vsync.
+    std::unique_lock lk(m.lock, std::defer_lock);
+    if (consume && !lk.try_lock()) {
+        std::lock_guard slk(m.shots_lock);
+        if (const auto last = m.last_screen.find(va); last != m.last_screen.end()) {
+            out = last->second;
+            return true;
+        }
+    }
+    if (!lk.owns_lock()) lk.lock();
+    auto it = m.displays.find(va);
+    if (it == m.displays.end() || !it->second.image.img) return false;
+    Impl::Display& d = it->second;
+    if (hash_ram(mem.host(va), d.bytes) != d.ram_hash) return false;  // the CPU wrote the framebuffer since
     out = {d.image.img, d.width, d.height, d.image.view};
+    if (consume) {
+        std::lock_guard slk(m.shots_lock);
+        m.last_screen[va] = out;
+    }
     return true;
+}
+
+void Renderer::vblank() {
+    Impl& m = *impl_;
+    const s64 now = Impl::now_ns(), prev = m.vb_time.exchange(now);
+    // Smoothed: the kernel delivers late VBlanks back to back when it catches up.
+    if (prev && now > prev) m.vb_period = std::clamp<s64>(m.vb_period + (now - prev - m.vb_period) / 16, 1'000'000, 50'000'000);
+    ++m.vb_count;
 }
 
 bool Renderer::read_display(u32 va, std::vector<u32>& rgba, u32& width, u32& height, bool interp) {
     std::lock_guard lk(impl_->lock);
     Impl& m = *impl_;
     auto it = m.displays.find(va);
-    if (it == m.displays.end() || !(interp ? it->second.interp : it->second.image).img) return false;
+    if (it == m.displays.end() || !(interp ? it->second.interp[0] : it->second.image).img) return false;
     const Impl::Display& d = it->second;
     const VkDeviceSize bytes = VkDeviceSize(d.width) * d.height * 4;
     m.submit_and_wait();
@@ -1879,7 +2071,7 @@ bool Renderer::read_display(u32 va, std::vector<u32>& rgba, u32& width, u32& hei
     VkBufferImageCopy copy{};
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageExtent = {d.width, d.height, 1};
-    vkCmdCopyImageToBuffer(m.cmd, (interp ? d.interp : d.image).img, VK_IMAGE_LAYOUT_GENERAL, m.xfer.buf, 1, &copy);
+    vkCmdCopyImageToBuffer(m.cmd, (interp ? d.interp[0] : d.image).img, VK_IMAGE_LAYOUT_GENERAL, m.xfer.buf, 1, &copy);
     m.submit_and_wait();
     width = d.width, height = d.height;
     rgba.resize(size_t(width) * height);
@@ -1910,7 +2102,14 @@ void Renderer::drop_targets_locked(bool displays) {
     for (auto& [key, fb] : m.framebuffers) vkDestroyFramebuffer(m.dev, fb, nullptr);
     m.surfaces.clear(), m.padded.clear(), m.depths.clear(), m.framebuffers.clear();
     if (displays) {
-        for (auto& [va, d] : m.displays) m.destroy(d.image), m.destroy(d.interp);
+        {
+            std::lock_guard slk(m.shots_lock);
+            m.shots.clear(), m.last_screen.clear();
+        }
+        for (auto& [va, d] : m.displays) {
+            m.destroy(d.image);
+            for (auto& i : d.interp) m.destroy(i);
+        }
         m.displays.clear();
     }
     m.cur = nullptr;
@@ -1941,17 +2140,21 @@ void Renderer::set_widescreen(float aspect) {
     impl_->wide_aspect = aspect;
 }
 
-void Renderer::set_interpolate(bool on) {
+void Renderer::set_frame_rate(u32 fps) {
     std::lock_guard lk(impl_->lock);
-    impl_->interpolate = on;
+    impl_->samples = std::clamp(fps / 30, 1u, 4u);
+    impl_->interpolate = impl_->samples > 1;
     impl_->frame_ops.clear(), impl_->prev_ops.clear();
-    for (auto& [va, d] : impl_->displays) d.interp_fresh = false;
+    std::lock_guard slk(impl_->shots_lock);
+    impl_->shots.clear();  // the presenter goes back to the plain screen images
 }
 
 Renderer::Stats Renderer::stats() const {
     Stats s = impl_->stats;
     s.interpolated = impl_->interp_frames, s.not_interpolated = impl_->interp_skipped;
     s.camera_draws = impl_->interp_camera_draws;
+    s.uv_wrapped = impl_->uv_wrapped, s.uv_stepped = impl_->uv_stepped;
+    s.smooth = impl_->cadence[0], s.repeated = impl_->cadence[1], s.skipped_shots = impl_->cadence[2];
     return s;
 }
 

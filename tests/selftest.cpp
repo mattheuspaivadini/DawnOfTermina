@@ -137,6 +137,10 @@ static void test_hid() {
     assert(d.resolution == c.resolution && d.vsync == c.vsync && d.fps == c.fps && d.keys == c.keys &&
            d.layout == c.layout && d.hud_scale == c.hud_scale && d.hud_opacity == c.hud_opacity && d.minimap == c.minimap);
 
+    const core::Config pf = core::parse_config("[performance]\nmode = \"full\"\nopacity = 0.5\n");
+    assert(pf.perf == "full" && pf.perf_opacity == 0.5f && core::parse_config("[performance]\nmode = \"x\"\n").perf == "off");
+    assert(core::parse_config(core::format_config(pf)).perf == "full");
+
     std::vector<ScriptEvent> ev;
     assert(parse_input_script("20:START,21.5:A,30:T160x120", ev) && ev.size() == 3);
     assert(ev[0].buttons == START && ev[1].t == 21.5 && ev[1].buttons == A);
@@ -187,18 +191,21 @@ static void test_boot(const stdfs::path& data) {
     std::printf("selftest: boot frontier 0x%08X, heap %u KiB\n", frontier, heap >> 10);
 }
 
-// Interpolated camera (gfx/camera_midpoint.h): the midpoint of two yaws is the half yaw, rigid,
-// translation averaged; cuts by distance and angle.
+// Interpolated camera (gfx/camera_midpoint.h): a fraction t between two yaws is t of the yaw,
+// rigid, translation interpolated; cuts by distance and angle.
 static void test_camera() {
     using namespace gfx::camera;
     auto yaw = [](double deg, double x) {
         const double r = deg * 3.14159265358979323846 / 180;
         return Mat{{{std::cos(r), 0, std::sin(r), x}, {0, 1, 0, 5}, {-std::sin(r), 0, std::cos(r), 0}}};
     };
-    const Mat a = yaw(0, 0), b = yaw(40, 100), m = midpoint(a, b), want = yaw(20, 50);
-    assert(rigid(a) && rigid(m));
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 4; ++j) assert(std::abs(m[i][j] - want[i][j]) < 1e-9);
+    const Mat a = yaw(0, 0), b = yaw(40, 100);
+    for (double t : {0.0, 1 / 3.0, 0.5, 0.75, 1.0}) {  // slerp: constant angular speed
+        const Mat m = lerp(a, b, t), want = yaw(40 * t, 100 * t);
+        assert(rigid(m));
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 4; ++j) assert(std::abs(m[i][j] - want[i][j]) < 1e-9);
+    }
     const Mat id = mul(inverse_rigid(b), b);
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 4; ++j) assert(std::abs(id[i][j] - (i == j)) < 1e-9);

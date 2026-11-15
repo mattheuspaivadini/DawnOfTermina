@@ -121,7 +121,7 @@ Cada função transcrita mantém o endereço virtual original em comentário (`/
 | 4 | Backend Vulkan e tradutor PICA200 | 🟡 draws em lote, vertex shaders na GPU e iluminação por fragmento; cenas com personagens renderizadas; cache de shaders/pipelines em disco (sem engasgos), fog e stencil; faltam sombras |
 | 5 | Entry point (`_start` / `nnMain`) | ✅ boot do crt0 transcrito até a fronteira atual |
 | 6 | Recompilador estático automático ARM11 → C++ | ✅ boot do SDK roda recompilado até a criação de threads |
-| 7 | Threads do guest e serviços do sistema até o primeiro frame | ✅ título, criação de arquivo (teclado HLE), cutscene inicial da Lost Woods e Link controlável (circle pad) a ~60 VBlanks/s |
+| 7 | Threads do guest e serviços do sistema até o primeiro frame | ✅ título, criação de arquivo (teclado HLE), cutscene inicial da Lost Woods e Link controlável (circle pad) a ~60 VBlanks/s; com Project Restoration, South Clock Town (relógio do HUD HD) |
 | 8 | Áudio: HLE do DSP (24 vozes, PCM8/PCM16/ADPCM) com saída via SDL3 | ✅ música e efeitos; sem reverb/filtros |
 | 9 | Renderização em alta resolução (`DOT_RES_SCALE`) com framebuffers residentes na GPU | ✅ |
 | 10 | Widescreen real (`DOT_WIDESCREEN=16:9`, `21:9`, `window`…) | ✅ |

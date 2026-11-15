@@ -236,6 +236,12 @@ int main(int argc, char** argv) {
                 if (st->exited) std::printf("guest: process exited\n");
                 else std::printf("guest: stopped: %s\n", st->error.c_str());
                 std::fflush(stdout);
+                // Without a terminal a stopped guest looked like a frozen frame: say so on screen.
+                if (!st->exited && !std::getenv("DOT_EXIT_ON_STOP")) {
+                    SDL_SetWindowTitle(window, "DawnOfTermina - stopped (emulation error)");
+                    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "DawnOfTermina: the game stopped",
+                                             ("Emulation error (please report it):\n\n" + st->error).c_str(), window);
+                }
                 if (std::getenv("DOT_EXIT_ON_STOP")) running = false;
             }
 #endif

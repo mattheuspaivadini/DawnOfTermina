@@ -69,4 +69,21 @@ i = thumb.lift(img, 0x100000, 0xD072)                                # beq +0xe4
 assert (i.cond, i.target) == (0, (0x100004 + 0xE4) | 1)
 assert thumb.lift(img, 0x100000, 0x4718).kind == "jump"             # bx r3 (return via register)
 
+# Computed `add pc, pc, rX, lsl #2` without a bounding cmp (recomp.Recompiler.jump_table)
+import recomp  # noqa: E402
+
+# libgcc __udivsi3 (GCC, Project Restoration code): `addne` into an unrolled loop
+div = FakeImage([0xE16F3F10, 0xE16F2F11, 0xE0423003, 0xE273301F, 0x10833083, 0xE3A02000,
+                 0x108FF103,                                      # 0x100018 addne pc, pc, r3, lsl #2
+                 0xE320F000,                                      # nop
+                 0xE1500F81, 0xE0A22002, 0x20400F81,              # 0x100020 cmp / adc / subhs
+                 0xE1500F01, 0xE0A22002, 0x20400F01,
+                 0xE1A00002, 0xE12FFF1E])                         # mov r0, r2; bx lr
+targets = recomp.Recompiler(div).jump_table(arm.lift(div, 0x100018, 0x108FF103))
+assert targets == [0x100020 + 4 * k for k in range(7)], [hex(t) for t in targets]
+# unconditional add pc over a table of branches (vanilla 0x1D8A00)
+tbl = FakeImage([0xE08FF10C, 0xE1A00000, 0xEA000004, 0xEA000004, 0xEAFFFFFF, 0xE3A00102])
+targets = recomp.Recompiler(tbl).jump_table(arm.lift(tbl, 0x100000, 0xE08FF10C))
+assert targets == [0x100008, 0x10000C, 0x100010], [hex(t) for t in targets]
+
 print("test_lifter: OK")

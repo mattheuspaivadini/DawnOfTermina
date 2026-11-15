@@ -30,6 +30,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "gfx/layout.h"
@@ -313,11 +314,10 @@ struct Renderer::Impl {
         std::array<u32, pica::reg::COUNT> regs;
         std::shared_ptr<const pica::ShaderState> vs;
         u32 a[6] = {};
-        u64 key = 0;  // draws: what it draws (program, buffers, texture) + ordinal in the frame
+        u64 key = 0;  // draws: what it draws (program, buffers, texture) (no ordinal: end_frame pairs instances)
     };
     bool interpolate = false, replaying = false;
     std::vector<Op> frame_ops, prev_ops;
-    std::map<u64, u32> key_counts;
     std::shared_ptr<pica::ShaderState> last_vs;
     u64 interp_frames = 0, interp_skipped = 0, interp_camera_draws = 0;
     // Widescreen: the colour buffers that feed the top screen get W times more rows (rows are
@@ -1384,8 +1384,7 @@ struct Renderer::Impl {
         // What is drawn: program entry, attribute buffers, index buffer and count, texture 0.
         const u32 what[] = {regs[VS_ENTRY] & 0xFFFF, regs[0x200], regs[0x203], regs[0x227], regs[0x228], regs[0x085],
                             regs[COLOR_ADDR]};
-        const u64 k = fnv(what, sizeof what);
-        op.key = k ^ u64(key_counts[k]++) * 0x9E3779B97F4A7C15ull;
+        op.key = fnv(what, sizeof what);  // instances of one mesh/atlas share it: end_frame pairs them
         frame_ops.push_back(std::move(op));
     }
 
@@ -1436,55 +1435,90 @@ struct Renderer::Impl {
 
     // End of a top-screen frame (its transfer was just recorded and run): replay it halfway
     // between the previous frame and this one.
+    // Relative change of the float uniforms between two draws: sum |a-b| / sum (|a|+|b|).
+    static float uniform_change(const pica::ShaderState& x, const pica::ShaderState& y) {
+        static_assert(sizeof(pica::Vec4) == 16);
+        const float* a = &x.float_uniforms[0].x;
+        const float* b = &y.float_uniforms[0].x;
+        double num = 0, den = 0;
+        for (u32 i = 0; i < 96 * 4; ++i)
+            if (std::isfinite(a[i]) && std::isfinite(b[i])) num += std::fabs(a[i] - b[i]), den += std::fabs(a[i]) + std::fabs(b[i]);
+        return den > 0 ? float(num / den) : 0.0f;
+    }
+
     void end_frame(Memory& mem) {
         if (!interpolate || replaying) return;
-        std::map<u64, const Op*> prev;
+        // Previous draws of the same mesh/atlas (one key). Each draw takes the unused one with the
+        // closest uniforms: pairing by order put a pane or NPC halfway to a sibling whenever one
+        // instance appeared, hid or moved in the draw order (a "View" prompt and moved button
+        // rings showed up only in the in-between frames of Clock Town's HUD).
+        std::unordered_map<u64, std::vector<const Op*>> prev;
         for (const Op& op : prev_ops)
-            if (op.kind == Op::Draw) prev[op.key] = &op;
+            if (op.kind == Op::Draw) prev[op.key].push_back(&op);
+        std::unordered_map<u64, u32> ordinal;
+        std::vector<const Op*> partner(frame_ops.size(), nullptr);
         u32 draws = 0, matched = 0, camera_draws = 0, camera_cuts = 0;
-        std::vector<float> change;  // per matched draw: relative change of its float uniforms
-        for (const Op& op : frame_ops) {
+        std::vector<float> change, world_change;  // per matched draw: relative change of its float uniforms
+        for (size_t n = 0; n < frame_ops.size(); ++n) {
+            const Op& op = frame_ops[n];
             if (op.kind != Op::Draw) continue;
             ++draws;
             auto it = prev.find(op.key);
             if (it == prev.end()) continue;
+            auto& cands = it->second;
+            const u32 ord = ordinal[op.key]++;
+            size_t best = cands.size();
+            float best_change = 0;
+            if (cands.size() > 32) {  // shortcut: big groups (grass, particles) pair by order, cost bound
+                if (ord < cands.size() && cands[ord]) best = ord, best_change = uniform_change(*cands[ord]->vs, *op.vs);
+            } else {
+                for (size_t j = 0; j < cands.size(); ++j)
+                    if (cands[j])
+                        if (const float c = uniform_change(*cands[j]->vs, *op.vs); best == cands.size() || c < best_change)
+                            best = j, best_change = c;
+            }
+            if (best == cands.size()) continue;
+            const Op* p = cands[best];
+            cands[best] = nullptr;
             ++matched;
-            double num = 0, den = 0;
-            static_assert(sizeof(pica::Vec4) == 16);
-            const float* a = &it->second->vs->float_uniforms[0].x;
-            const float* b = &op.vs->float_uniforms[0].x;
-            for (u32 i = 0; i < 96 * 4; ++i)
-                if (std::isfinite(a[i]) && std::isfinite(b[i])) num += std::fabs(a[i] - b[i]), den += std::fabs(a[i]) + std::fabs(b[i]);
-            change.push_back(den > 0 ? float(num / den) : 0.0f);
+            change.push_back(best_change);
             camera::Mat ca, cb;
-            if (camera_draw(*it->second->vs, ca) && camera_draw(*op.vs, cb)) ++camera_draws, camera_cuts += camera::cut(ca, cb);
+            if (camera_draw(*p->vs, ca) && camera_draw(*op.vs, cb))
+                ++camera_draws, camera_cuts += camera::cut(ca, cb), world_change.push_back(best_change);
+            // A draw that jumps (appears, teleports, no real partner) is drawn as in the real frame:
+            // ordinary motion measured < 0.02, mismatched pairs well above.
+            if (best_change <= 0.05f) partner[n] = p;
         }
         // A scene change matches few draws. A camera cut matches most of them (same objects, new
         // camera), but their matrices jump: measured median change 0.05-0.93 at cuts against
         // 0.0001 (p90 0.0013, fast pans < 0.02) between ordinary frames. Averaging across a cut
         // put characters where neither frame has them. Either way: show the real frame twice.
+        // The median is over the world draws when there are any: the static 2D HUD draws (most
+        // draws with the HD HUD) kept it low across cuts.
+        auto& med = world_change.empty() ? change : world_change;
         bool cut = false;
-        if (!change.empty()) {
-            std::nth_element(change.begin(), change.begin() + change.size() / 2, change.end());
-            cut = change[change.size() / 2] > 0.025f;
+        if (!med.empty()) {
+            std::nth_element(med.begin(), med.begin() + med.size() / 2, med.end());
+            cut = med[med.size() / 2] > 0.025f;
         }
         cut |= camera_cuts * 2 > camera_draws;  // the world camera jumped (DekUI's test)
         if (draws && matched * 2 >= draws && !cut) {
             replaying = true;
             pica::ShaderState vs;
-            for (const Op& op : frame_ops) {
+            for (size_t n = 0; n < frame_ops.size(); ++n) {
+                const Op& op = frame_ops[n];
                 switch (op.kind) {
                 case Op::Draw: {
                     vs = *op.vs;
-                    if (auto it = prev.find(op.key); it != prev.end()) {
+                    if (const Op* p = partner[n]) {
                         for (u32 i = 0; i < 96; ++i) {
-                            const pica::Vec4& a = it->second->vs->float_uniforms[i];
+                            const pica::Vec4& a = p->vs->float_uniforms[i];
                             pica::Vec4& b = vs.float_uniforms[i];
                             b = {(a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f, (a.z + b.z) * 0.5f, (a.w + b.w) * 0.5f};
                         }
                         camera::Mat ca, cb;
-                        if (camera_draw(*it->second->vs, ca) && camera_draw(*op.vs, cb)) {
-                            camera_midpoint(*it->second->vs, vs, ca, cb);
+                        if (camera_draw(*p->vs, ca) && camera_draw(*op.vs, cb)) {
+                            camera_midpoint(*p->vs, vs, ca, cb);
                             ++interp_camera_draws;
                         }
                     }
@@ -1513,7 +1547,6 @@ struct Renderer::Impl {
         }
         prev_ops.swap(frame_ops);
         frame_ops.clear();
-        key_counts.clear();
     }
 
     // Fragment shader text depends only on these registers (shader_gen.cpp: texture unit
@@ -1881,7 +1914,7 @@ void Renderer::drop_targets_locked(bool displays) {
         m.displays.clear();
     }
     m.cur = nullptr;
-    m.frame_ops.clear(), m.prev_ops.clear(), m.key_counts.clear();  // no in-between frame across the change
+    m.frame_ops.clear(), m.prev_ops.clear();  // no in-between frame across the change
 }
 
 void Renderer::drop_targets() {
@@ -1911,7 +1944,7 @@ void Renderer::set_widescreen(float aspect) {
 void Renderer::set_interpolate(bool on) {
     std::lock_guard lk(impl_->lock);
     impl_->interpolate = on;
-    impl_->frame_ops.clear(), impl_->prev_ops.clear(), impl_->key_counts.clear();
+    impl_->frame_ops.clear(), impl_->prev_ops.clear();
     for (auto& [va, d] : impl_->displays) d.interp_fresh = false;
 }
 

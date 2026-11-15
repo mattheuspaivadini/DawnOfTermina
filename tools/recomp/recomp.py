@@ -11,6 +11,7 @@ The output is derived from the game binary: it lives in the build tree, never in
 """
 import argparse
 import collections
+import hashlib
 import struct
 import sys
 from pathlib import Path
@@ -369,6 +370,24 @@ def init_array_seeds(image):
     return seeds
 
 
+def select_hooks(text: str, code_sha256: str):
+    """hooks.txt section whose `[<version> <sha256>]` header matches the code.bin hash ->
+    (version, {entry: hook}); (None, {}) when no section matches."""
+    sections, cur = {}, None
+    for line in text.splitlines():
+        line = line.split("#")[0].split()
+        if not line:
+            continue
+        if line[0].startswith("["):
+            version, sha = " ".join(line).strip("[]").split()
+            cur = sections[sha.lower()] = (version, {})
+        elif cur is None:
+            raise SystemExit("hooks.txt: hook outside a [<version> <sha256>] section")
+        else:
+            cur[1][int(line[0], 16)] = line[1]
+    return sections.get(code_sha256.lower(), (None, {}))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("game_data", type=Path)
@@ -405,13 +424,12 @@ def main():
             break
         rc.discover(extra)
 
-    hooks = {}  # entry -> native replacement in src/recomp/hooks.cpp
-    for line in args.hooks.read_text().splitlines():
-        line = line.split("#")[0].split()
-        if line:
-            hooks[int(line[0], 16)] = line[1]
+    sha = hashlib.sha256(image.code).hexdigest()
+    version, hooks = select_hooks(args.hooks.read_text(), sha)  # entry -> src/recomp/hooks.cpp
+    print(f"code.bin {sha}: " + (f"v{version}, {len(hooks)} native hooks" if version else
+          "unknown version, building without native hooks"), file=sys.stderr)
     if missing := [h(a) for a in hooks if a not in rc.entries]:
-        raise SystemExit(f"hooks.txt: not a function entry: {', '.join(missing)}")
+        raise SystemExit(f"hooks.txt [{version}]: not a function entry: {', '.join(missing)}")
 
     funcs = {}
     for key in sorted(rc.entries):

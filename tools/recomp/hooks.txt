@@ -2,6 +2,13 @@
 # <entry VA> <recomp::hooks function>  — found in Hopper; names also in tools/symbols.csv.
 # Each hook must keep the routine's AAPCS contract: arguments in r0-r3 (or s0/s1, hard-float),
 # result in r0 (or s0), return the entry LR.
+#
+# Addresses change between game versions, so hooks live in one section per code.bin:
+# [<version> <SHA-256 of game_data/exefs/code.bin>]. recomp.py hashes the extracted code.bin and
+# uses the matching section; an unknown code.bin builds without hooks (they are only a speed-up).
+# v1.1: no section yet (needs a decrypted v1.1 code.bin to locate the routines in Hopper).
+
+[1.0 050a58834365187ca67211eef0a29816715e9ab9f7289e8372b06fb906620580]
 0x00300154 aeabi_memcpy      # RVCT __aeabi_memcpy(dst, src, n)
 0x00300144 memcpy_src_dst    # swaps r0/r1, then __aeabi_memcpy
 0x001f28e8 aeabi_memcpy4     # word-aligned variant

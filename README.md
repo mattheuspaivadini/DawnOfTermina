@@ -26,12 +26,13 @@ O código ARM11 original (`code.bin` do ExeFS) é traduzido automaticamente para
 1. Coloque sua cópia do jogo em qualquer pasta fora do controle de versão (ex.: `ISO/` ou `input/`, ambas ignoradas pelo Git).
 2. Extraia ExeFS, `exheader.bin`, `code.bin` (descomprimido), `code.elf` (para o Hopper) e RomFS para `game_data/`:
    ```sh
-   python3 tools/extract_cia.py "ISO/<seu jogo>.cia" game_data/
+   python3 tools/extract_cia.py "ISO/<seu jogo>.cia" game_data/ --update "ISO/<update v1.1>.cia"
    ```
+   `--update` é opcional, mas **recomendado**: aplica a atualização oficial v1.1 (correções da Nintendo; pré-requisito de mods como o *Project Restoration*) por cima do jogo base. O extrator confere que o `.cia` é mesmo a atualização deste jogo e desta região (Title ID `0004000E` + o mesmo ID do jogo) antes de escrever qualquer coisa. A versão e o SHA-256 do `code.bin` ficam em `game_data/manifest.json`.
 
 Alternativa: abra o jogo sem `game_data/`; uma tela pede o seu `.cia` (sugere um que esteja em `ISO/`) e faz a extração para `game_data/` ao lado do projeto. O executável procura `game_data/` no diretório atual e ao lado do binário (`build/../game_data`), então também abre por duplo clique.
 
-O extrator é Python puro (sem dependências externas) e exige um `.cia` **descriptografado**; ele avisa e aborta se o conteúdo estiver criptografado.
+O extrator é Python puro (sem dependências externas) e exige `.cia`s **descriptografados** (jogo e update); ele avisa e aborta se o conteúdo estiver criptografado. Updates baixados da eShop costumam vir criptografados: decifre-os antes (por exemplo, com o GodMode9 no seu próprio console).
 
 ## Compilando
 
@@ -96,7 +97,7 @@ Cada função transcrita mantém o endereço virtual original em comentário (`/
 | Etapa | Descrição | Status |
 |---|---|---|
 | 1 | Bootstrap do repositório, licença, documentação | ✅ |
-| 2 | Pipeline de extração do `.cia` e preparação do binário para o Hopper | ✅ |
+| 2 | Pipeline de extração do `.cia` (com update v1.1 opcional via `--update`) e preparação do binário para o Hopper | ✅ |
 | 3 | Runtime, memória e HLE do Horizon OS | ✅ |
 | 4 | Backend Vulkan e tradutor PICA200 | 🟡 draws em lote, vertex shaders na GPU e iluminação por fragmento; cenas com personagens renderizadas; cache de shaders/pipelines em disco (sem engasgos), fog e stencil; faltam sombras |
 | 5 | Entry point (`_start` / `nnMain`) | ✅ boot do crt0 transcrito até a fronteira atual |

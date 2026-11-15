@@ -6,8 +6,15 @@ LZSS-decompressed), code.elf (code.bin at its original VAs, for Hopper), romfs/ 
 raw romfs.bin image (served to the game by the fs:USER HLE).
 Pure Python, no ctrtool/3dstool needed.
 
-usage: extract_cia.py <game.cia> [out_dir=game_data]
+usage: extract_cia.py <game.cia> [out_dir=game_data] [--update <update.cia>]
+
+--update applies the official update (title 0004000E..., v1.1 recommended) on top of the base:
+exheader.bin and code.bin are replaced, its RomFS files overwrite the base ones. The resulting
+version and code.bin SHA-256 go to out_dir/manifest.json.
 """
+import argparse
+import hashlib
+import json
 import struct
 import sys
 from pathlib import Path
@@ -167,21 +174,52 @@ def extract_romfs(f, base, out: Path) -> int:
     return count
 
 
-def main():
-    if len(sys.argv) < 2:
-        sys.exit(__doc__)
-    cia = Path(sys.argv[1])
-    out = Path(sys.argv[2] if len(sys.argv) > 2 else "game_data")
-    out.mkdir(parents=True, exist_ok=True)
+def cia_layout(f):
+    """-> (offset of content 0 = the NCCH, title ID, title version, content 0 encrypted) from
+    the CIA header and its TMD (the TMD is never encrypted, so this works on any .cia)."""
+    f.seek(0)
+    hdr_size, _, _, cert_size, tik_size, tmd_size = struct.unpack("<IHHIII", f.read(0x14))
+    f.seek(align(hdr_size, 64) + align(cert_size, 64) + align(tik_size, 64))
+    tmd = f.read(tmd_size)
+    sig = struct.unpack_from(">I", tmd, 0)[0]
+    body = {0x10003: 0x240, 0x10004: 0x140, 0x10005: 0x80}.get(sig)  # RSA-4096/2048, ECDSA
+    if body is None:
+        raise ValueError(f"not a CIA (unknown TMD signature type {sig:#x})")
+    title_id = struct.unpack_from(">Q", tmd, body + 0x4C)[0]
+    version = struct.unpack_from(">H", tmd, body + 0x9C)[0]
+    content_type = struct.unpack_from(">H", tmd, body + 0xC4 + 64 * 0x24 + 6)[0]
+    ncch = align(hdr_size, 64) + align(cert_size, 64) + align(tik_size, 64) + align(tmd_size, 64)
+    return ncch, title_id, version, bool(content_type & 1)
+
+
+def version_name(v: int) -> str:
+    # TMD title version: major.minor.micro in 6.6.4 bits; 0 is the launch release, sold as 1.0.
+    return "1.0" if v == 0 else f"{v >> 10}.{(v >> 4) & 0x3F}"
+
+
+def check_update(base_tid: int, update_tid: int):
+    """An update for this game: category 0x0004000E with the base's unique ID (which also
+    encodes the region: USA 0x00125500, EUR 0x00125600, JPN 0x000D6E00)."""
+    if base_tid >> 32 != 0x00040000:
+        raise ValueError(f"base title {base_tid:016X} is not a game (category 00040000)")
+    if update_tid >> 32 != 0x0004000E:
+        raise ValueError(f"--update: {update_tid:016X} is not an update title (category 0004000E)")
+    if update_tid & 0xFFFFFFFF != base_tid & 0xFFFFFFFF:
+        raise ValueError(f"--update: {update_tid:016X} belongs to another game or region "
+                         f"(base is {base_tid:016X}, expected update {0x0004000E << 32 | base_tid & 0xFFFFFFFF:016X})")
+
+
+def extract(cia: Path, out: Path):
+    """Extract one decrypted CIA into out/. Run again with an update CIA on the same out/, it
+    overwrites exheader.bin, exefs/code.bin (+ code.elf) and the RomFS files it carries."""
     with open(cia, "rb") as f:
-        hdr_size, _, _, cert_size, tik_size, tmd_size = struct.unpack("<IHHIII", f.read(0x14))
-        ncch = align(hdr_size, 64) + align(cert_size, 64) + align(tik_size, 64) + align(tmd_size, 64)
+        ncch, _, _, encrypted = cia_layout(f)
         f.seek(ncch)
         h = f.read(0x200)
-        if h[0x100:0x104] != b"NCCH":
-            sys.exit("content 0 is not a plain NCCH: the .cia is CIA-encrypted; decrypt it first")
+        if encrypted or h[0x100:0x104] != b"NCCH":
+            sys.exit(f"{cia.name}: content 0 is CIA-encrypted (title key); decrypt the .cia first")
         if not h[0x18F] & 0x4:
-            sys.exit("NCCH is encrypted (NoCrypto flag not set); decrypt the .cia first")
+            sys.exit(f"{cia.name}: NCCH is encrypted (NoCrypto flag not set); decrypt the .cia first")
 
         exh_size = u32(h, 0x180)
         f.seek(ncch + 0x200)
@@ -213,6 +251,8 @@ def main():
 
         romfs_off = u32(h, 0x1B0) * MEDIA_UNIT
         if romfs_off:
+            # Files are written over the base ones (others stay); romfs.bin is replaced, as the
+            # system mounts an update's RomFS instead of the base one.
             n = extract_romfs(f, ncch + romfs_off, out / "romfs")
             print(f"romfs/  {n} files")
             # Raw RomFS image (from the IVFC header): what fs:USER serves to the game's SDK.
@@ -226,13 +266,58 @@ def main():
                     o.write(chunk)
                     remaining -= len(chunk)
             print(f"romfs.bin  {(out / 'romfs.bin').stat().st_size:#x}")
+    return cs
 
-    print(f"\ntitle: {cs['name']}  code compressed: {cs['compressed']}")
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cia", type=Path, help="decrypted base game .cia")
+    ap.add_argument("out", type=Path, nargs="?", default=Path("game_data"))
+    ap.add_argument("--update", type=Path, help="decrypted update .cia (v1.1, recommended)")
+    args = ap.parse_args()
+    try:
+        with open(args.cia, "rb") as f:
+            _, base_tid, base_ver, _ = cia_layout(f)
+        if args.update:  # validated before writing anything
+            with open(args.update, "rb") as f:
+                _, upd_tid, upd_ver, upd_encrypted = cia_layout(f)
+            check_update(base_tid, upd_tid)
+            if upd_encrypted:
+                raise ValueError(f"{args.update.name}: content is CIA-encrypted (title key); "
+                                 "decrypt the update .cia first")
+    except (ValueError, struct.error) as e:
+        sys.exit(f"error: {e}")
+
+    args.out.mkdir(parents=True, exist_ok=True)
+    base_sha = None
+    cs = extract(args.cia, args.out)
+    version = base_ver
+    if args.update:
+        base_sha = hashlib.sha256((args.out / "exefs" / "code.bin").read_bytes()).hexdigest()
+        print(f"\napplying update {upd_tid:016X} v{version_name(upd_ver)}")
+        cs = extract(args.update, args.out)
+        version = upd_ver
+    code_sha = hashlib.sha256((args.out / "exefs" / "code.bin").read_bytes()).hexdigest()
+    manifest = {
+        "title_id": f"{base_tid:016X}",
+        "game_version": version_name(version),
+        "title_version": version,
+        "code_sha256": code_sha,
+    }
+    if base_sha:
+        manifest["base_code_sha256"] = base_sha
+    (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+    print(f"\ntitle: {cs['name']}  version {manifest['game_version']}  code compressed: {cs['compressed']}")
     for s in ("text", "rodata", "data"):
         v = cs[s]
         print(f".{s:<7} VA {v['addr']:#010x}  size {v['size']:#x}  pages {v['pages']:#x}")
     print(f".bss     size {cs['bss_size']:#x}\nstack    size {cs['stack_size']:#x}")
-    print(f"entry    {cs['text']['addr']:#010x}")
+    print(f"entry    {cs['text']['addr']:#010x}\ncode.bin sha256 {code_sha}")
+    if not args.update:
+        print("\nnote: no --update given. Installing the official v1.1 update is recommended "
+              "(bug fixes; required by mods such as Project Restoration):\n"
+              "  extract_cia.py <game.cia> game_data --update <update_v1.1.cia>")
 
 
 if __name__ == "__main__":

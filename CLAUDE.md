@@ -112,7 +112,8 @@ Decisão do usuário (2026-11-14): **tradutor automático ARM11 → C++** para o
 ## Hooks nativos (Etapa 12)
 
 - `tools/recomp/hooks.txt` (`<VA> <nome>`) → o recompilador emite `func_<VA>` como `return recomp::hooks::<nome>(c);` (declarados em `src/recomp/hooks.h`, implementados em `hooks.cpp`). Chamadas diretas, tail calls e a tabela indireta passam pelo hook. VA que não é entrada descoberta = erro no build. O hook só reproduz o contrato AAPCS (r0/s0 de resultado, memória escrita, retorna o LR de entrada).
-- Hooks atuais (RVCT, achados no Hopper; nomes no `symbols.csv`): `__aeabi_memcpy` `0x300154`, `memcpy_src_dst` `0x300144` (r0/r1 trocados), `__aeabi_memcpy4` `0x1F28E8`, `__aeabi_memmove4` `0x14C364`, `__aeabi_memset` `0x137ED4` (dst, n, c), `__aeabi_memclr` `0x16E63C`, `__aeabi_memclr4` `0x300338`, `strlen` `0x3028E0`, `strcmp` `0x302E3C`, `sinf` `0x22A3AC`, `cosf` `0x22A234`, `atan2f` `0x1E4F78` (hard-float: s0/s1 → s0). `sqrtf` não existe como função (511 `vsqrt` inline). Leitura de arquivo não foi hookada: o `fs` já é HLE por IPC e não aparece no perfil.
+- **Por versão:** os endereços mudam entre v1.0 e v1.1, então o `hooks.txt` tem uma seção por `code.bin`: `[<versão> <SHA-256 do code.bin>]`. O `recomp.py` calcula o hash do `code.bin` extraído e usa a seção que casa (`select_hooks`, testado em `tools/test_versions.py`); um `code.bin` desconhecido compila **sem hooks**, com aviso (eles só aceleram). **Ainda não há seção v1.1:** os endereços precisam de um `code.bin` v1.1 decifrado (achar as rotinas no Hopper e criar `[1.1 <sha>]`).
+- Hooks atuais da v1.0 (RVCT, achados no Hopper; nomes no `symbols.csv`): `__aeabi_memcpy` `0x300154`, `memcpy_src_dst` `0x300144` (r0/r1 trocados), `__aeabi_memcpy4` `0x1F28E8`, `__aeabi_memmove4` `0x14C364`, `__aeabi_memset` `0x137ED4` (dst, n, c), `__aeabi_memclr` `0x16E63C`, `__aeabi_memclr4` `0x300338`, `strlen` `0x3028E0`, `strcmp` `0x302E3C`, `sinf` `0x22A3AC`, `cosf` `0x22A234`, `atan2f` `0x1E4F78` (hard-float: s0/s1 → s0). `sqrtf` não existe como função (511 `vsqrt` inline). Leitura de arquivo não foi hookada: o `fs` já é HLE por IPC e não aparece no perfil.
 - **Medição** (abertura → cutscene da Lost Woods, 150 s, roteiro padrão, CPU das threads `guest` ÷ VBlanks): sem hooks 2,42 / 2,51 / 2,56 ms por VBlank; com hooks 2,54 / 2,56. **Diferença dentro do ruído.** Perfil por amostragem (gdb, 201 amostras com a thread do jogo ativa): memcpy ≈1%; **~23% é o handler HLE do `TriggerCmdReqQueue` do GSP** (`gsp_command`: processamento das command lists/renderer na thread do jogo, chamado de `0x16506C`), ~5% `recomp::call` (era busca binária na tabela de 17 mil entradas; agora **O(1)**: `set_function_table` monta um índice direto `(chave − menor chave) / 2` → posição na tabela, ~11 MB de `u32`, e a chave exata é conferida para recusar entrada ARM chamada como Thumb e vice-versa). O GSP é o alvo que sobra para reduzir CPU de verdade.
 - Os hooks de cópia (`__aeabi_memcpy`, `memcpy_src_dst`, `memcpy4`, `memmove4`) usam `std::memmove`: sem UB em regiões sobrepostas.
 - Threads do guest se chamam `guest` (`pthread_setname_np`): somar `utime+stime` de `/proc/<pid>/task/*` com esse nome dá a CPU do jogo; o perfil por gdb filtra por esse nome.
@@ -208,15 +209,18 @@ Sem `CMAKE_BUILD_TYPE` o CMake agora assume **Release**: um build sem tipo compi
 - O `.cia` do usuário é **não criptografado** (NCCH com flag NoCrypto), então a extração é Python puro.
 
 ```sh
-python3 tools/extract_cia.py "ISO/The Legend of Zelda Majora's Mask 3D (USA).cia" game_data
+python3 tools/extract_cia.py "ISO/The Legend of Zelda Majora's Mask 3D (USA).cia" game_data [--update <update_v1.1.cia>]
 ```
+
+- **Update v1.1 (`--update`, recomendado):** validado antes de escrever qualquer arquivo, pelo TMD (sempre em claro): o jogo base precisa ser `00040000xxxxxxxx` e o update `0004000E` + os mesmos 32 bits baixos (ID único, que também separa a região: USA `00125500`, EUR `00125600`, JPN `000D6E00`); conteúdo marcado como criptografado no TMD → erro. Aplicação = a mesma extração rodada sobre `game_data/`: `exheader.bin`, `code.bin`/`code.elf` substituídos; arquivos do RomFS do update sobrescrevem os do base em `romfs/` (os outros ficam) e o `romfs.bin` passa a ser o do update (o sistema monta o RomFS do update no lugar do base). `game_data/manifest.json`: `title_id`, `game_version` (`"1.0"` = versão 0 do TMD; `1040` = `"1.1"`), `title_version`, `code_sha256` (+ `base_code_sha256` com update). Sem `--update`, o extrator recomenda instalar a v1.1.
+- **O update da pasta `ISO/` (`0004000E00125500`, v1040) está criptografado** (título com chave da eShop): validação e recusa testadas com ele; a aplicação foi testada com um update sintético (NCCH do base com Title ID de update). **Nada foi rodado ainda com o `code.bin` da v1.1.**
 
 ## Progresso
 
 | Etapa | Descrição | Status | Notas |
 |---|---|---|---|
 | 1 | Bootstrap: git, `.gitignore`, `LICENSE`, `README.md`, `CLAUDE.md`, CMake | ✅ | executável stub que valida `game_data/` |
-| 2 | Extração do `.cia` + mapa de memória + abrir no Hopper | ✅ | extrator em Python puro (sem ctrtool/3dstool); `code.elf` validado no Hopper |
+| 2 | Extração do `.cia` + mapa de memória + abrir no Hopper | ✅ | extrator em Python puro (sem ctrtool/3dstool); `code.elf` validado no Hopper; `--update` (v1.1) + `manifest.json`; hooks por versão |
 | 3 | Runtime de memória, `svc`, stubs `fs`/`hid`/`dsp` | ✅ | HLE no nível do SDK, sem IPC; `tests/selftest.cpp` via ctest |
 | 4 | Vulkan + tradutor PICA200 | 🟡 | 4a ✅, 4b parte 1 ✅, 4b parte 2 ✅ draws reais na tela, **iluminação por fragmento ✅** (abertura 3D visível), **sem engasgos de shader** (push constants + caches em disco), **fog ✅**, stencil (não exercitado ainda). Falta shadow maps, gas |
 | 5 | Entry point / `nnMain` | ✅ | crt0 transcrito até a fronteira `0x0011BECC`; srv/svc/err em HLE; 29 símbolos nomeados |

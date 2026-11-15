@@ -54,7 +54,14 @@ void pause_capture_sync(Context* c);
 
 // DekUI single-screen inventory (src/recomp/dekui.cpp): Items/Masks/Gear on the top screen.
 void dekui_capture_page(Context* c);
+void dekui_enter_page(Context* c);
+void dekui_leave_page(Context* c);
 void dekui_capture_gear(Context* c);
+void dekui_model_frame(Context* c);
+void dekui_model_begin(Context* c);
+void dekui_model_end(Context* c);
+void dekui_dialogue_begin(Context* c);
+void dekui_dialogue_end(Context* c);
 void dekui_close_gear(Context* c);
 void dekui_layout_pass(Context* c);
 void dekui_layout_begin(Context* c);

@@ -21,14 +21,27 @@
 // and each hook does what DekUI's SVC handler does, including the displaced instruction.
 //
 // Ported so far: the Items/Masks/Gear pages drawn on the top screen (NativeInventory: the layouts
-// move from the bottom screen's render queue to the top's and are re-posed while drawn) and its
-// D-pad/stick navigation (InventoryNavigation).
+// move from the bottom screen's render queue to the top's and are re-posed while drawn), their
+// D-pad/stick navigation (InventoryNavigation), tabs (MenuTabs), button legend (MenuHelp), map
+// prompt (ItemsMapPrompt), panel shadow (InventoryShadow), item model (ItemPreview) and the item
+// description box (DialogueScale).
+//
+// Several modules draw extra panes by building layout trees on the guest stack below sp: their
+// Root() returns the tree to draw in place of r4 + 8, sp moves below it while the layout draws,
+// and End() gives sp back (DekUI's SVC 2/3 handlers do the same).
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
 
+#include "hle/svc.h"
+#include "mm3d/dialogue_scale.h"
 #include "mm3d/inventory_navigation.h"
+#include "mm3d/inventory_shadow.h"
+#include "mm3d/item_preview.h"
+#include "mm3d/menu_help.h"
+#include "mm3d/menu_tabs.h"
 #include "mm3d/native_inventory.h"
 #include "recomp/hooks.h"
 
@@ -43,6 +56,12 @@ struct Guest {  // DekUI's memory interface: reads of unmapped memory fail inste
 };
 
 Inv::Hook g_inventory;
+MM3D::ItemPreview::Hook g_preview;
+MM3D::DialogueScale::Hook g_dialogue;
+MM3D::InventoryShadow::Hook g_shadow;
+MM3D::ItemsMapPrompt::Hook g_map_prompt;
+MM3D::MenuTabs::Hook g_tabs;
+MM3D::MenuHelp::Hook g_help;
 
 // DekUI's release defaults (resources/mm3d/defaults/presentation.json).
 // shortcut: fixed layout; expose these in the F1 menu / config.toml when someone wants to move them.
@@ -67,6 +86,15 @@ bool apply_defaults() {
     gear.poses[G::Description] = {83.5f, 1.8f, 0.6f};
     gear.poses[G::Photo] = {78.7f, -20.6f, 0.88f};
     G::Apply(gear);
+    MM3D::ItemPreview::model_x = 4.11f, MM3D::ItemPreview::model_y = 0.44f, MM3D::ItemPreview::model_scale = 0.87f;
+    MM3D::DialogueScale::item_x = 83.5f, MM3D::DialogueScale::item_y = 1.8f, MM3D::DialogueScale::item_scale = 0.6f;
+    MM3D::MenuTabs::gear_pose.x = -14.9f, MM3D::MenuTabs::gear_pose.y = 19.7f, MM3D::MenuTabs::gear_pose.scale = 0.62f;
+    MM3D::ItemsMapPrompt::elements[2].y = -3.6f;  // the label; pose, R and arrow keep the module's defaults
+    MM3D::MenuHelp::Options help;
+    help.pose = {157.8f, 230.4f, 0.53f};
+    help.horizontal = true, help.spacing = 20.9f, help.button_gap = 4.1f, help.button_scale = 0.91f;
+    help.opacity = 0.85f;
+    MM3D::MenuHelp::Apply(help);
     // The NPC "give item" menu (NativeItemPresent) is not ported: keep its navigation native.
     MM3D::NativeItemPresent::enabled = false;
     return true;
@@ -78,7 +106,8 @@ bool active() {
     static const bool ok = [] {
         if (const char* e = std::getenv("DOT_DEKUI"); e && *e == '0') return false;  // DOT_DEKUI=0: native menus
         Guest g;
-        return Inv::CodeMatches(g) && MM3D::InventoryNavigation::CodeMatches(g);
+        return Inv::CodeMatches(g) && MM3D::InventoryNavigation::CodeMatches(g) &&
+               MM3D::ItemPreview::CodeMatches(g) && MM3D::DialogueScale::CodeMatches(g);
     }();
     return ok;
 }
@@ -87,25 +116,73 @@ bool active() {
 
 bool dekui_inventory_routed() { return Inv::status.load() == 2; }
 
-// mov r4, r0 at the Items/Masks page entries (0x59E3E8, 0x5C250C).
+// mov r4, r0 at the Items/Masks page entry (0x59E3E8).
 void dekui_capture_page(Context* c) {
     Guest g;
     if (active()) g_inventory.Capture(g, c->r[0]);
     c->r[4] = c->r[0];
 }
 
+// mov r4, r0 where the Items/Masks page has built its icons (0x5C250C; r1 = controller).
+void dekui_enter_page(Context* c) {
+    Guest g;
+    if (active()) g_preview.Enter(g, c->r[0], c->r[1]), g_inventory.Capture(g, c->r[0]);
+    c->r[4] = c->r[0];
+}
+
+// mov r4, r0 when the Items/Masks page leaves (0x5C27DC).
+void dekui_leave_page(Context* c) {
+    if (active()) g_preview.Leave(c->r[0]);
+    c->r[4] = c->r[0];
+}
+
 // mov r4, r0 at the Gear page entry (0x5A6B44).
 void dekui_capture_gear(Context* c) {
     Guest g;
-    if (active()) g_inventory.CaptureGear(g, c->r[0]);
+    if (active()) g_preview.EnterGear(g, c->r[0], c->r[1]), g_inventory.CaptureGear(g, c->r[0]);
     c->r[4] = c->r[0];
 }
 
 // mov r5, r0 when the Gear page closes (0x5A5FC8).
 void dekui_close_gear(Context* c) {
     Guest g;
-    if (active() && g_inventory.gear_page == c->r[0]) g_inventory.Capture(g, 0);
+    if (active()) {
+        g_preview.Leave(c->r[0]);
+        if (g_inventory.gear_page == c->r[0]) g_inventory.Capture(g, 0);
+    }
     c->r[5] = c->r[0];
+}
+
+// The item model of the menu page (ItemPreview): mov r4, r0 at the model frame (0x111C6C),
+// mov r1, r6 before its matrix is copied (0x1122E4, matrix at r6), nop after (0x1122EC).
+void dekui_model_frame(Context* c) {
+    if (active()) g_preview.ModelFrame(c->r[0]);
+    c->r[4] = c->r[0];
+}
+void dekui_model_begin(Context* c) {
+    Guest g;
+    if (active()) g_preview.ModelBegin(g, c->r[4], c->r[6]);
+    c->r[1] = c->r[6];
+}
+void dekui_model_end(Context*) {
+    Guest g;
+    if (active()) g_preview.ModelEnd(g);
+}
+
+// The item description MessageWindow (DialogueScale): add r0, r4, #8 before it is posed
+// (0x161C9C), add sp, sp, #8 after (0x161CA4).
+void dekui_dialogue_begin(Context* c) {
+    Guest g;
+    if (active()) {
+        const bool description = g_preview.Description(g, c->r[4]);
+        g_dialogue.Begin(g, c->r[4], description, description && g_preview.gear, nullptr);
+    }
+    c->r[0] = c->r[4] + 8;
+}
+void dekui_dialogue_end(Context* c) {
+    Guest g;
+    if (active()) g_dialogue.End(g, c->r[4]);
+    c->r[13] += 8;
 }
 
 // mov r4, r0 before the layout manager draws one screen's queue (0x126814): r0 manager, r1 screen.
@@ -126,14 +203,33 @@ void dekui_layout_pass(Context* c) {
 // add r2, r4, #8 before one layout (r4) is drawn (0x1262F0).
 void dekui_layout_begin(Context* c) {
     Guest g;
-    if (active()) g_inventory.Begin(g, c->r[4], false);  // our widescreen keeps 2D layouts at 5:3
-    c->r[2] = c->r[4] + 8;
+    const u32 layout = c->r[4], native = layout + 8;
+    c->r[2] = native;
+    if (!active()) return;
+    g_inventory.Begin(g, layout, false);  // our widescreen keeps 2D layouts at 5:3
+    // Same chain and order as DekUI's SVC 2 (only the modules ported here).
+    auto below = [&] { return c->r[2] != native ? c->r[2] : c->r[13]; };  // free stack for the next tree
+    if (const u32 root = g_shadow.Root(g, g_inventory, layout, c->r[13], nullptr); root != native) c->r[2] = root;
+    g_map_prompt.ResolveDescription(g, g_preview.owner, g_inventory.panel);
+    const std::int64_t us = std::int64_t(hle::svc::GetSystemTick() / 268.111856);
+    if (const u32 root = g_map_prompt.Root(g, g_inventory, layout, below(), c->r[2], false, us); root != native)
+        c->r[2] = root;
+    c->r[2] = g_tabs.Root(g, g_inventory, layout, below(), c->r[2]);
+    g_help.source.ResolveDescription(g, g_preview.owner, g_inventory.panel);
+    c->r[2] = g_help.Root(g, g_inventory, layout, below(), c->r[2], nullptr);
+    if (c->r[2] != native) c->r[13] = c->r[2];  // the trees live below the new sp while it draws
 }
 
 // str r0, [r6] after it was drawn (0x1262FC): the poses written by Begin are restored.
 void dekui_layout_end(Context* c) {
     Guest g;
-    if (active()) g_inventory.End(g);
+    if (active()) {
+        if (const u32 sp = g_help.scratch.End(g)) c->r[13] = sp;
+        if (const u32 sp = g_tabs.scratch.End(g)) c->r[13] = sp;
+        if (const u32 sp = g_map_prompt.prompt.End(g)) c->r[13] = sp;
+        if (const u32 sp = g_shadow.scratch.End(g)) c->r[13] = sp;
+        g_inventory.End(g);
+    }
     w32(c->r[6], c->r[0]);
 }
 

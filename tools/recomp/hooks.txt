@@ -85,7 +85,13 @@
 # DekUI single-screen inventory (src/recomp/dekui.cpp; PCs from DekUI's NativeInventory,
 # ItemPreview and InventoryNavigation, verified against this code.bin by CodeMatches at runtime).
 0x0059e3e8 dekui_capture_page insn    # mov r4, r0: Items/Masks page
-0x005c250c dekui_capture_page insn    # mov r4, r0: Items/Masks page, icon array built
+0x005c250c dekui_enter_page insn      # mov r4, r0: Items/Masks page, icon array built (r1 controller)
+0x005c27dc dekui_leave_page insn      # mov r4, r0: Items/Masks page leaves
+0x00111c6c dekui_model_frame insn     # mov r4, r0: menu item model frame
+0x001122e4 dekui_model_begin insn     # mov r1, r6: before the model matrix (r6) is used
+0x001122ec dekui_model_end insn       # nop: after it
+0x00161c9c dekui_dialogue_begin insn  # add r0, r4, #8: MessageWindow r4 about to be posed
+0x00161ca4 dekui_dialogue_end insn    # add sp, sp, #8: after
 0x005a6b44 dekui_capture_gear insn    # mov r4, r0: Gear page
 0x005a5fc8 dekui_close_gear insn      # mov r5, r0: Gear page closes
 0x00126814 dekui_layout_pass insn     # mov r4, r0: draw one screen's layout queue (r1 = screen)

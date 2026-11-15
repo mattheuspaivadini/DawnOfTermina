@@ -108,7 +108,7 @@ endif()
 # Self-contained folder: cmake --install build --prefix dist. With game data configured the
 # executable holds the recompiled game code: personal use only, never commit or share it.
 install(TARGETS dawnoftermina RUNTIME DESTINATION .)
-install(FILES tools/extract_cia.py tools/bps_patch.py DESTINATION tools)
+install(FILES tools/extract_cia.py tools/bps_patch.py tools/romfs_patch.py DESTINATION tools)
 install(FILES LICENSE README.md DESTINATION .)
 
 enable_testing()
@@ -121,4 +121,5 @@ if(Python3_FOUND)
     add_test(NAME recomp_lifter COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tools/recomp/test_lifter.py)
     add_test(NAME tool_versions COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tools/test_versions.py)
     add_test(NAME tool_bps COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tools/test_bps.py)
+    add_test(NAME tool_romfs COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tools/test_romfs.py)
 endif()

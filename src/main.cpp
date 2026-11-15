@@ -132,6 +132,7 @@ int main(int argc, char** argv) {
                      "rebuild (cmake --build build) and start it again.");
 #endif
     }
+    gfx::g_hd_hud = fs::exists(data / "romfs" / "layout" / "Joker.Main.New.gar");  // extract_cia.py --romfs
     // config.toml lives next to game_data/ (like saves/ and cache/); DOT_* variables override it.
     const std::filesystem::path config_file = std::filesystem::absolute(data).parent_path() / "config.toml";
     core::Config config = core::load_config(config_file);

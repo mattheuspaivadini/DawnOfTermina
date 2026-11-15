@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <map>
@@ -95,6 +96,8 @@ void file_command(const std::shared_ptr<HostFile>& file, core::Memory& mem, u32 
         const u32 size = c[3], addr = c[5];
         std::fseek(file->f, long(file->base + offset), SEEK_SET);
         const u32 n = u32(std::fread(mem.host(addr), 1, size, file->f));
+        static const bool trace = std::getenv("DOT_TRACE_FS");
+        if (trace) std::fprintf(stderr, "fs: read %s +%#llx %#x -> %#x\n", file->path.c_str(), (unsigned long long)offset, size, n);
         c.reply(2, 2);
         c.set(2, n), c.set(3, size << 4 | 0xC), c.set(4, addr);
         return;

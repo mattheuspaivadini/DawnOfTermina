@@ -34,7 +34,14 @@ O código ARM11 original (`code.bin` do ExeFS) é traduzido automaticamente para
    ```sh
    python3 tools/extract_cia.py "ISO/<seu jogo>.cia" game_data/ --update "ISO/<update v1.1>.cia" --restoration "<Project Restoration>.zip"
    ```
-   A ordem é sempre jogo base → update v1.1 → mod. O mod **exige a v1.1**: sem `--update`, ou se nenhum `code.bps` do pacote tiver o CRC32 do `code.bin` extraído, o extrator para com erro antes de aplicar. Os patches BPS são aplicados por `tools/bps_patch.py` (Python puro, confere tamanhos e CRC32 de origem, patch e destino). O `manifest.json` registra `restoration_enabled`. Depois de mudar o `game_data/`, recompile (`cmake --build build`): o código do mod é recompilado junto com o jogo. Arquivos de `romfs/` do mod são copiados para `game_data/romfs/`, mas ainda **não** são lidos pelo jogo (ele lê o `romfs.bin`); a versão 1.5.9 não traz nenhum.
+   A ordem é sempre jogo base → update v1.1 → mod. O mod **exige a v1.1**: sem `--update`, ou se nenhum `code.bps` do pacote tiver o CRC32 do `code.bin` extraído, o extrator para com erro antes de aplicar. Os patches BPS são aplicados por `tools/bps_patch.py` (Python puro, confere tamanhos e CRC32 de origem, patch e destino). O `manifest.json` registra `restoration_enabled`. Depois de mudar o `game_data/`, recompile (`cmake --build build`): o código do mod é recompilado junto com o jogo. Arquivos de `romfs/` do mod entram no `romfs.bin` (ver `--romfs` abaixo).
+
+   **HUD HD / tela única (opcional, recomendado com o Project Restoration):** use o pacote *plus HD HUD* do Restoration (`mm3d_project_restoration_plus_hd_hud_v1.5.9-5-g8bb2a7b.7z`, na [página de releases](https://github.com/leoetlino/project-restoration/releases)) e o layout [*big screen*](https://restoration.zora.re/hd-hud) (`mm3d_big_screen_layout_779512b.7z`) com `--romfs`. Corações, rupias e botões de item passam para a tela de cima (é a mesma base usada pelo DekUI); no modo N64 só o minimapa continua vindo da tela de baixo:
+   ```sh
+   python3 tools/extract_cia.py "ISO/<seu jogo>.cia" game_data/ --update "ISO/<update v1.1>.cia" \
+       --restoration mm3d_project_restoration_plus_hd_hud_v1.5.9-5-g8bb2a7b.7z --romfs mm3d_big_screen_layout_779512b.7z
+   ```
+   `--romfs <arquivo|pasta>` (repetível) aplica qualquer mod de RomFS: os arquivos são acrescentados ou substituídos dentro do `romfs.bin` por `tools/romfs_patch.py` (a imagem é regravada, ~650 MB).
 
 Alternativa: abra o jogo sem `game_data/`; uma tela pede o seu `.cia` (sugere um que esteja em `ISO/`) e faz a extração para `game_data/` ao lado do projeto. O executável procura `game_data/` no diretório atual e ao lado do binário (`build/../game_data`), então também abre por duplo clique.
 
@@ -107,7 +114,7 @@ Cada função transcrita mantém o endereço virtual original em comentário (`/
 | Etapa | Descrição | Status |
 |---|---|---|
 | 1 | Bootstrap do repositório, licença, documentação | ✅ |
-| 2 | Pipeline de extração do `.cia` (com update v1.1 opcional via `--update` e Project Restoration via `--restoration`) e preparação do binário para o Hopper | ✅ |
+| 2 | Pipeline de extração do `.cia` (com update v1.1 opcional via `--update` e Project Restoration via `--restoration`, mods de RomFS como o HD HUD via `--romfs`) e preparação do binário para o Hopper | ✅ |
 | 3 | Runtime, memória e HLE do Horizon OS | ✅ |
 | 4 | Backend Vulkan e tradutor PICA200 | 🟡 draws em lote, vertex shaders na GPU e iluminação por fragmento; cenas com personagens renderizadas; cache de shaders/pipelines em disco (sem engasgos), fog e stencil; faltam sombras |
 | 5 | Entry point (`_start` / `nnMain`) | ✅ boot do crt0 transcrito até a fronteira atual |

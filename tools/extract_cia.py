@@ -7,6 +7,7 @@ raw romfs.bin image (served to the game by the fs:USER HLE).
 Pure Python, no ctrtool/3dstool needed.
 
 usage: extract_cia.py <game.cia> [out_dir=game_data] [--update <update.cia>] [--restoration <mod>]
+                      [--romfs <mod> ...]
 
 --update applies the official update (title 0004000E..., v1.1 recommended) on top of the base:
 exheader.bin and code.bin are replaced, its RomFS goes to update_romfs.bin (base romfs.bin kept). The resulting
@@ -16,6 +17,10 @@ version and code.bin SHA-256 go to out_dir/manifest.json.
 release archive (.zip, or .7z with 7z/bsdtar installed) or a folder with code.bps, exheader.bin or
 exheader.bps, and optionally romfs/. The code.bps whose source CRC32 matches code.bin is picked
 (the release has one per game version; its 3ds/ variant is preferred over citra/).
+
+--romfs adds a RomFS mod (archive or folder; its romfs/ subfolder if it has one) into romfs.bin
+(tools/romfs_patch.py), e.g. Project Restoration's HD HUD layout (mm3d_big_screen_layout_*.7z).
+Mods are applied in order, after the update and Restoration.
 """
 import argparse
 import hashlib
@@ -31,6 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))  # run with python3 -I, which leaves the script dir out
 from bps_patch import BPSError, bps_apply, bps_info  # noqa: E402
+from romfs_patch import patch_romfs  # noqa: E402
 
 MEDIA_UNIT = 0x200
 
@@ -290,7 +296,7 @@ def unpack_mod(src: Path, tmp: Path) -> Path:
     if src.is_dir():
         return src
     if not src.is_file():
-        raise ValueError(f"--restoration: {src} not found")
+        raise ValueError(f"{src} not found")
     if zipfile.is_zipfile(src):
         with zipfile.ZipFile(src) as z:
             z.extractall(tmp)
@@ -299,7 +305,7 @@ def unpack_mod(src: Path, tmp: Path) -> Path:
         if shutil.which(cmd[0]):
             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
             return tmp
-    raise ValueError(f"--restoration: can't unpack {src.name} (install 7z or bsdtar, or extract it "
+    raise ValueError(f"can't unpack {src.name} (install 7z or bsdtar, or extract it "
                      "and pass the folder)")
 
 
@@ -348,20 +354,21 @@ def apply_restoration(mod: Path, out: Path, cs_before):
     exh_path.write_bytes(exh)
     code_path.write_bytes(code)
     write_elf(code, cs, out / "code.elf")
-    n = 0
     if (d / "romfs").is_dir():
-        # shortcut: the game reads romfs.bin, not romfs/, so these files are not loaded yet;
-        # rebuild romfs.bin (IVFC level 3) when a release ships RomFS files.
-        for f in (d / "romfs").rglob("*"):
-            if f.is_file():
-                dst = out / "romfs" / f.relative_to(d / "romfs")
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(f, dst)
-                n += 1
-        print(f"warning: {n} romfs/ files copied to {out / 'romfs'}, but RomFS mods are not loaded "
-              "by the game yet (it reads romfs.bin)")
+        apply_romfs_mod(d / "romfs", out)
     print(f"Project Restoration applied from {d}: code.bin {len(code):#x}, mod code {start:#x}-{end:#x}")
     return cs, [start, end]
+
+
+def apply_romfs_mod(mod: Path, out: Path):
+    """Files of a mod's romfs/ folder into romfs.bin (what the game reads) and romfs/ (reference)."""
+    n = patch_romfs(out / "romfs.bin", mod)
+    for f in mod.rglob("*"):
+        if f.is_file():
+            dst = out / "romfs" / f.relative_to(mod)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(f, dst)
+    print(f"romfs mod {mod}: {n} files added to romfs.bin")
 
 
 def main():
@@ -371,6 +378,8 @@ def main():
     ap.add_argument("--update", type=Path, help="decrypted update .cia (v1.1, recommended)")
     ap.add_argument("--restoration", type=Path,
                     help="Project Restoration release (.zip/.7z) or folder; needs --update v1.1")
+    ap.add_argument("--romfs", type=Path, action="append", default=[],
+                    help="RomFS mod (.zip/.7z or folder) added into romfs.bin; repeatable")
     args = ap.parse_args()
     try:
         with open(args.cia, "rb") as f:
@@ -390,6 +399,14 @@ def main():
             mod = unpack_mod(args.restoration, Path(tmp.name))
             if not any(mod.rglob("code.bps")):
                 raise ValueError(f"--restoration: no code.bps in {args.restoration}")
+        romfs_mods = []
+        for src in args.romfs:
+            tmp_r = tempfile.TemporaryDirectory(prefix="dot_romfs_")
+            d = unpack_mod(src, Path(tmp_r.name))
+            d = next((p for p in sorted(d.rglob("romfs")) if p.is_dir()), d)
+            if not any(p.is_file() for p in d.rglob("*")):
+                raise ValueError(f"--romfs: {src} has no files")
+            romfs_mods.append((tmp_r, d))
     except (ValueError, struct.error, subprocess.CalledProcessError, zipfile.BadZipFile) as e:
         sys.exit(f"error: {e}")
 
@@ -411,6 +428,8 @@ def main():
             cs, mod_code = apply_restoration(mod, args.out, cs)
         except (ValueError, BPSError) as e:
             sys.exit(f"error: {e}")
+    for _, d in romfs_mods:
+        apply_romfs_mod(d, args.out)
     code_sha = hashlib.sha256((args.out / "exefs" / "code.bin").read_bytes()).hexdigest()
     manifest = {
         "title_id": f"{base_tid:016X}",
@@ -418,6 +437,7 @@ def main():
         "title_version": version,
         "code_sha256": code_sha,
         "restoration_enabled": bool(args.restoration),
+        "romfs_mods": [p.name for p in args.romfs],
     }
     if mod_code:
         manifest["restoration_code"] = mod_code  # read by tools/recomp (extra code range)

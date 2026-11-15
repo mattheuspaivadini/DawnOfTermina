@@ -44,6 +44,9 @@ inline std::atomic<bool> g_bottom_modal{false}, g_force_modal{false};
 inline std::atomic<bool> g_minimap{true};  // Tab in the N64 layout
 inline std::atomic<bool> g_hud_visible{true};  // the bottom screen shows the gameplay HUD (game memory)
 inline std::atomic<float> g_hud_scale{0.6f}, g_hud_opacity{0.9f};
+// Project Restoration's HD HUD (big screen layout, extract_cia.py --romfs) draws hearts, rupees and
+// item buttons on the top screen itself: only the minimap piece is still taken from the bottom.
+inline std::atomic<bool> g_hd_hud{false};
 inline bool bottom_modal() { return g_n64 && (g_bottom_modal || g_force_modal); }
 
 // A rectangle of the bottom screen (320x240 units) placed in a corner of the top screen.
@@ -71,7 +74,7 @@ inline constexpr HudPiece HUD_PIECES[] = {
 
 // Where a HUD piece goes on the top screen rect; empty when hidden.
 inline Rect hud_rect(const Rect& top, const HudPiece& p) {
-    if (!g_hud_visible || (p.minimap && !g_minimap)) return {0, 0, 0, 0};
+    if (!g_hud_visible || (p.minimap && !g_minimap) || (g_hd_hud && !p.minimap)) return {0, 0, 0, 0};
     const float u = top.h / 240, s = u * g_hud_scale * p.scale, margin = 6 * u;
     const float w = p.src.w * s, h = p.src.h * s, ox = p.x * s + margin, oy = p.y * s + margin;
     return {p.right ? top.x + top.w - ox - w : top.x + ox, p.bottom ? top.y + top.h - oy - h : top.y + oy, w, h};

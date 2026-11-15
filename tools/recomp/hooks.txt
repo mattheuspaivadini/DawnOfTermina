@@ -60,3 +60,21 @@
 0x001e4f78 atan2f            # atan2f(y = s0, x = s1) -> s0
 0x0018d570 fov_projection insn  # vldr s0, [r4, #0x18]: camera FOV when building the projection (DekUI)
 0x0018d584 fov_projection insn  # same, second branch of the function
+
+# Project Restoration 1.5.9 + HD HUD (mm3d_project_restoration_plus_hd_hud_v1.5.9-5-g8bb2a7b, the
+# build DekUI uses; every v100/v101/v110 variant yields this code.bin): same addresses.
+[1.0+restoration-1.5.9-hd-hud dbb46a8b175b1e4df7e103cbaf188995567049c6bea8fce668b2e330eb872ef9]
+0x00300154 aeabi_memcpy      # RVCT __aeabi_memcpy(dst, src, n)
+0x00300144 memcpy_src_dst    # swaps r0/r1, then __aeabi_memcpy
+0x001f28e8 aeabi_memcpy4     # word-aligned variant
+0x0014c364 aeabi_memmove4    # word-aligned memmove (backward copy when overlapping)
+0x00137ed4 aeabi_memset      # __aeabi_memset(dst, n, c)
+0x0016e63c aeabi_memclr      # __aeabi_memclr(dst, n)
+0x00300338 aeabi_memclr4     # word-aligned variant
+0x003028e0 strlen
+0x00302e3c strcmp
+0x0022a3ac sinf              # hard-float: s0 -> s0
+0x0022a234 cosf
+0x001e4f78 atan2f            # atan2f(y = s0, x = s1) -> s0
+0x0018d570 fov_projection insn  # vldr s0, [r4, #0x18]: camera FOV when building the projection (DekUI)
+0x0018d584 fov_projection insn  # same, second branch of the function

@@ -95,6 +95,13 @@ class Recompiler:
             return False
         return self.decode(addr, t).kind != "trap"
 
+    def after_noreturn_bl(self, a, t):
+        """In a mod's code range, a pointer from data to the instruction after an unconditional
+        ARM `bl` is a function start: the walk assumed the call returns, but the HD HUD build's
+        constructor table points at 0x7D0BDC, right after `bl` to an abort() stub."""
+        return not t and self.image.region(a) not in (0, None) and (a - 4, False) in self.seen and \
+            self.image.read32(a - 4) >> 24 == 0xEB
+
     def walk_ok(self, key):
         """plausible_walk, stricter in a mod's code range (not .text), which also holds the mod's
         data: zero words (padding, tables) decode as valid instructions there, and constants
@@ -236,7 +243,7 @@ class Recompiler:
             return False
         if (a, not t) in self.seen:
             return False  # decoded in the other mode: not a function start
-        if (a, t) in self.seen and v not in self.branch_targets:
+        if (a, t) in self.seen and v not in self.branch_targets and not self.after_noreturn_bl(a, t):
             return False  # inside code already decoded (tail-call targets excepted)
         if (a - 2, True) in self.seen and self.decode(a - 2, True).size == 4:
             return False  # second half of a Thumb BL/BLX pair

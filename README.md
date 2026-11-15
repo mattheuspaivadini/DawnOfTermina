@@ -89,7 +89,7 @@ Na primeira execução é criado um `config.toml` ao lado de `game_data/` (ignor
 
 **FOV da câmera** (aba *Video* e `[camera]` do `config.toml`): 45° é o original; até 70° alarga a visão do jogo e, separadamente, das cutscenes. Disponível no jogo v1.0 e no build com Project Restoration (na v1.1 sem o mod os endereços ainda não foram mapeados).
 
-Teclas remapeáveis no menu (aba *Controls*). Controle: layout posicional da Nintendo (leste = A), analógico direito = câmera (C-stick), L3/R3 = itens I/II. Mouse: clique na tela de baixo = toque; no modo N64, clicar num ícone do canto toca o botão correspondente. Escala/opacidade do HUD e o minimapa ficam no F1 (aba *Video*) e em `[hud]` do `config.toml`; o modo pode ser `n64`, `single` ou `dual`.
+Teclas remapeáveis no menu (aba *Controls*). Controle: layout posicional da Nintendo (leste = A), analógico direito = câmera (C-stick), L3/R3 = itens I/II. Mouse: clique na tela de baixo = toque; no modo N64, clicar num ícone do canto toca o botão correspondente. O overlay de desempenho (off / só FPS / completo com 1% low, CPU, GPU e RAM) e sua opacidade ficam no F1 (aba *Video*) e em `[performance]`. Escala/opacidade do HUD e o minimapa ficam no F1 (aba *Video*) e em `[hud]` do `config.toml`; o modo pode ser `n64`, `single` ou `dual`.
 
 **C-stick:** o jogo conversa com um *Circle Pad Pro* emulado. Na tela "This game supports the Circle Pad Pro" aperte **ZR** (tecla 3 ou gatilho direito) para ativá-lo; *Don't Use* deixa a câmera só no botão L.
 
@@ -125,7 +125,7 @@ Cada função transcrita mantém o endereço virtual original em comentário (`/
 | 8 | Áudio: HLE do DSP (24 vozes, PCM8/PCM16/ADPCM) com saída via SDL3 | ✅ música e efeitos; sem reverb/filtros |
 | 9 | Renderização em alta resolução (`DOT_RES_SCALE`) com framebuffers residentes na GPU | ✅ |
 | 10 | Widescreen real (`DOT_WIDESCREEN=16:9`, `21:9`, `window`…) | ✅ |
-| 11 | 60 FPS por interpolação de quadros (`DOT_FPS=60`), sem acelerar a lógica; câmera interpolada como movimento rígido (DekUI) | ✅ |
+| 11 | 60/90/120 FPS por interpolação de quadros (`DOT_FPS`), sem acelerar a lógica; câmera interpolada como movimento rígido (DekUI); ritmo de apresentação por linha do tempo | ✅ |
 | 12 | Hooks nativos para rotinas da libc (memcpy/memset/strlen/strcmp/sinf/cosf/atan2f) | ✅ infraestrutura; ganho medido dentro do ruído |
 | 5E | Experiência de PC: `config.toml`, menu ImGui (F1), tela única N64/tela única/dupla, câmera no mouse (C-stick), atalhos de toque | ✅ |
 | 13 | Savestates: F5 salva, F9 carrega (`states/slot1.state`), `DOT_LOAD_STATE=<arquivo>` no boot | ✅ |

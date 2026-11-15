@@ -1070,11 +1070,13 @@ struct Renderer::Impl {
         if (!d.image.img) {
             d.width = screen_w, d.height = out_w * scale;
             d.image = make_general(d.width, d.height, VK_FORMAT_R8G8B8A8_UNORM,
-                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                   VK_IMAGE_ASPECT_COLOR_BIT);
         }
         if (replaying && !d.interp.img)
             d.interp = make_general(d.width, d.height, VK_FORMAT_R8G8B8A8_UNORM,
-                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                   VK_IMAGE_ASPECT_COLOR_BIT);
         const Image& dst_img = replaying ? d.interp : d.image;
         begin();
         VkDescriptorSet set;
@@ -1775,12 +1777,12 @@ bool Renderer::display(core::Memory& mem, u32 va, GpuScreen& out, bool consume) 
     // even pacing at any monitor refresh, also when the game drops to 20 or 15 frames/s.
     if (consume && d.interp_fresh) {
         if (std::chrono::steady_clock::now() - d.ready < d.period / 2) {
-            out = {d.interp.img, d.width, d.height};
+            out = {d.interp.img, d.width, d.height, d.interp.view};
             return true;
         }
         d.interp_fresh = false;
     }
-    out = {d.image.img, d.width, d.height};
+    out = {d.image.img, d.width, d.height, d.image.view};
     return true;
 }
 

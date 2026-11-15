@@ -106,14 +106,32 @@ static void test_hid() {
     assert(!window_to_touch(1700, 900, 1920, 1080, tx, ty));
     gfx::g_show_bottom = true, gfx::g_top_width = 400.0f;
     assert(window_to_touch(1488, 756, 1920, 1080, tx, ty) && tx == 0);  // 5:3 top pillarboxed, same overlay
+    // N64 layout, 16:9 top filling 1920x1080 (4.5 px per top row, HUD scale 0.6 -> 2.7 px per
+    // bottom pixel, margin 27): item II (53x53 from (265,185)) at (1749.9, 97.2), 143.1 wide.
+    gfx::g_n64 = true, gfx::g_top_width = 240.0f * 16 / 9;
+    assert(window_to_touch(1749.9f + 71.5f, 97.2f + 71.5f, 1920, 1080, tx, ty) && tx == 291 && ty == 211);
+    assert(!window_to_touch(960, 540, 1920, 1080, tx, ty));  // game view: no touch
+    gfx::g_hud_visible = false;  // cutscene: no HUD pieces
+    assert(!window_to_touch(1749.9f + 71.5f, 97.2f + 71.5f, 1920, 1080, tx, ty));
+    gfx::g_hud_visible = true;
+    gfx::g_minimap = false;  // minimap (192x204 at 0.75 scale) right-bottom, hidden by Tab
+    assert(!window_to_touch(1920 - 30, 1080 - 27 - 110 * 2.025f - 30, 1920, 1080, tx, ty));
+    gfx::g_minimap = true;
+    assert(window_to_touch(1920 - 30, 1080 - 27 - 110 * 2.025f - 30, 1920, 1080, tx, ty) && tx > 240 && ty > 220);
+    gfx::g_bottom_modal = true;  // menu pop-up: 1152x864 centred at (384, 108)
+    assert(window_to_touch(384, 108, 1920, 1080, tx, ty) && tx == 0 && ty == 0);
+    assert(window_to_touch(1535.9f, 971.9f, 1920, 1080, tx, ty) && tx == 319 && ty == 239);
+    assert(!window_to_touch(1821, 168, 1920, 1080, tx, ty));  // HUD pieces are gone
+    gfx::g_bottom_modal = false, gfx::g_n64 = false, gfx::g_top_width = 400.0f;
 
     // config.toml round trip
     core::Config c = core::parse_config("[display]\nresolution = \"720p\" # x\nvsync = false\nfps = 30\n"
                                         "[audio]\nvolume = 150\n[keys]\nA = \"K\"\n");
     assert(c.resolution == "720p" && !c.vsync && c.fps == 30 && c.volume == 100 && c.keys["A"] == "K");
-    assert(c.layout == "single" && c.widescreen == "16:9");  // defaults kept
+    assert(c.layout == "n64" && c.widescreen == "16:9" && c.minimap && c.hud_scale == 0.6f);  // defaults kept
     const core::Config d = core::parse_config(core::format_config(c));
-    assert(d.resolution == c.resolution && d.vsync == c.vsync && d.fps == c.fps && d.keys == c.keys);
+    assert(d.resolution == c.resolution && d.vsync == c.vsync && d.fps == c.fps && d.keys == c.keys &&
+           d.layout == c.layout && d.hud_scale == c.hud_scale && d.hud_opacity == c.hud_opacity && d.minimap == c.minimap);
 
     std::vector<ScriptEvent> ev;
     assert(parse_input_script("20:START,21.5:A,30:T160x120", ev) && ev.size() == 3);

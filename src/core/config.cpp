@@ -69,6 +69,9 @@ Config parse_config(const std::string& text) {
         else if (k == "display.fullscreen") c.fullscreen = v == "true";
         else if (k == "display.vsync") c.vsync = v == "true";
         else if (k == "display.fps") c.fps = std::atoi(v.c_str()) >= 60 ? 60 : 30;
+        else if (k == "hud.scale") c.hud_scale = std::clamp(std::strtof(v.c_str(), nullptr), 0.3f, 1.5f);
+        else if (k == "hud.opacity") c.hud_opacity = std::clamp(std::strtof(v.c_str(), nullptr), 0.1f, 1.0f);
+        else if (k == "hud.minimap") c.minimap = v == "true";
         else if (k == "audio.volume") c.volume = std::clamp(std::atoi(v.c_str()), 0, 100);
         else if (k == "input.mouse_sensitivity") c.mouse_sensitivity = std::strtof(v.c_str(), nullptr);
         else if (section == "keys") c.keys[key] = v;
@@ -83,10 +86,12 @@ std::string format_config(const Config& c) {
       << "[display]\n"
       << "resolution = \"" << c.resolution << "\"  # 1080p | 720p | native\n"
       << "widescreen = \"" << c.widescreen << "\"  # off | 16:9 | 16:10 | 21:9 | window\n"
-      << "layout = \"" << c.layout << "\"  # single | dual\n"
+      << "layout = \"" << c.layout << "\"  # n64 | single | dual\n"
       << "fullscreen = " << b(c.fullscreen) << "\n"
       << "vsync = " << b(c.vsync) << "\n"
       << "fps = " << c.fps << "  # 30 | 60 (interpolated)\n\n"
+      << "[hud]  # n64 layout\nscale = " << c.hud_scale << "\nopacity = " << c.hud_opacity
+      << "\nminimap = " << b(c.minimap) << "\n\n"
       << "[audio]\nvolume = " << c.volume << "\n\n"
       << "[input]\nmouse_sensitivity = " << c.mouse_sensitivity << "\n\n[keys]\n";
     for (const auto& [k, v] : c.keys) o << k << " = \"" << v << "\"\n";

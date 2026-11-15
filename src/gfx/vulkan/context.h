@@ -4,6 +4,7 @@
 
 #include <functional>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "core/types.h"
@@ -22,6 +23,7 @@ struct ScreenImage {
 struct GpuScreen {
     VkImage image;
     u32 width, height;
+    VkImageView view = VK_NULL_HANDLE;  // sampled by the N64 HUD
 };
 
 constexpr u32 TOP_W = 400, BOTTOM_W = 320, SCREEN_H = 240;
@@ -46,6 +48,15 @@ public:
     void set_vsync(bool on) { recreate_ |= vsync_ != on, vsync_ = on; }
     // Drawn over the composed screens inside a render pass on the swapchain image (menu).
     void set_overlay(std::function<void(VkCommandBuffer)> fn) { overlay_ = std::move(fn); }
+    // N64 layout: the overlay draws the bottom screen through this descriptor set (combined
+    // image sampler, binding 0), which present() points at the bottom screen image of the
+    // frame; the bottom screen is then not blitted.
+    void set_bottom_texture(VkDescriptorSet set) { bottom_set_ = set; }
+    VkSampler sampler() const { return sampler_; }
+    // Writes the next presented window image (screens + overlay) to a PPM file (validation:
+    // DOT_DUMP_WINDOW). Ignored if the swapchain cannot be a transfer source.
+    void dump_next_frame(std::string path) { dump_path_ = std::move(path); }
+    VkImageView bottom_view() const { return screen_views_[1]; }
     VkInstance instance() const { return instance_; }
     VkRenderPass render_pass() const { return render_pass_; }
     u32 image_count() const { return u32(swapchain_images_.size()); }
@@ -91,6 +102,11 @@ private:
 
     // [0] = top, [1] = bottom; both fed from one persistently mapped staging buffer.
     VkImage screens_[2]{};
+    VkImageView screen_views_[2]{};
+    VkSampler sampler_ = VK_NULL_HANDLE;
+    VkDescriptorSet bottom_set_ = VK_NULL_HANDLE;
+    std::string dump_path_;
+    bool can_dump_ = false;
     VkDeviceMemory screen_mem_[2]{};
     VkBuffer staging_ = VK_NULL_HANDLE;
     VkDeviceMemory staging_mem_ = VK_NULL_HANDLE;

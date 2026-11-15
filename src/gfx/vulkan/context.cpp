@@ -39,8 +39,10 @@ static void image_barrier(VkCommandBuffer cmd, VkImage img, VkImageLayout from, 
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = img;
     b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
-                         nullptr, 0, nullptr, 1, &b);
+    // Fragment stage too: the N64 HUD samples the bottom screen in the overlay pass.
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &b);
 }
 
 Context::~Context() {
@@ -48,7 +50,9 @@ Context::~Context() {
         vkDeviceWaitIdle(device_);
         destroy_swapchain();
         vkDestroyRenderPass(device_, render_pass_, nullptr);
+        vkDestroySampler(device_, sampler_, nullptr);
         for (int i = 0; i < 2; ++i) {
+            vkDestroyImageView(device_, screen_views_[i], nullptr);
             vkDestroyImage(device_, screens_[i], nullptr);
             vkFreeMemory(device_, screen_mem_[i], nullptr);
         }
@@ -176,7 +180,7 @@ bool Context::create_screen_images() {
         ii.mipLevels = ii.arrayLayers = 1;
         ii.samples = VK_SAMPLE_COUNT_1_BIT;
         ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         if (!check(vkCreateImage(device_, &ii, nullptr, &screens_[i]), "vkCreateImage")) return false;
         VkMemoryRequirements req;
         vkGetImageMemoryRequirements(device_, screens_[i], &req);
@@ -186,7 +190,17 @@ bool Context::create_screen_images() {
         if (!check(vkAllocateMemory(device_, &mai, nullptr, &screen_mem_[i]), "vkAllocateMemory") ||
             !check(vkBindImageMemory(device_, screens_[i], screen_mem_[i], 0), "vkBindImageMemory"))
             return false;
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = screens_[i];
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = ii.format;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (!check(vkCreateImageView(device_, &vi, nullptr, &screen_views_[i]), "vkCreateImageView")) return false;
     }
+    VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (!check(vkCreateSampler(device_, &si, nullptr, &sampler_), "vkCreateSampler")) return false;
 
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = TOP_BYTES + BOTTOM_BYTES;
@@ -295,6 +309,8 @@ bool Context::create_swapchain() {
     ci.imageExtent = extent;
     ci.imageArrayLayers = 1;
     ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    can_dump_ = caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if (can_dump_) ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -375,6 +391,19 @@ bool Context::present(const ScreenImage& top, const ScreenImage& bottom, const G
     }
     if (r != VK_SUBOPTIMAL_KHR && !check(r, "vkAcquireNextImageKHR")) return false;
     vkResetFences(device_, 1, &frame_fence_);
+    // N64 HUD: the overlay samples this frame's bottom screen (the fence wait above means the
+    // previous frame no longer reads the descriptor).
+    const bool hud = g_n64 && bottom_set_ && overlay_;
+    if (hud) {
+        const VkDescriptorImageInfo info{sampler_, gpu_bottom && gpu_bottom->view ? gpu_bottom->view : screen_views_[1],
+                                         VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet = bottom_set_;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w.pImageInfo = &info;
+        vkUpdateDescriptorSets(device_, 1, &w, 0, nullptr);
+    }
 
     if (!gpu_top) std::memcpy(staging_ptr_, top.pixels, TOP_BYTES);
     if (!gpu_bottom) std::memcpy(staging_ptr_ + TOP_BYTES, bottom.pixels, BOTTOM_BYTES);
@@ -390,8 +419,10 @@ bool Context::present(const ScreenImage& top, const ScreenImage& bottom, const G
     for (int i = 0; i < 2; ++i) {
         if (gpu_screens[i]) {  // rendered by the PICA renderer, kept in GENERAL layout
             VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-            mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0,
+            mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &mb, 0,
                                  nullptr, 0, nullptr);
             continue;
         }
@@ -402,9 +433,8 @@ bool Context::present(const ScreenImage& top, const ScreenImage& bottom, const G
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         copy.imageExtent = {widths[i], SCREEN_H, 1};
         vkCmdCopyBufferToImage(cmd, staging_, screens_[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-        image_barrier(cmd, screens_[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
-                      VK_ACCESS_TRANSFER_READ_BIT);
+        image_barrier(cmd, screens_[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                      VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
     }
 
     VkImage target = swapchain_images_[idx];
@@ -426,13 +456,14 @@ bool Context::present(const ScreenImage& top, const ScreenImage& bottom, const G
         dst[i][3] = s32(rects[i].y + rects[i].h);
     for (int i = 0; i < 2; ++i) {
         if (dst[i][2] <= dst[i][0] || dst[i][3] <= dst[i][1]) continue;  // hidden overlay
+        if (i == 1 && hud) continue;  // drawn by the overlay
         const GpuScreen* g = gpu_screens[i];
         VkImageBlit blit{};
         blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         blit.srcOffsets[1] = g ? VkOffset3D{s32(g->width), s32(g->height), 1} : VkOffset3D{s32(widths[i]), s32(SCREEN_H), 1};
         blit.dstOffsets[0] = {dst[i][0], dst[i][1], 0};
         blit.dstOffsets[1] = {dst[i][2], dst[i][3], 1};
-        vkCmdBlitImage(cmd, g ? g->image : screens_[i], g ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        vkCmdBlitImage(cmd, g ? g->image : screens_[i], VK_IMAGE_LAYOUT_GENERAL,
                        target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, g ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
     if (overlay_) {  // the render pass also moves the image to PRESENT_SRC
@@ -454,6 +485,36 @@ bool Context::present(const ScreenImage& top, const ScreenImage& bottom, const G
     if (!overlay_)
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
                              nullptr, 0, nullptr, 1, &to_present);
+    // DOT_DUMP_WINDOW: copy the finished image (PRESENT_SRC) to a host buffer.
+    VkBuffer dump_buf = VK_NULL_HANDLE;
+    VkDeviceMemory dump_mem = VK_NULL_HANDLE;
+    if (!dump_path_.empty() && can_dump_) {
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.size = VkDeviceSize(extent_.width) * extent_.height * 4;
+        bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        vkCreateBuffer(device_, &bi, nullptr, &dump_buf);
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(device_, dump_buf, &req);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = find_memory(gpu_, req.memoryTypeBits,
+                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        vkAllocateMemory(device_, &mai, nullptr, &dump_mem);
+        vkBindBufferMemory(device_, dump_buf, dump_mem, 0);
+        VkImageMemoryBarrier b = to_present;
+        b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                             nullptr, 1, &b);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {extent_.width, extent_.height, 1};
+        vkCmdCopyImageToBuffer(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dump_buf, 1, &copy);
+        b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT, b.dstAccessMask = 0;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr,
+                             0, nullptr, 1, &b);
+    }
     vkEndCommandBuffer(cmd);
 
     const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -467,6 +528,24 @@ bool Context::present(const ScreenImage& top, const ScreenImage& bottom, const G
     si.pSignalSemaphores = &render_done_[idx];
     std::lock_guard qlk(queue_lock_);
     if (!check(vkQueueSubmit(queue_, 1, &si, frame_fence_), "vkQueueSubmit")) return false;
+    if (dump_buf) {
+        vkWaitForFences(device_, 1, &frame_fence_, VK_TRUE, UINT64_MAX);
+        void* p = nullptr;
+        vkMapMemory(device_, dump_mem, 0, VK_WHOLE_SIZE, 0, &p);
+        const bool bgr = swapchain_format_ == VK_FORMAT_B8G8R8A8_UNORM;
+        if (std::FILE* f = std::fopen(dump_path_.c_str(), "wb")) {
+            std::fprintf(f, "P6\n%u %u\n255\n", extent_.width, extent_.height);
+            const u8* px = static_cast<const u8*>(p);
+            for (size_t i = 0; i < size_t(extent_.width) * extent_.height; ++i, px += 4) {
+                const u8 rgb[3] = {px[bgr ? 2 : 0], px[1], px[bgr ? 0 : 2]};
+                std::fwrite(rgb, 1, 3, f);
+            }
+            std::fclose(f);
+        }
+        vkDestroyBuffer(device_, dump_buf, nullptr);
+        vkFreeMemory(device_, dump_mem, nullptr);
+        dump_path_.clear();
+    }
 
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;

@@ -61,7 +61,7 @@ Gera `dist/dawnoftermina` com `dist/tools/extract_cia.py` ao lado. Aberto sem `g
 
 ### Configuração e controles
 
-Na primeira execução é criado um `config.toml` ao lado de `game_data/` (ignorado pelo Git) com: **1080p**, widescreen **16:9**, **tela única** (a tela de baixo vira uma sobreposição), VSync e **30 FPS**. O modo **60 FPS** (quadros intermediários interpolados; a lógica do jogo continua a 30 Hz) renderiza o dobro na GPU: ative no menu se ela tiver folga na resolução escolhida (uma Intel Iris Xe mantém 720p a 60 FPS). Tudo pode ser mudado em jogo no menu (**F1** ou **Esc**) e é salvo na hora, inclusive a resolução interna: 1080p = 4×, 720p = 3×, 240p = 1× (a escala é inteira).
+Na primeira execução é criado um `config.toml` ao lado de `game_data/` (ignorado pelo Git) com: **1080p**, widescreen **16:9**, **tela única estilo N64** (corações, itens I/X/Y/II, Ocarina e minimapa recortados da tela de baixo para os cantos; ao abrir um menu da tela de toque — Items, Masks — a tela de baixo aparece ampliada no centro, sobre o jogo escurecido, e some ao fechar), VSync e **30 FPS**. O modo **60 FPS** (quadros intermediários interpolados; a lógica do jogo continua a 30 Hz) renderiza o dobro na GPU: ative no menu se ela tiver folga na resolução escolhida (uma Intel Iris Xe mantém 720p a 60 FPS). Tudo pode ser mudado em jogo no menu (**F1** ou **Esc**) e é salvo na hora, inclusive a resolução interna: 1080p = 4×, 720p = 3×, 240p = 1× (a escala é inteira).
 
 | Tecla | Ação |
 |---|---|
@@ -71,12 +71,14 @@ Na primeira execução é criado um `config.toml` ao lado de `game_data/` (ignor
 | Enter / Backspace | Start / Select |
 | F / G / O / M | botões de toque: item I / item II / Ocarina / mapa |
 | F2 | câmera no mouse (captura o cursor; Esc solta) |
-| Tab | mostra/esconde a tela de baixo |
+| C / V / Z | menus Items / Masks / Gear (toque) |
+| Tab | minimapa (N64) ou tela de baixo (tela única) |
+| F3 | tela de baixo inteira no centro (N64: Ocarina, banco, códigos) |
 | F11 | tela cheia |
 | F5 / F9 | salvar / carregar savestate |
 | F1 / Esc | menu de configurações |
 
-Teclas remapeáveis no menu (aba *Controls*). Controle: layout posicional da Nintendo (leste = A), analógico direito = câmera (C-stick), L3/R3 = itens I/II. Mouse: clique na tela de baixo = toque.
+Teclas remapeáveis no menu (aba *Controls*). Controle: layout posicional da Nintendo (leste = A), analógico direito = câmera (C-stick), L3/R3 = itens I/II. Mouse: clique na tela de baixo = toque; no modo N64, clicar num ícone do canto toca o botão correspondente. Escala/opacidade do HUD e o minimapa ficam no F1 (aba *Video*) e em `[hud]` do `config.toml`; o modo pode ser `n64`, `single` ou `dual`.
 
 **C-stick:** o jogo conversa com um *Circle Pad Pro* emulado. Na tela "This game supports the Circle Pad Pro" aperte **ZR** (tecla 3 ou gatilho direito) para ativá-lo; *Don't Use* deixa a câmera só no botão L.
 
@@ -114,7 +116,7 @@ Cada função transcrita mantém o endereço virtual original em comentário (`/
 | 10 | Widescreen real (`DOT_WIDESCREEN=16:9`, `21:9`, `window`…) | ✅ |
 | 11 | 60 FPS por interpolação de quadros (`DOT_FPS=60`), sem acelerar a lógica | ✅ |
 | 12 | Hooks nativos para rotinas da libc (memcpy/memset/strlen/strcmp/sinf/cosf/atan2f) | ✅ infraestrutura; ganho medido dentro do ruído |
-| 5E | Experiência de PC: `config.toml`, menu ImGui (F1), tela única/dupla, câmera no mouse (C-stick), atalhos de toque | ✅ |
+| 5E | Experiência de PC: `config.toml`, menu ImGui (F1), tela única N64/tela única/dupla, câmera no mouse (C-stick), atalhos de toque | ✅ |
 | 13 | Savestates: F5 salva, F9 carrega (`states/slot1.state`), `DOT_LOAD_STATE=<arquivo>` no boot | ✅ |
 | 14+ | Subsistemas do jogo (cenas, loop, colisão, atores, HUD) | ⏳ |
 

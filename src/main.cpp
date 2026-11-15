@@ -238,6 +238,17 @@ int main(int argc, char** argv) {
             auto pad = hle::hid::ReadPad();
             if (pad.trigger || pad.release)
                 std::printf("pad hold=%08x stick=(%d,%d)\n", pad.hold, pad.stick_x, pad.stick_y);
+#ifdef DOT_HAVE_RECOMP
+            // N64 layout: bit 0 of 0x6A3A18 (v1.0) = the world is paused, written each frame by the
+            // play loop (0x15F644) from the touch-screen menu state; set with the Items/Masks menus,
+            // clear through boot, title and cutscenes (savestate diffs + trace). Same .data offset in
+            // v1.0, v1.1 and Project Restoration (2 code references each).
+            gfx::g_bottom_modal = mem.read<u32>(code->data.addr + 0x58A18) & 1;
+            // Halfword at 0x68D300 (v1.0, 31 code references; same offset in the other versions):
+            // 0 only while the bottom screen shows the gameplay HUD (1 through boot, title, opening
+            // cutscenes and menus). The HUD pieces are hidden otherwise.
+            gfx::g_hud_visible = mem.read<u16>(code->data.addr + 0x42300) == 0;
+#endif
             ui::frame();  // before fetching the screens: a resolution change destroys their images
 #ifdef DOT_HAVE_RECOMP
             // DOT_SAVE_STATE_AT=<guest seconds> (DOT_INPUT's clock): one automatic save to states/slot1.state.
@@ -290,6 +301,9 @@ int main(int argc, char** argv) {
                         write_ppm(std::filesystem::path(dir) / ("interp_" + id + ".ppm"), px, w, h);
                     if (hle::service::gsp::screen_dump(1, px, w, h))
                         write_ppm(std::filesystem::path(dir) / ("bottom_" + id + ".ppm"), px, w, h);
+                    // DOT_DUMP_WINDOW: also the composed window (layout, HUD, menu), as presented.
+                    if (std::getenv("DOT_DUMP_WINDOW"))
+                        gpu.dump_next_frame((std::filesystem::path(dir) / ("window_" + id + ".ppm")).string());
                     // Guest time of each dump, in the units of DOT_INPUT, to line scripts up with frames.
                     if (std::FILE* f = std::fopen((std::filesystem::path(dir) / "frames.txt").c_str(), "a")) {
                         std::fprintf(f, "%s %.1f\n", id.c_str(), hle::service::gsp::stats().vblanks / 59.83);

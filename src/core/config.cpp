@@ -72,6 +72,8 @@ Config parse_config(const std::string& text) {
         else if (k == "hud.scale") c.hud_scale = std::clamp(std::strtof(v.c_str(), nullptr), 0.3f, 1.5f);
         else if (k == "hud.opacity") c.hud_opacity = std::clamp(std::strtof(v.c_str(), nullptr), 0.1f, 1.0f);
         else if (k == "hud.minimap") c.minimap = v == "true";
+        else if (k == "camera.fov") c.fov = std::clamp(std::strtof(v.c_str(), nullptr), 45.0f, 70.0f);
+        else if (k == "camera.cutscene_fov") c.cutscene_fov = std::clamp(std::strtof(v.c_str(), nullptr), 45.0f, 70.0f);
         else if (k == "audio.volume") c.volume = std::clamp(std::atoi(v.c_str()), 0, 100);
         else if (k == "input.mouse_sensitivity") c.mouse_sensitivity = std::strtof(v.c_str(), nullptr);
         else if (section == "keys") c.keys[key] = v;
@@ -92,6 +94,8 @@ std::string format_config(const Config& c) {
       << "fps = " << c.fps << "  # 30 | 60 (interpolated)\n\n"
       << "[hud]  # n64 layout\nscale = " << c.hud_scale << "\nopacity = " << c.hud_opacity
       << "\nminimap = " << b(c.minimap) << "\n\n"
+      << "[camera]  # vertical FOV in degrees: 45 (original) to 70\nfov = " << c.fov
+      << "\ncutscene_fov = " << c.cutscene_fov << "\n\n"
       << "[audio]\nvolume = " << c.volume << "\n\n"
       << "[input]\nmouse_sensitivity = " << c.mouse_sensitivity << "\n\n[keys]\n";
     for (const auto& [k, v] : c.keys) o << k << " = \"" << v << "\"\n";

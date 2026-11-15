@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "recomp/runtime.h"
 
 // Native replacements for hot C library routines of the game (listed with their VAs in
@@ -35,5 +37,13 @@ u32 strcmp(Context* c);
 u32 sinf(Context* c);
 u32 cosf(Context* c);
 u32 atan2f(Context* c);
+
+// Instruction hooks (`insn` in hooks.txt): run in place of one instruction.
+// Camera FOV (port of DekUI's CameraLive): replaces `vldr s0, [r4, #0x18]` where the game builds a
+// camera projection from its vertical FOV. 45° is the original gameplay FOV; a larger setting
+// widens every camera by the same factor in projection space. Settings in degrees, 45..70
+// (45 = original); cutscene_fov applies while the live top-screen camera is scripted.
+extern std::atomic<float> fov, cutscene_fov;
+void fov_projection(Context* c);
 
 }  // namespace recomp::hooks

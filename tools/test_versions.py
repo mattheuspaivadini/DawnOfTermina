@@ -29,14 +29,16 @@ text = """# comment
 [1.1 bbbb]
 0x00300200 aeabi_memcpy
 0x00300300 strlen
+0x0018d570 fov_projection insn
 """
-assert select_hooks(text, "aaaa") == ("1.0", {0x300154: "aeabi_memcpy"})
-assert select_hooks(text, "BBBB") == ("1.1", {0x300200: "aeabi_memcpy", 0x300300: "strlen"})
-assert select_hooks(text, "cccc") == (None, {})
+assert select_hooks(text, "aaaa") == ("1.0", {0x300154: "aeabi_memcpy"}, {})
+assert select_hooks(text, "BBBB") == ("1.1", {0x300200: "aeabi_memcpy", 0x300300: "strlen"},
+                                      {0x18d570: "fov_projection"})
+assert select_hooks(text, "cccc") == (None, {}, {})
 real = (root / "recomp" / "hooks.txt").read_text()  # the shipped table parses, v1.0 is known
-version, hooks = select_hooks(real, "050a58834365187ca67211eef0a29816715e9ab9f7289e8372b06fb906620580")
-assert version == "1.0" and len(hooks) == 12, (version, len(hooks))
-version, hooks11 = select_hooks(real, "a1d1724df4857a68df200d2543ab6c96df172738fe511f58168b77c58fe36e05")
+version, hooks, insns = select_hooks(real, "050a58834365187ca67211eef0a29816715e9ab9f7289e8372b06fb906620580")
+assert version == "1.0" and len(hooks) == 12 and len(insns) == 2, (version, len(hooks), len(insns))
+version, hooks11, _ = select_hooks(real, "a1d1724df4857a68df200d2543ab6c96df172738fe511f58168b77c58fe36e05")
 assert version == "1.1" and sorted(hooks11.values()) == sorted(hooks.values()), version
 
 print("test_versions: OK")

@@ -19,6 +19,7 @@
 
 #undef NDEBUG
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -28,6 +29,7 @@
 #include "game/crt0.h"
 #include "game/guest.h"
 #include "hle/fs.h"
+#include "gfx/camera_midpoint.h"
 #include "gfx/layout.h"
 #include "hle/hid.h"
 #include "hle/svc.h"
@@ -183,6 +185,27 @@ static void test_boot(const stdfs::path& data) {
     std::printf("selftest: boot frontier 0x%08X, heap %u KiB\n", frontier, heap >> 10);
 }
 
+// Interpolated camera (gfx/camera_midpoint.h): the midpoint of two yaws is the half yaw, rigid,
+// translation averaged; cuts by distance and angle.
+static void test_camera() {
+    using namespace gfx::camera;
+    auto yaw = [](double deg, double x) {
+        const double r = deg * 3.14159265358979323846 / 180;
+        return Mat{{{std::cos(r), 0, std::sin(r), x}, {0, 1, 0, 5}, {-std::sin(r), 0, std::cos(r), 0}}};
+    };
+    const Mat a = yaw(0, 0), b = yaw(40, 100), m = midpoint(a, b), want = yaw(20, 50);
+    assert(rigid(a) && rigid(m));
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 4; ++j) assert(std::abs(m[i][j] - want[i][j]) < 1e-9);
+    const Mat id = mul(inverse_rigid(b), b);
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 4; ++j) assert(std::abs(id[i][j] - (i == j)) < 1e-9);
+    assert(!cut(a, b) && cut(a, yaw(50, 0)) && cut(a, yaw(0, 300)));
+    Mat scaled = a;
+    scaled[0][0] = 2;
+    assert(!rigid(scaled));
+}
+
 void test_pica();                     // tests/pica_test.cpp
 void test_shaders(const char* data);  // tests/shader_test.cpp
 void test_recomp_runtime();            // tests/recomp_test.cpp
@@ -193,6 +216,7 @@ int main(int argc, char** argv) {
     test_memory_and_svc(mem);
     test_fs();
     test_hid();
+    test_camera();
     test_pica();
     test_recomp_runtime();
     test_audio();

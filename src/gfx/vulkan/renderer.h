@@ -81,6 +81,7 @@ public:
     struct Stats {
         u64 draws, skipped, pipelines, readbacks, shaders;  // shaders = GLSL compiled (not from the disk cache)
         u64 interpolated, not_interpolated;                 // DOT_FPS=60: in-between frames made / skipped (cuts)
+        u64 camera_draws;                                   // in-between draws moved along the rigid camera midpoint
     };
     Stats stats() const;
 

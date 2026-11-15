@@ -37,6 +37,9 @@ struct Config {
     float hud_scale = 0.6f;            // size of the bottom-screen pieces in the corners
     float hud_opacity = 0.9f;
     bool minimap = true;               // Tab
+    // [camera] vertical FOV in degrees, 45 (original) to 70; v1.0 and Restoration builds only
+    float fov = 45.0f;
+    float cutscene_fov = 45.0f;
     // [audio]
     int volume = 100;                  // percent
     // [input]

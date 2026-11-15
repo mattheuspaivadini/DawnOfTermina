@@ -271,14 +271,15 @@ int main(int argc, char** argv) {
                     last_vblanks = st.vblanks;
                     const auto rs = renderer.stats();
                     std::printf("gsp: vblanks %llu, frames %llu, command lists %llu, draws %llu, fills %llu, transfers %llu | "
-                                "rendered %llu, skipped %llu, pipelines %llu, shaders %llu, readbacks %llu, interpolated %llu/%llu\n",
+                                "rendered %llu, skipped %llu, pipelines %llu, shaders %llu, readbacks %llu, interpolated %llu/%llu (camera draws %llu)\n",
                                 (unsigned long long)st.vblanks, (unsigned long long)st.frames, (unsigned long long)st.command_lists,
                                 (unsigned long long)st.draws, (unsigned long long)st.memory_fills,
                                 (unsigned long long)st.display_transfers, (unsigned long long)rs.draws,
                                 (unsigned long long)rs.skipped, (unsigned long long)rs.pipelines,
                                 (unsigned long long)rs.shaders,
                                 (unsigned long long)rs.readbacks, (unsigned long long)rs.interpolated,
-                                (unsigned long long)(rs.interpolated + rs.not_interpolated));
+                                (unsigned long long)(rs.interpolated + rs.not_interpolated),
+                                (unsigned long long)rs.camera_draws);
                 }
             }
             // Screens the renderer produced on the GPU are presented from there; otherwise from memory.

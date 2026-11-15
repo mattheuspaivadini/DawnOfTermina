@@ -76,6 +76,7 @@ class Recompiler:
         self.seen = set()
         self.branch_targets = set()  # keys reached by direct B: possible tail-called functions
         self.adr_pointers = []  # ADR results, vetted after the walk like data candidates
+        self.insn_hooks = {}  # instruction VA -> recomp::hooks function run in its place
 
     def decode(self, addr, is_thumb):
         key = (addr, is_thumb)
@@ -324,6 +325,8 @@ class Recompiler:
             if insn.addr in labels:
                 out.append(f"L_{insn.addr:08X}:")
             stmt = self.emit_insn(insn, by_addr)
+            if insn.addr in self.insn_hooks and not insn.thumb:  # replaces the instruction (keeps its condition)
+                stmt = f"recomp::hooks::{self.insn_hooks[insn.addr]}(c);"
             if "recomp::svc(" in insn.code:  # savestates resume a thread parked in a syscall here
                 stmt = f"c->r[15] = {h(insn.addr | t)}; {stmt}"
             if insn.cond != AL and insn.kind != "branch" or (insn.kind == "branch" and insn.cond != AL):
@@ -414,7 +417,8 @@ def init_array_seeds(image):
 
 def select_hooks(text: str, code_sha256: str):
     """hooks.txt section whose `[<version> <sha256>]` header matches the code.bin hash ->
-    (version, {entry: hook}); (None, {}) when no section matches."""
+    (version, {entry: hook}, {instruction VA: hook}); (None, {}, {}) when no section matches.
+    A line ending in `insn` hooks one instruction instead of a whole function."""
     sections, cur = {}, None
     for line in text.splitlines():
         line = line.split("#")[0].split()
@@ -422,12 +426,12 @@ def select_hooks(text: str, code_sha256: str):
             continue
         if line[0].startswith("["):
             version, sha = " ".join(line).strip("[]").split()
-            cur = sections[sha.lower()] = (version, {})
+            cur = sections[sha.lower()] = (version, {}, {})
         elif cur is None:
             raise SystemExit("hooks.txt: hook outside a [<version> <sha256>] section")
         else:
-            cur[1][int(line[0], 16)] = line[1]
-    return sections.get(code_sha256.lower(), (None, {}))
+            cur[2 if line[2:] == ["insn"] else 1][int(line[0], 16)] = line[1]
+    return sections.get(code_sha256.lower(), (None, {}, {}))
 
 
 def main():
@@ -467,11 +471,13 @@ def main():
         rc.discover(extra)
 
     sha = hashlib.sha256(image.code).hexdigest()
-    version, hooks = select_hooks(args.hooks.read_text(), sha)  # entry -> src/recomp/hooks.cpp
-    print(f"code.bin {sha}: " + (f"v{version}, {len(hooks)} native hooks" if version else
-          "unknown version, building without native hooks"), file=sys.stderr)
+    version, hooks, rc.insn_hooks = select_hooks(args.hooks.read_text(), sha)  # -> src/recomp/hooks.cpp
+    print(f"code.bin {sha}: " + (f"v{version}, {len(hooks)} native hooks, {len(rc.insn_hooks)} instruction hooks"
+          if version else "unknown version, building without native hooks"), file=sys.stderr)
     if missing := [h(a) for a in hooks if a not in rc.entries]:
         raise SystemExit(f"hooks.txt [{version}]: not a function entry: {', '.join(missing)}")
+    if bad := [h(a) for a in rc.insn_hooks if (a, False) not in rc.seen or rc.decode(a, False).kind != "normal"]:
+        raise SystemExit(f"hooks.txt [{version}]: not a decoded ARM data instruction: {', '.join(bad)}")
 
     funcs = {}
     for key in sorted(rc.entries):
@@ -525,6 +531,7 @@ def main():
              f"instructions: {total}",
              f"trap instructions: {sum(traps.values())}",
              f"native hooks: {len(hooks)}",
+             f"instruction hooks: {len(rc.insn_hooks)}",
              f"resume points: {len(resume)}"]
     stats += [f"  {n:6d}  {what}" for what, n in traps.most_common(40)]
     (args.out_dir / "stats.txt").write_text("\n".join(stats) + "\n")

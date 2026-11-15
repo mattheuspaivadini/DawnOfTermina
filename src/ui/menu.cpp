@@ -39,6 +39,7 @@
 #include "hle/dsp.h"
 #include "hle/hid.h"
 #include "hle/kernel.h"
+#include "recomp/hooks.h"
 
 namespace ui {
 
@@ -70,6 +71,7 @@ void apply(const core::Config& c, const core::Config* prev) {
     gfx::g_n64 = c.layout == "n64";
     gfx::g_hud_scale = c.hud_scale, gfx::g_hud_opacity = c.hud_opacity, gfx::g_minimap = c.minimap;
     hle::dsp::SetVolume(float(c.volume) / 100.0f);
+    recomp::hooks::fov = c.fov, recomp::hooks::cutscene_fov = c.cutscene_fov;
     if (!prev) return;
     if (prev->resolution != c.resolution) {
         int w = 0, h = 0;
@@ -128,6 +130,9 @@ void draw_menu() {
             ImGui::Checkbox("VSync", &c.vsync);
             int fps = c.fps >= 60 ? 1 : 0;
             if (ImGui::Combo("Frame rate", &fps, "30 FPS (original)\0" "60 FPS (interpolated)\0")) c.fps = fps ? 60 : 30;
+            ImGui::SliderFloat("Camera FOV", &c.fov, 45.0f, 70.0f, "%.0f deg");
+            ImGui::SliderFloat("Cutscene FOV", &c.cutscene_fov, 45.0f, 70.0f, "%.0f deg");
+            ImGui::TextDisabled("45 = original. Game v1.0 / Project Restoration only.");
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Audio")) {
@@ -164,7 +169,8 @@ void draw_menu() {
     if (c.resolution != g_cfg->resolution || c.widescreen != g_cfg->widescreen || c.layout != g_cfg->layout ||
         c.fullscreen != g_cfg->fullscreen || c.vsync != g_cfg->vsync || c.fps != g_cfg->fps ||
         c.volume != g_cfg->volume || c.mouse_sensitivity != g_cfg->mouse_sensitivity || c.hud_scale != g_cfg->hud_scale ||
-        c.hud_opacity != g_cfg->hud_opacity || c.minimap != g_cfg->minimap) {
+        c.hud_opacity != g_cfg->hud_opacity || c.minimap != g_cfg->minimap || c.fov != g_cfg->fov ||
+        c.cutscene_fov != g_cfg->cutscene_fov) {
         apply(c, g_cfg);
         *g_cfg = c;
         save();

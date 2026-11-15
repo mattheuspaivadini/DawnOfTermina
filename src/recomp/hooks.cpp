@@ -16,8 +16,11 @@
 
 #include "recomp/hooks.h"
 
+#include <bit>
 #include <cmath>
 #include <cstring>
+
+#include "hle/svc.h"
 
 // Only what callers can observe under AAPCS is reproduced: the result register and the
 // memory written. Scratch registers (r1-r3, r12, flags) are left as they were.
@@ -54,5 +57,50 @@ u32 strcmp(Context* c) {
 u32 sinf(Context* c) { set_fs(c, 0, std::sin(fs(c, 0))); return c->r[14]; }
 u32 cosf(Context* c) { set_fs(c, 0, std::cos(fs(c, 0))); return c->r[14]; }
 u32 atan2f(Context* c) { set_fs(c, 0, std::atan2(fs(c, 0), fs(c, 1))); return c->r[14]; }
+
+// ---- camera FOV, ported from DekUI (src/mm3d/camera_live.h, GPL-2.0-or-later) ----------------
+// Addresses are the v1.0 layout (also Project Restoration's), where hooks.txt installs the hook.
+
+std::atomic<float> fov{45.f}, cutscene_fov{45.f};
+
+// Pointer chains below run during the title screen too: read only mapped memory.
+static bool readable(u32 va, u32 bytes) {
+    if (va < 0x100000 || va & 3 || va > 0x40000000 - bytes) return false;
+    const hle::svc::MemoryInfo m = hle::svc::QueryMemory(va);
+    return m.state != 0 && va + bytes <= u64(m.base) + m.size;
+}
+
+// Play's camera array: four 0x198-byte cameras at +0x408, active index at +0xA7A, Camera::setting
+// at +0x156; settings 9/10 (DEMO0/FREE0) are scripted cutscene cameras.
+static bool scripted_camera() {
+    if (!readable(0x72F5C0, 4)) return false;
+    const u32 context = r32(0x72F5C0);
+    if (!readable(context + 0x16C, 4)) return false;
+    const u32 game = r32(context + 0x16C);
+    if (!readable(game, 0xA7C) || (r32(game + 0x13C) >> 8 & 255) != 4) return false;
+    const u32 index = r32(game + 0xA78) >> 16;
+    if (index > 3) return false;
+    const u32 camera = game + 0x408 + index * 0x198;
+    const unsigned setting = r32(camera + 0x154) >> 16;
+    return r32(camera + 0xA0) == game && (setting == 9 || setting == 10);
+}
+
+void fov_projection(Context* c) {
+    const u32 projection = c->r[4];
+    u32 bits = r32(projection + 0x18);
+    float want = fov.load(std::memory_order_relaxed);
+    // Only the live top-screen projection (0x656B5C, a 400x240 viewport) can be a cutscene camera.
+    if (r32(0x656B5C) == projection && r32(projection + 4) == 0 && r32(projection + 8) == 400 &&
+        r32(projection + 12) == 0 && r32(projection + 16) == 240 && scripted_camera())
+        want = cutscene_fov.load(std::memory_order_relaxed);
+    const float native = std::bit_cast<float>(bits);
+    if (std::isfinite(native) && native > 0 && native < 170 && want > 45 && want <= 70) {
+        constexpr float half_rad = 3.14159265358979f / 360.f;
+        // 45° becomes the setting; other FOVs (animated cameras) widen by the same tangent ratio.
+        bits = std::bit_cast<u32>(std::atan(std::tan(native * half_rad) * std::tan(want * half_rad) /
+                                            std::tan(45.f * half_rad)) / half_rad);
+    }
+    c->s[0] = bits;
+}
 
 }  // namespace recomp::hooks

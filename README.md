@@ -28,7 +28,7 @@ O código ARM11 original (`code.bin` do ExeFS) é traduzido automaticamente para
    ```sh
    python3 tools/extract_cia.py "ISO/<seu jogo>.cia" game_data/ --update "ISO/<update v1.1>.cia"
    ```
-   `--update` é opcional, mas **recomendado**: aplica a atualização oficial v1.1 (correções da Nintendo; pré-requisito de mods como o *Project Restoration*) por cima do jogo base. O extrator confere que o `.cia` é mesmo a atualização deste jogo e desta região (Title ID `0004000E` + o mesmo ID do jogo) antes de escrever qualquer coisa. A versão e o SHA-256 do `code.bin` ficam em `game_data/manifest.json`.
+   `--update` é opcional, mas **recomendado**: aplica a atualização oficial v1.1 (correções da Nintendo; pré-requisito de mods como o *Project Restoration*) por cima do jogo base: novo `code.bin`, e o RomFS do update fica em `game_data/update_romfs.bin`, ao lado do RomFS do jogo base. O extrator confere que o `.cia` é mesmo a atualização deste jogo e desta região (Title ID `0004000E` + o mesmo ID do jogo) antes de escrever qualquer coisa. A versão e o SHA-256 do `code.bin` ficam em `game_data/manifest.json`.
 
 Alternativa: abra o jogo sem `game_data/`; uma tela pede o seu `.cia` (sugere um que esteja em `ISO/`) e faz a extração para `game_data/` ao lado do projeto. O executável procura `game_data/` no diretório atual e ao lado do binário (`build/../game_data`), então também abre por duplo clique.
 

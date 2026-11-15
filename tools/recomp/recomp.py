@@ -358,14 +358,29 @@ class Recompiler:
         raise ValueError(k)
 
 
+def init_array_bounds(image, loop=0x001009E0):
+    """[begin, end) of the CTR-SDK .init_array, decoded from the Thumb loop that walks it
+    (same address in v1.0 and v1.1; the table moves with .rodata):
+    push {r4-r6,lr}; ldr r4,[pc,#i]; add r4,pc; ldr r5,[pc,#j]; add r5,pc."""
+    ins = [image.read16(loop + 2 * k) for k in range(5)]
+    if ins[0] != 0xB570 or ins[1] >> 8 != 0x4C or ins[2] != 0x447C or ins[3] >> 8 != 0x4D or ins[4] != 0x447D:
+        raise SystemExit(f"init_array_bounds: unexpected code at {loop:#x} (unknown game version?)")
+
+    def pc_rel(ldr_at, add_at):  # literal at Align(pc, 4) + imm8*4, plus the add's pc
+        lit = ((ldr_at + 4) & ~3) + (image.read16(ldr_at) & 0xFF) * 4
+        return (image.read32(lit) + add_at + 4) & 0xFFFFFFFF
+
+    return pc_rel(loop + 2, loop + 4), pc_rel(loop + 6, loop + 8)
+
+
 def init_array_seeds(image):
-    """CTR-SDK .init_array: relative offsets between 0x0064A390 and 0x0064A5D0 are
-    located by the Thumb loop at 0x001009E0; any word in .rodata that, added to its own
-    address, lands on plausible code is also a candidate."""
+    """CTR-SDK .init_array: relative offsets (each added to its own address) between the
+    bounds the crt0 loop uses."""
+    begin, end = init_array_bounds(image)
     seeds = []
     for a, v in image.words(1):
         t = (a + v) & 0xFFFFFFFF
-        if 0x0064A390 <= a < 0x0064A5D0 and image.in_text(t & ~1):
+        if begin <= a < end and image.in_text(t & ~1):
             seeds.append(t)
     return seeds
 

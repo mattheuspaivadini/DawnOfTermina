@@ -9,7 +9,7 @@ Pure Python, no ctrtool/3dstool needed.
 usage: extract_cia.py <game.cia> [out_dir=game_data] [--update <update.cia>]
 
 --update applies the official update (title 0004000E..., v1.1 recommended) on top of the base:
-exheader.bin and code.bin are replaced, its RomFS files overwrite the base ones. The resulting
+exheader.bin and code.bin are replaced, its RomFS goes to update_romfs.bin (base romfs.bin kept). The resulting
 version and code.bin SHA-256 go to out_dir/manifest.json.
 """
 import argparse
@@ -209,9 +209,10 @@ def check_update(base_tid: int, update_tid: int):
                          f"(base is {base_tid:016X}, expected update {0x0004000E << 32 | base_tid & 0xFFFFFFFF:016X})")
 
 
-def extract(cia: Path, out: Path):
-    """Extract one decrypted CIA into out/. Run again with an update CIA on the same out/, it
-    overwrites exheader.bin, exefs/code.bin (+ code.elf) and the RomFS files it carries."""
+def extract(cia: Path, out: Path, romfs_image="romfs.bin"):
+    """Extract one decrypted CIA into out/. Run again with an update CIA on the same out/
+    (romfs_image="update_romfs.bin"): it overwrites exheader.bin and exefs/code.bin (+ code.elf)
+    and adds its RomFS files to romfs/."""
     with open(cia, "rb") as f:
         ncch, _, _, encrypted = cia_layout(f)
         f.seek(ncch)
@@ -251,21 +252,22 @@ def extract(cia: Path, out: Path):
 
         romfs_off = u32(h, 0x1B0) * MEDIA_UNIT
         if romfs_off:
-            # Files are written over the base ones (others stay); romfs.bin is replaced, as the
-            # system mounts an update's RomFS instead of the base one.
+            # An update's RomFS is a separate archive (SelfNCCH path 5; MM3D v1.1: only
+            # version.ctxb), not a replacement: its files go over romfs/ (for reference only),
+            # its image to update_romfs.bin, and romfs.bin stays the base game's.
             n = extract_romfs(f, ncch + romfs_off, out / "romfs")
             print(f"romfs/  {n} files")
             # Raw RomFS image (from the IVFC header): what fs:USER serves to the game's SDK.
             remaining = u32(h, 0x1B4) * MEDIA_UNIT
             f.seek(ncch + romfs_off)
-            with open(out / "romfs.bin", "wb") as o:
+            with open(out / romfs_image, "wb") as o:
                 while remaining:
                     chunk = f.read(min(remaining, 1 << 20))
                     if not chunk:
                         break
                     o.write(chunk)
                     remaining -= len(chunk)
-            print(f"romfs.bin  {(out / 'romfs.bin').stat().st_size:#x}")
+            print(f"{romfs_image}  {(out / romfs_image).stat().st_size:#x}")
     return cs
 
 
@@ -289,13 +291,14 @@ def main():
         sys.exit(f"error: {e}")
 
     args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "update_romfs.bin").unlink(missing_ok=True)  # from an earlier --update run
     base_sha = None
     cs = extract(args.cia, args.out)
     version = base_ver
     if args.update:
         base_sha = hashlib.sha256((args.out / "exefs" / "code.bin").read_bytes()).hexdigest()
         print(f"\napplying update {upd_tid:016X} v{version_name(upd_ver)}")
-        cs = extract(args.update, args.out)
+        cs = extract(args.update, args.out, "update_romfs.bin")
         version = upd_ver
     code_sha = hashlib.sha256((args.out / "exefs" / "code.bin").read_bytes()).hexdigest()
     manifest = {

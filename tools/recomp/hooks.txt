@@ -6,7 +6,8 @@
 # Addresses change between game versions, so hooks live in one section per code.bin:
 # [<version> <SHA-256 of game_data/exefs/code.bin>]. recomp.py hashes the extracted code.bin and
 # uses the matching section; an unknown code.bin builds without hooks (they are only a speed-up).
-# v1.1: no section yet (needs a decrypted v1.1 code.bin to locate the routines in Hopper).
+# v1.1 addresses: each v1.0 routine matched to a single place in the v1.1 code.bin by its
+# instructions (relative branch offsets ignored; their targets agree with the neighbours below).
 
 [1.0 050a58834365187ca67211eef0a29816715e9ab9f7289e8372b06fb906620580]
 0x00300154 aeabi_memcpy      # RVCT __aeabi_memcpy(dst, src, n)
@@ -21,3 +22,17 @@
 0x0022a3ac sinf              # hard-float: s0 -> s0
 0x0022a234 cosf
 0x001e4f78 atan2f            # atan2f(y = s0, x = s1) -> s0
+
+[1.1 a1d1724df4857a68df200d2543ab6c96df172738fe511f58168b77c58fe36e05]
+0x0030029c aeabi_memcpy
+0x0030028c memcpy_src_dst
+0x001f28d8 aeabi_memcpy4
+0x0014c340 aeabi_memmove4    # tail-calls aeabi_memcpy4
+0x00137fd4 aeabi_memset      # branches into aeabi_memclr
+0x0016e608 aeabi_memclr      # branches into aeabi_memclr4
+0x00300480 aeabi_memclr4
+0x00302a28 strlen
+0x00302f84 strcmp
+0x0022a39c sinf
+0x0022a224 cosf
+0x001e4f68 atan2f

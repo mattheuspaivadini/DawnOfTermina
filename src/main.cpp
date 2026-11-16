@@ -306,7 +306,11 @@ int main(int argc, char** argv) {
                 const double t = double(hle::service::gsp::stats().vblanks) / 59.83;
                 if (next <= last && t >= start + (next - first) * period) {
                     const u32 play = recomp::hooks::play();
-                    if (play) {
+                    // Entrance table (0x69FB44, v1.0 layout, 12 bytes per group, read by 0x18E6E8): a null
+                    // list is an unused group (0x0B-0x0D, 0x0F, 0x2E, 0x37) that faults the game on entry.
+                    if (mem.read<u32>(0x69FB44 + 12 * next + 4) == 0) {
+                        std::printf("tour: entrance group 0x%02X unused, skipped\n", next);
+                    } else if (play) {
                         const u16 entrance = u16(next << 9);
                         mem.write<u16>(play + 0xC52E, entrance);
                         mem.write<u8>(play + 0xC529, 0x14);

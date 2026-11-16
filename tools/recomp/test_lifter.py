@@ -86,4 +86,9 @@ tbl = FakeImage([0xE08FF10C, 0xE1A00000, 0xEA000004, 0xEA000004, 0xEAFFFFFF, 0xE
 targets = recomp.Recompiler(tbl).jump_table(arm.lift(tbl, 0x100000, 0xE08FF10C))
 assert targets == [0x100008, 0x10000C, 0x100010], [hex(t) for t in targets]
 
+# `ldrlo pc` table whose case 0 is the instruction right after it (vanilla 0x4FDACC): needs a label
+sw = FakeImage([0xE3500002, 0x379FF100, 0xE12FFF1E, 0x00100008, 0x00100014, 0xE12FFF1E])
+_, labels = recomp.Recompiler(sw).build(0x100000)
+assert {0x100008, 0x100014} <= labels, [hex(a) for a in labels]
+
 print("test_lifter: OK")

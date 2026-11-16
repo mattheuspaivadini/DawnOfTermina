@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -30,6 +31,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -312,12 +314,31 @@ struct Renderer::Impl {
         std::shared_ptr<const pica::ShaderState> vs;
         u32 a[6] = {};
         u64 key = 0;  // draws: what it draws (program, buffers, texture) (no ordinal: end_frame pairs instances)
+        // The replay reads no guest memory (it runs beside the guest, see `job`): the draw's
+        // fetched vertices and widescreen clip factor, a fill's colour (a[2], RGBA8).
+        std::vector<pica::VertexInput> verts;
+        float clip = 1.0f;
     };
     bool interpolate = false, replaying = false;
     u32 samples = 1;     // images per game frame: DOT_FPS / 30 (1 = off)
     u32 replay_k = 0;    // in-between frame being replayed (1..samples-1)
     std::vector<Op> frame_ops, prev_ops;
     std::shared_ptr<pica::ShaderState> last_vs;
+    // The replay of a finished frame runs on `worker` (under `lock`) while the guest goes on
+    // with its next frame: run on the guest thread it held the guest's baton for ~7 ms per
+    // frame in Clock Town, past the second VBlank, and the game fell to 20 frames/s (slow
+    // motion). Any later renderer call runs a replay that has not started yet itself
+    // (`acquire`), so the order of GPU work is unchanged.
+    bool job = false, quit = false;
+    Memory* job_mem = nullptr;  // only passed through: replayed operations do not read it
+    std::condition_variable job_cv;
+    std::thread worker;
+
+    std::unique_lock<std::mutex> acquire() {
+        std::unique_lock lk(lock);
+        if (job) replay_frame();
+        return lk;
+    }
     u64 interp_frames = 0, interp_skipped = 0, interp_camera_draws = 0;
 
     // Presentation timeline of the top screen (interpolation on). Every image, real or
@@ -614,6 +635,14 @@ struct Renderer::Impl {
         dev = ctx.device(), gpu = ctx.gpu();
         cache_dir = dir;
         load_caches();
+        worker = std::thread([this] {
+            std::unique_lock lk(lock);
+            for (;;) {
+                job_cv.wait(lk, [this] { return job || quit; });
+                if (quit) return;
+                replay_frame();
+            }
+        });
         VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         pci.queueFamilyIndex = ctx.queue_family();
@@ -972,8 +1001,8 @@ struct Renderer::Impl {
                                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                     VK_IMAGE_ASPECT_COLOR_BIT);
-            upload(mem, sf);
-        } else if (ram_hash(mem, sf) != sf.ram_hash) {
+            if (!replaying) upload(mem, sf);
+        } else if (!replaying && ram_hash(mem, sf) != sf.ram_hash) {
             upload(mem, sf);  // the CPU wrote it: guest memory is the newest copy
         }
         return sf;
@@ -1039,21 +1068,26 @@ struct Renderer::Impl {
         }
     }
 
-    void fill(Memory& mem, u32 start, u32 end) {
+    // Returns the clear colour (RGBA8); replays pass the real fill's as `rgba`.
+    u32 fill(Memory& mem, u32 start, u32 end, u32 rgba = 0) {
         for (auto& [key, d] : depths)
             if (key[0] == start) clear_depth(d.image, start);
         auto it = surfaces.find(start);
-        if (it == surfaces.end() || start + guest_bytes(it->second) > end) return;
+        if (it == surfaces.end() || start + guest_bytes(it->second) > end) return 0;
         Surface& sf = it->second;
-        const auto c = pica::pixel::decode(sf.format, mem.host(start));  // the guest memory was just filled
-        const VkClearColorValue v{{c.r / 255.0f, c.g / 255.0f, c.b / 255.0f, c.a / 255.0f}};
+        if (!replaying) {
+            const auto c = pica::pixel::decode(sf.format, mem.host(start));  // the guest memory was just filled
+            rgba = u32(c.r) | u32(c.g) << 8 | u32(c.b) << 16 | u32(c.a) << 24;
+        }
+        const VkClearColorValue v{{(rgba & 0xFF) / 255.0f, (rgba >> 8 & 0xFF) / 255.0f, (rgba >> 16 & 0xFF) / 255.0f,
+                                   (rgba >> 24) / 255.0f}};
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         begin();
         memory_barrier();
         vkCmdClearColorImage(cmd, sf.color.img, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
         memory_barrier();
-        sf.ram_hash = ram_hash(mem, sf);
-        sf.gpu_newer = false;
+        if (!replaying) sf.ram_hash = ram_hash(mem, sf), sf.gpu_newer = false;
+        return rgba;
     }
 
     bool display_transfer(Memory& mem, u32 in, u32 out, u32 in_dim, u32 out_dim, u32 flags) {
@@ -1074,7 +1108,7 @@ struct Renderer::Impl {
         }
         if (!src) return false;
         Surface& sf = *src;
-        if (ram_hash(mem, sf) != sf.ram_hash) upload(mem, sf);
+        if (!replaying && ram_hash(mem, sf) != sf.ram_hash) upload(mem, sf);
         const u32 hs = scaling ? 1 : 0, vs = scaling == 2 ? 1 : 0;
         const u32 out_w = (out_dim & 0xFFFF) >> hs, out_h = (out_dim >> 16) >> vs;
         if (!out_w || !out_h || (out_w << hs) > sf.width || row0 + (out_h << vs) > sf.height) return false;
@@ -1273,7 +1307,7 @@ struct Renderer::Impl {
                 if (sf.gpu_newer && va < t.va + t.size && t.va < va + guest_bytes(sf))
                     std::fprintf(stderr, "renderer: texture %ux%u fmt %u at %08X overlaps surface %ux%u fmt %u at %08X\n",
                                  t.w, t.h, u32(t.fmt), t.va, sf.width, sf.height, sf.format, va);
-        sync(mem, t.va, t.va + u32(t.size), false);
+        if (!replaying) sync(mem, t.va, t.va + u32(t.size), false);  // the real frame already did
         return nullptr;
     }
 
@@ -1289,6 +1323,7 @@ struct Renderer::Impl {
         if (!va || !w || !h || !size || w % 8 || h % 8) return dummy;
         const u64 key = fnv(&va, 4, fnv(&w, 4, fnv(&h, 4, u64(fmt))));
         Texture& t = textures[key];
+        if (replaying) return t.ready ? t : dummy;  // the real frame uploaded it a moment ago
         const u64 hash = hash_words(mem.host(va), size);
         if (t.ready && t.hash == hash) return t;
         const auto rgba = pica::decode_texture({mem.host(va), size}, w, h, fmt);
@@ -1429,11 +1464,12 @@ struct Renderer::Impl {
         return vertex_shaders[key] = glsl.empty() ? VK_NULL_HANDLE : module(glsl, ShaderStage::Vertex);
     }
 
-    void record_draw(const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs, bool indexed) {
+    void record_draw(const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs, bool indexed,
+                     std::vector<pica::VertexInput>&& verts, float clip) {
         if (!interpolate || replaying) return;
         if (!last_vs || std::memcmp(last_vs.get(), &vs, sizeof vs)) last_vs = std::make_shared<pica::ShaderState>(vs);
         Op op{Op::Draw};
-        op.indexed = indexed, op.regs = regs, op.vs = last_vs;
+        op.indexed = indexed, op.regs = regs, op.vs = last_vs, op.verts = std::move(verts), op.clip = clip;
         // What is drawn: program entry, attribute buffers, index buffer and count, texture 0.
         const u32 what[] = {regs[VS_ENTRY] & 0xFFFF, regs[0x200], regs[0x203], regs[0x227], regs[0x228], regs[0x085],
                             regs[COLOR_ADDR]};
@@ -1514,7 +1550,7 @@ struct Renderer::Impl {
     std::unordered_map<u64, s8> uv_proof;  // (draw key, component) -> texcoord semantic, or -1
     u64 uv_wrapped = 0, uv_stepped = 0;
 
-    std::vector<UvFix> uv_fixes(Memory& mem, const Op& prev, const Op& op) {
+    std::vector<UvFix> uv_fixes(const Op& prev, const Op& op) {
         std::vector<UvFix> fixes;
         const float* fa = &prev.vs->float_uniforms[0].x;
         const float* fb = &op.vs->float_uniforms[0].x;
@@ -1526,7 +1562,7 @@ struct Renderer::Impl {
         const auto& regs = op.regs;
         if (cand.empty() || (regs[TEX_CONFIG] >> 10 & 1)) return fixes;  // procedural textures read UVs too
         const u32 entry = regs[VS_ENTRY] & 0xFFFF;
-        std::vector<pica::VertexInput> verts;
+        const std::vector<pica::VertexInput>& verts = op.verts;
         std::unique_ptr<pica::ShaderState> s;
         pica::Vec4 base[2][16];
         for (u16 c : cand) {
@@ -1534,7 +1570,7 @@ struct Renderer::Impl {
             const auto [it, fresh] = uv_proof.try_emplace(op.key * 0x9E3779B97F4A7C15ull + c, s8(-1));
             if (fresh) {
                 if (!s) {
-                    if (!pica::load_vertices(mem, regs, *op.vs, op.indexed, verts) || verts.empty()) return fixes;
+                    if (verts.empty()) return fixes;
                     s = std::make_unique<pica::ShaderState>(*op.vs);
                     for (int v = 0; v < 2; ++v) pica::run_vertex_shader(*s, entry, verts[v * (verts.size() / 2)].v, base[v]);
                 }
@@ -1583,10 +1619,17 @@ struct Renderer::Impl {
         return fixes;
     }
 
-    // End of a top-screen frame (its transfer was just recorded and run): replay it at
-    // k/samples of the way from the previous frame to this one, k = 1..samples-1.
+    // End of a top-screen frame (its transfer was just recorded and run): its replay is due.
     void end_frame(Memory& mem) {
         if (!interpolate || replaying) return;
+        job = true, job_mem = &mem;
+        job_cv.notify_one();
+    }
+
+    // Lock held. Replays the recorded frame at k/samples of the way from the previous frame
+    // to it, k = 1..samples-1. Reads no guest memory: the guest runs meanwhile.
+    void replay_frame() {
+        job = false;
         // Previous draws of the same mesh/atlas (one key). Each draw takes the unused one with the
         // closest uniforms: pairing by order put a pane or NPC halfway to a sibling whenever one
         // instance appeared, hid or moved in the draw order (a "View" prompt and moved button
@@ -1644,7 +1687,7 @@ struct Renderer::Impl {
         cut |= camera_cuts * 2 > camera_draws;  // the world camera jumped (DekUI's test)
         if (draws && matched * 2 >= draws && !cut) {
             for (size_t n = 0; n < frame_ops.size(); ++n)
-                if (partner[n]) uv[n] = uv_fixes(mem, *partner[n], frame_ops[n]);
+                if (partner[n]) uv[n] = uv_fixes(*partner[n], frame_ops[n]);
             replaying = true;
             pica::ShaderState vs;
             for (replay_k = 1; replay_k < samples; ++replay_k) {
@@ -1668,14 +1711,14 @@ struct Renderer::Impl {
                             for (const UvFix& f : uv[n])
                                 (&vs.float_uniforms[0].x)[f.comp] = f.step ? (t < 0.5f ? f.a : f.a + f.d) : f.a + t * f.d;
                         }
-                        draw(mem, op.regs, vs, op.indexed);
+                        draw(*job_mem, op.regs, vs, op.verts, op.clip);
                         break;
                     }
                     case Op::Fill:
-                        if (op.gpu) fill(mem, op.a[0], op.a[1]);
+                        if (op.gpu) fill(*job_mem, op.a[0], op.a[1], op.a[2]);
                         break;
                     case Op::Transfer:
-                        if (op.gpu) display_transfer(mem, op.a[0], op.a[1], op.a[2], op.a[3], op.a[4]);
+                        if (op.gpu) display_transfer(*job_mem, op.a[0], op.a[1], op.a[2], op.a[3], op.a[4]);
                         break;
                     }
                 }
@@ -1753,15 +1796,17 @@ struct Renderer::Impl {
         return lo <= -0.98f && hi >= 0.98f ? 1.0f : squeeze;
     }
 
-    void draw(Memory& mem, const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs, bool indexed) {
+    // Returns the widescreen clip factor; `clip` < 0 computes it (replays pass the real draw's).
+    float draw(Memory& mem, const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs,
+               const std::vector<pica::VertexInput>& verts, float clip = -1.0f) {
         auto skip = [&](const char* why) {
             static std::map<std::string, bool> seen;
             if (!seen[why]) std::fprintf(stderr, "renderer: skipping draws: %s\n", why), seen[why] = true;
             ++stats.skipped;
+            return 1.0f;
         };
         if (!bind_target(mem, regs)) return skip("unsupported or missing colour buffer");
-        std::vector<pica::VertexInput> verts;
-        if (!pica::load_vertices(mem, regs, vs, indexed, verts) || verts.empty()) return skip("vertex fetch");
+        if (verts.empty()) return skip("vertex fetch");
         Surface* tex_surface[3] = {};
         for (u32 i = 0; i < 3; ++i)
             if (regs[TEX_CONFIG] >> i & 1) tex_surface[i] = resolve_texture(mem, regs, i);
@@ -1771,7 +1816,7 @@ struct Renderer::Impl {
                 if (regs[TEX_CONFIG] >> i & 1) {
                     char hexva[16];
                     std::snprintf(hexva, sizeof hexva, "%08X", tex_source(regs, i).va);
-                    if (std::strstr(list, hexva)) return;
+                    if (std::strstr(list, hexva)) return 1.0f;
                 }
         }
         if (static const bool trace_light = std::getenv("DOT_TRACE_LIGHT"); trace_light && (regs[0x08F] & 1) && !(regs[0x1C6] & 1)) {
@@ -1859,8 +1904,8 @@ struct Renderer::Impl {
             const s32 v[4] = {s32(iv & 0xFF), s32(iv >> 8 & 0xFF), s32(s8(iv >> 16)), 0};
             std::memcpy(u + 1536 + i * 16, v, 16);
         }
-        const float depth[4] = {f24_to_f32(regs[DEPTH_SCALE] & 0xFFFFFF), f24_to_f32(regs[DEPTH_OFFSET] & 0xFFFFFF),
-                                widescreen_clip(regs, vs, verts), 0};
+        if (clip < 0) clip = widescreen_clip(regs, vs, verts);
+        const float depth[4] = {f24_to_f32(regs[DEPTH_SCALE] & 0xFFFFFF), f24_to_f32(regs[DEPTH_OFFSET] & 0xFFFFFF), clip, 0};
         std::memcpy(u + 1600, depth, 16);
         const u32 bools = vs.bool_uniforms;
         std::memcpy(u + 1616, &bools, 4);
@@ -1942,12 +1987,21 @@ struct Renderer::Impl {
         ++stats.draws;
         if (std::getenv("DOT_TRACE_FB"))
             std::fprintf(stderr, "renderer:   draw %zu vertices into %08X\n", verts.size(), cur->va);
+        return clip;
     }
 };
 
 Renderer::Renderer(Context& ctx) : impl_(std::make_unique<Impl>(ctx)) {}
 Renderer::~Renderer() {
-    std::lock_guard lk(impl_->lock);
+    if (impl_->worker.joinable()) {
+        {
+            auto lk = impl_->acquire();
+            impl_->quit = true;
+        }
+        impl_->job_cv.notify_one();
+        impl_->worker.join();
+    }
+    auto lk = impl_->acquire();
     impl_->save_caches();
 }
 bool Renderer::init(const std::filesystem::path& cache_dir) { return impl_->init(cache_dir); }
@@ -1961,27 +2015,29 @@ template <class F> static void timed(const char* what, F&& f) {
 
 void Renderer::draw(core::Memory& mem, const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs,
                     bool indexed) {
-    std::lock_guard lk(impl_->lock);
-    impl_->record_draw(regs, vs, indexed);
-    timed("draw (total)", [&] { impl_->draw(mem, regs, vs, indexed); });
+    auto lk = impl_->acquire();
+    std::vector<pica::VertexInput> verts;
+    if (!pica::load_vertices(mem, regs, vs, indexed, verts)) verts.clear();
+    float clip = 1.0f;
+    timed("draw (total)", [&] { clip = impl_->draw(mem, regs, vs, verts); });
+    impl_->record_draw(regs, vs, indexed, std::move(verts), clip);
 }
 
 void Renderer::sync(core::Memory& mem, u32 start, u32 end, bool overwrite) {
-    std::lock_guard lk(impl_->lock);
+    auto lk = impl_->acquire();
     timed("sync", [&] { impl_->sync(mem, start, end, overwrite); });
 }
 
 void Renderer::memory_fill(core::Memory& mem, u32 start, u32 end, u32 value, u32 width_mode) {
-    std::lock_guard lk(impl_->lock);
+    auto lk = impl_->acquire();
     // 16-bit fills clear D16; 24/32-bit fills D24, the 32-bit ones with the stencil in the top byte.
     impl_->depth_clears[start] = width_mode == 0 ? Impl::DepthClear{(value & 0xFFFF) / 65535.0f, 0}
                                                  : Impl::DepthClear{(value & 0xFFFFFF) / 16777215.0f, width_mode == 2 ? value >> 24 : 0};
-    impl_->record_op(Impl::Op::Fill, {start, end}, true);
-    impl_->fill(mem, start, end);
+    impl_->record_op(Impl::Op::Fill, {start, end, impl_->fill(mem, start, end)}, true);
 }
 
 bool Renderer::display_transfer(core::Memory& mem, u32 in, u32 out, u32 in_dim, u32 out_dim, u32 flags) {
-    std::lock_guard lk(impl_->lock);
+    auto lk = impl_->acquire();
     const bool gpu = impl_->display_transfer(mem, in, out, in_dim, out_dim, flags);
     impl_->record_op(Impl::Op::Transfer, {in, out, in_dim, out_dim, flags}, gpu);
     // A transfer to the top screen's framebuffer (400 rows, linear) ends a game frame.
@@ -2058,7 +2114,7 @@ void Renderer::vblank() {
 }
 
 bool Renderer::read_display(u32 va, std::vector<u32>& rgba, u32& width, u32& height, bool interp) {
-    std::lock_guard lk(impl_->lock);
+    auto lk = impl_->acquire();
     Impl& m = *impl_;
     auto it = m.displays.find(va);
     if (it == m.displays.end() || !(interp ? it->second.interp[0] : it->second.image).img) return false;
@@ -2082,7 +2138,7 @@ bool Renderer::read_display(u32 va, std::vector<u32>& rgba, u32& width, u32& hei
 u32 Renderer::scale() const { return impl_->scale; }
 
 void Renderer::flush(core::Memory& mem) {
-    std::lock_guard lk(impl_->lock);
+    auto lk = impl_->acquire();
     for (auto& [va, sf] : impl_->surfaces)
         if (sf.gpu_newer) impl_->readback(mem, sf);  // only the GPU has it: keep it through guest memory
     impl_->submit_and_wait();
@@ -2117,7 +2173,7 @@ void Renderer::drop_targets_locked(bool displays) {
 }
 
 void Renderer::drop_targets() {
-    std::lock_guard lk(impl_->lock);
+    auto lk = impl_->acquire();
     drop_targets_locked(false);
 }
 
@@ -2125,7 +2181,7 @@ void Renderer::set_scale(core::Memory& mem, u32 scale) {
     scale = std::clamp(scale, 1u, 8u);
     if (scale == this->scale()) return;
     flush(mem);
-    std::lock_guard lk(impl_->lock);
+    auto lk = impl_->acquire();
     Impl& m = *impl_;
     drop_targets_locked(true);
     for (auto& [key, s] : m.samplers) vkDestroySampler(m.dev, s, nullptr);  // anisotropy follows the scale
@@ -2136,12 +2192,12 @@ void Renderer::set_scale(core::Memory& mem, u32 scale) {
 }
 
 void Renderer::set_widescreen(float aspect) {
-    std::lock_guard lk(impl_->lock);
+    auto lk = impl_->acquire();
     impl_->wide_aspect = aspect;
 }
 
 void Renderer::set_frame_rate(u32 fps) {
-    std::lock_guard lk(impl_->lock);
+    auto lk = impl_->acquire();
     impl_->samples = std::clamp(fps / 30, 1u, 4u);
     impl_->interpolate = impl_->samples > 1;
     impl_->frame_ops.clear(), impl_->prev_ops.clear();

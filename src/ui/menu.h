@@ -45,10 +45,14 @@ bool handle_event(const SDL_Event& e);
 void frame();
 bool visible();
 
-// First run without game data: a window asking for the user's Majora's Mask 3D .cia, which
-// `script` (tools/extract_cia.py) extracts into `target`. `suggested` (may be empty) is a .cia
-// found nearby, offered with one click. Returns false if the player closed the window.
-bool run_setup(const std::filesystem::path& target, const std::filesystem::path& script,
-               const std::filesystem::path& suggested);
+// No valid v1.1 game data: a window that requires the user's Majora's Mask 3D base .cia and
+// its v1.1 update .cia, which `script` (tools/extract_cia.py) checks (title IDs, region,
+// version) and extracts into `target`. `files` are preselected (found nearby or given on the
+// command line); `start` begins at once. Returns false if the player closed the window.
+struct SetupFiles {
+    std::filesystem::path base, update;
+    bool start = false;
+};
+bool run_setup(const std::filesystem::path& target, const std::filesystem::path& script, SetupFiles files);
 
 }  // namespace ui

@@ -345,7 +345,7 @@ struct Extraction {
     std::atomic<bool> done{false};
     bool ok = false;
 
-    void run(std::string script, std::string cia, std::string out) {
+    void run(std::string script, std::string base, std::string update, std::string out) {
         int fds[2];
         if (pipe(fds) != 0) return finish(false, "cannot create a pipe\n");
         posix_spawn_file_actions_t fa;
@@ -353,7 +353,9 @@ struct Extraction {
         posix_spawn_file_actions_adddup2(&fa, fds[1], 1);
         posix_spawn_file_actions_adddup2(&fa, fds[1], 2);
         posix_spawn_file_actions_addclose(&fa, fds[0]);
-        char* argv[] = {const_cast<char*>("python3"), const_cast<char*>("-I"), script.data(), cia.data(), out.data(), nullptr};
+        char flag[] = "--update";
+        char* argv[] = {const_cast<char*>("python3"), const_cast<char*>("-I"), script.data(), base.data(), out.data(),
+                        flag, update.data(), nullptr};
         pid_t pid = 0;
         const int err = posix_spawnp(&pid, "python3", &fa, nullptr, argv, environ);
         posix_spawn_file_actions_destroy(&fa);
@@ -384,9 +386,8 @@ struct Extraction {
 
 }  // namespace
 
-bool run_setup(const std::filesystem::path& target, const std::filesystem::path& script,
-               const std::filesystem::path& suggested) {
-    SDL_Window* window = SDL_CreateWindow("DawnOfTermina — setup", 900, 560, SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
+bool run_setup(const std::filesystem::path& target, const std::filesystem::path& script, SetupFiles files) {
+    SDL_Window* window = SDL_CreateWindow("DawnOfTermina — setup", 900, 600, SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
     if (!window) return false;
     bool result = false;
     {
@@ -397,18 +398,35 @@ bool run_setup(const std::filesystem::path& target, const std::filesystem::path&
         }
         const std::vector<u32> top(gfx::vulkan::TOP_W * gfx::vulkan::SCREEN_H, 0xFF000000);
         const std::vector<u32> bottom(gfx::vulkan::BOTTOM_W * gfx::vulkan::SCREEN_H, 0xFF000000);
+        // picked[0] = base game, [1] = v1.1 update; set by the file dialog callback (another thread).
         std::mutex picked_lock;
-        std::filesystem::path picked;  // set by the file dialog callback
+        std::filesystem::path picked[2];
         auto ex = std::make_unique<Extraction>();
         std::thread worker;
         bool running = false, finished = false;
-        auto start = [&](const std::filesystem::path& cia) {
-            if (running) return;
+        auto start = [&] {
+            if (running || files.base.empty() || files.update.empty()) return;
             ex = std::make_unique<Extraction>();
             running = true;
-            worker = std::thread([e = ex.get(), script, cia, target] { e->run(script.string(), cia.string(), target.string()); });
+            worker = std::thread([e = ex.get(), script, b = files.base, u = files.update, target] {
+                e->run(script.string(), b.string(), u.string(), target.string());
+            });
         };
-        if (const char* cia = std::getenv("DOT_SETUP_CIA")) start(cia);  // unattended (testing)
+        if (files.start) start();  // both given on the command line
+        auto browse = [&](int which) {
+            static const SDL_DialogFileFilter filter{"Nintendo 3DS CIA (*.cia)", "cia"};
+            SDL_ShowOpenFileDialog(
+                [](void* user, const char* const* f, int) {
+                    auto* ctx = static_cast<std::pair<std::mutex*, std::filesystem::path*>*>(user);
+                    if (f && f[0]) {
+                        std::lock_guard lk(*ctx->first);
+                        *ctx->second = f[0];
+                    }
+                    delete ctx;
+                },
+                new std::pair<std::mutex*, std::filesystem::path*>(&picked_lock, &picked[which]), window, &filter, 1,
+                nullptr, false);
+        };
         for (bool open = true; open && !finished;) {
             for (SDL_Event e; SDL_PollEvent(&e);) {
                 ImGui_ImplSDL3_ProcessEvent(&e);
@@ -416,7 +434,8 @@ bool run_setup(const std::filesystem::path& target, const std::filesystem::path&
             }
             {
                 std::lock_guard lk(picked_lock);
-                if (!picked.empty()) start(picked), picked.clear();
+                if (!picked[0].empty()) files.base = picked[0], picked[0].clear();
+                if (!picked[1].empty()) files.update = picked[1], picked[1].clear();
             }
             if (running && ex->done) {
                 worker.join();
@@ -431,31 +450,37 @@ bool run_setup(const std::filesystem::path& target, const std::filesystem::path&
             ImGui::Begin("setup", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove);
             ImGui::TextUnformatted("DawnOfTermina");
             ImGui::Separator();
-            ImGui::TextWrapped("The Majora's Mask 3D game data was not found. Select your own copy of the game "
-                               "as a decrypted .cia file; it will be extracted to:");
+            ImGui::TextWrapped("No Majora's Mask 3D v1.1 game data was found. DawnOfTermina runs version 1.1 only: "
+                               "select your own copy of the game AND its official v1.1 update, both as decrypted .cia "
+                               "files of the same region. They will be checked and extracted to:");
             ImGui::TextDisabled("%s", target.string().c_str());
             ImGui::TextWrapped("This is done once (about 650 MB, a minute or two). Nothing is downloaded.");
             ImGui::Spacing();
             ImGui::BeginDisabled(running);
-            if (!suggested.empty() && ImGui::Button(("Use " + suggested.filename().string()).c_str())) start(suggested);
-            if (ImGui::Button("Select .cia file...")) {
-                static const SDL_DialogFileFilter filter{"Nintendo 3DS CIA (*.cia)", "cia"};
-                SDL_ShowOpenFileDialog(
-                    [](void* user, const char* const* files, int) {
-                        auto* ctx = static_cast<std::pair<std::mutex*, std::filesystem::path*>*>(user);
-                        if (files && files[0]) {
-                            std::lock_guard lk(*ctx->first);
-                            *ctx->second = files[0];
-                        }
-                    },
-                    new std::pair<std::mutex*, std::filesystem::path*>(&picked_lock, &picked),  // shortcut: leaked once per click
-                    window, &filter, 1, nullptr, false);
+            const char* labels[2] = {"1. Base game (.cia)", "2. Update v1.1 (.cia)"};
+            const std::filesystem::path* chosen[2] = {&files.base, &files.update};
+            for (int i = 0; i < 2; ++i) {
+                ImGui::PushID(i);
+                ImGui::TextUnformatted(labels[i]);
+                ImGui::SameLine(200);
+                if (ImGui::Button("Select...")) browse(i);
+                ImGui::SameLine();
+                if (chosen[i]->empty()) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "required, not selected");
+                else ImGui::TextUnformatted(chosen[i]->filename().string().c_str());
+                ImGui::PopID();
             }
+            ImGui::Spacing();
+            const bool ready = !files.base.empty() && !files.update.empty();
+            ImGui::BeginDisabled(!ready);
+            if (ImGui::Button("Extract and start")) start();
+            ImGui::EndDisabled();
             ImGui::SameLine();
             if (ImGui::Button("Quit")) open = false;
             ImGui::EndDisabled();
-            if (running) ImGui::TextUnformatted("Extracting...");
-            else if (ex->done && !ex->ok) ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "Extraction failed: see the log below.");
+            if (!ready && !running) ImGui::TextDisabled("Both files are required to continue.");
+            if (running) ImGui::TextUnformatted("Checking and extracting...");
+            else if (ex->done && !ex->ok)
+                ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "Rejected or failed: see the log below, then pick the right files.");
             {
                 std::lock_guard lk(ex->lock);
                 ImGui::BeginChild("log", ImVec2(0, 0), ImGuiChildFlags_Borders);

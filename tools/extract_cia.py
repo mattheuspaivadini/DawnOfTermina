@@ -6,12 +6,14 @@ LZSS-decompressed), code.elf (code.bin at its original VAs, for Hopper), romfs/ 
 raw romfs.bin image (served to the game by the fs:USER HLE).
 Pure Python, no ctrtool/3dstool needed.
 
-usage: extract_cia.py <game.cia> [out_dir=game_data] [--update <update.cia>] [--restoration <mod>]
+usage: extract_cia.py <game.cia> [out_dir=game_data] --update <update_v1.1.cia> [--restoration <mod>]
                       [--romfs <mod> ...]
 
---update applies the official update (title 0004000E..., v1.1 recommended) on top of the base:
-exheader.bin and code.bin are replaced, its RomFS goes to update_romfs.bin (base romfs.bin kept). The resulting
-version and code.bin SHA-256 go to out_dir/manifest.json.
+DawnOfTermina runs Majora's Mask 3D v1.1 only: the base game .cia and its official v1.1 update
+(title 0004000E..., same region) are both required and checked (title IDs, region, version)
+before anything is written. The update replaces exheader.bin and code.bin; its RomFS goes to
+update_romfs.bin (base romfs.bin kept). The version and code.bin SHA-256 go to
+out_dir/manifest.json, written last: no manifest = incomplete extraction.
 
 --restoration applies Project Restoration (https://restoration.zora.re/) last, on top of v1.1: the
 release archive (.zip, or .7z with 7z/bsdtar installed) or a folder with code.bps, exheader.bin or
@@ -216,11 +218,17 @@ def version_name(v: int) -> str:
     return "1.0" if v == 0 else f"{v >> 10}.{(v >> 4) & 0x3F}"
 
 
+# Majora's Mask 3D unique IDs, by region.
+MM3D_IDS = {0x00125500: "USA", 0x00125600: "EUR", 0x000D6E00: "JPN"}
+
+
 def check_update(base_tid: int, update_tid: int):
-    """An update for this game: category 0x0004000E with the base's unique ID (which also
-    encodes the region: USA 0x00125500, EUR 0x00125600, JPN 0x000D6E00)."""
+    """Majora's Mask 3D and an update for it: category 0x0004000E with the base's unique ID
+    (which also encodes the region)."""
     if base_tid >> 32 != 0x00040000:
         raise ValueError(f"base title {base_tid:016X} is not a game (category 00040000)")
+    if base_tid & 0xFFFFFFFF not in MM3D_IDS:
+        raise ValueError(f"base title {base_tid:016X} is not Majora's Mask 3D")
     if update_tid >> 32 != 0x0004000E:
         raise ValueError(f"--update: {update_tid:016X} is not an update title (category 0004000E)")
     if update_tid & 0xFFFFFFFF != base_tid & 0xFFFFFFFF:
@@ -375,7 +383,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cia", type=Path, help="decrypted base game .cia")
     ap.add_argument("out", type=Path, nargs="?", default=Path("game_data"))
-    ap.add_argument("--update", type=Path, help="decrypted update .cia (v1.1, recommended)")
+    ap.add_argument("--update", type=Path, required=True, help="decrypted v1.1 update .cia (required)")
     ap.add_argument("--restoration", type=Path,
                     help="Project Restoration release (.zip/.7z) or folder; needs --update v1.1")
     ap.add_argument("--romfs", type=Path, action="append", default=[],
@@ -383,17 +391,16 @@ def main():
     args = ap.parse_args()
     try:
         with open(args.cia, "rb") as f:
-            _, base_tid, base_ver, _ = cia_layout(f)
-        if args.update:  # validated before writing anything
-            with open(args.update, "rb") as f:
-                _, upd_tid, upd_ver, upd_encrypted = cia_layout(f)
-            check_update(base_tid, upd_tid)
-            if upd_encrypted:
-                raise ValueError(f"{args.update.name}: content is CIA-encrypted (title key); "
-                                 "decrypt the update .cia first")
-        if args.restoration and not (args.update and version_name(upd_ver) == "1.1"):
-            raise ValueError("--restoration: Project Restoration requires the game updated to v1.1; "
-                             "pass the v1.1 update .cia with --update")
+            _, base_tid, _, _ = cia_layout(f)
+        with open(args.update, "rb") as f:  # validated before writing anything
+            _, upd_tid, upd_ver, upd_encrypted = cia_layout(f)
+        check_update(base_tid, upd_tid)
+        if version_name(upd_ver) != "1.1":
+            raise ValueError(f"--update: {args.update.name} is version {version_name(upd_ver)}; "
+                             "DawnOfTermina needs the v1.1 update")
+        if upd_encrypted:
+            raise ValueError(f"{args.update.name}: content is CIA-encrypted (title key); "
+                             "decrypt the update .cia first")
         if args.restoration:
             tmp = tempfile.TemporaryDirectory(prefix="dot_restoration_")
             mod = unpack_mod(args.restoration, Path(tmp.name))
@@ -413,14 +420,11 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     for stale in ("update_romfs.bin", "manifest.json"):  # from an earlier run
         (args.out / stale).unlink(missing_ok=True)
-    base_sha = None
     cs = extract(args.cia, args.out)
-    version = base_ver
-    if args.update:
-        base_sha = hashlib.sha256((args.out / "exefs" / "code.bin").read_bytes()).hexdigest()
-        print(f"\napplying update {upd_tid:016X} v{version_name(upd_ver)}")
-        cs = extract(args.update, args.out, "update_romfs.bin")
-        version = upd_ver
+    base_sha = hashlib.sha256((args.out / "exefs" / "code.bin").read_bytes()).hexdigest()
+    print(f"\napplying update {upd_tid:016X} v{version_name(upd_ver)}")
+    cs = extract(args.update, args.out, "update_romfs.bin")
+    version = upd_ver
     mod_code = None
     if args.restoration:
         print("\napplying Project Restoration")
@@ -441,8 +445,7 @@ def main():
     }
     if mod_code:
         manifest["restoration_code"] = mod_code  # read by tools/recomp (extra code range)
-    if base_sha:
-        manifest["base_code_sha256"] = base_sha
+    manifest["base_code_sha256"] = base_sha
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
     print(f"\ntitle: {cs['name']}  version {manifest['game_version']}  code compressed: {cs['compressed']}")
@@ -451,10 +454,6 @@ def main():
         print(f".{s:<7} VA {v['addr']:#010x}  size {v['size']:#x}  pages {v['pages']:#x}")
     print(f".bss     size {cs['bss_size']:#x}\nstack    size {cs['stack_size']:#x}")
     print(f"entry    {cs['text']['addr']:#010x}\ncode.bin sha256 {code_sha}")
-    if not args.update:
-        print("\nnote: no --update given. Installing the official v1.1 update is recommended "
-              "(bug fixes; required by mods such as Project Restoration):\n"
-              "  extract_cia.py <game.cia> game_data --update <update_v1.1.cia>")
 
 
 if __name__ == "__main__":

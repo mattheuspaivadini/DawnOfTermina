@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <optional>
+#include <regex>
 #include <fstream>
 #include <iterator>
 #include <thread>
@@ -30,8 +31,6 @@
 
 #include "core/config.h"
 #include "core/loader.h"
-#include "game/crt0.h"
-#include "game/guest.h"
 #include "gfx/pica/texture.h"
 #include "gfx/vulkan/context.h"
 #include "gfx/vulkan/renderer.h"
@@ -48,14 +47,12 @@
 #include "recomp/hooks.h"
 #include "ui/menu.h"
 
-#ifdef DOT_HAVE_RECOMP
 namespace recomp {
 extern const FuncEntry kFunctions[];
 extern const u32 kFunctionCount;
 extern const FuncEntry kResumePoints[];
 extern const u32 kResumePointCount;
 }  // namespace recomp
-#endif
 
 // ExHeader ARM11 local capabilities: main thread priority at 0x20F.
 static u8 read_main_priority(const std::filesystem::path& data) {
@@ -100,10 +97,29 @@ static std::vector<u32> icon_screen(const std::filesystem::path& smdh_path) {
     std::_Exit(1);
 }
 
-static bool has_game_data(const std::filesystem::path& d) {
+// game_data is usable when extract_cia.py finished it (manifest.json, written last) for v1.1
+// and its code.bin is the one this executable was recompiled from (DOT_CODE_SHA256).
+enum class GameData { Missing, Ready, OtherBuild };
+static GameData check_game_data(const std::filesystem::path& d, std::string* sha = nullptr) {
     std::error_code ec;
-    return std::filesystem::exists(d / "exheader.bin", ec) && std::filesystem::exists(d / "exefs" / "code.bin", ec) &&
-           std::filesystem::exists(d / "romfs", ec);
+    for (const char* f : {"exheader.bin", "exefs/code.bin", "romfs.bin", "update_romfs.bin", "manifest.json"})
+        if (!std::filesystem::exists(d / f, ec)) return GameData::Missing;
+    std::ifstream f(d / "manifest.json");
+    const std::string m{std::istreambuf_iterator<char>(f), {}};
+    std::smatch version, code;
+    if (!std::regex_search(m, version, std::regex(R"re("game_version"\s*:\s*"([^"]*)")re")) || version[1] != "1.1" ||
+        !std::regex_search(m, code, std::regex(R"re("code_sha256"\s*:\s*"([0-9a-f]{64})")re")))
+        return GameData::Missing;
+    if (sha) *sha = code[1];
+    return code[1] == DOT_CODE_SHA256 ? GameData::Ready : GameData::OtherBuild;
+}
+
+[[noreturn]] static int other_build(const std::filesystem::path& data, const std::string& sha) {
+    fatal("The game data at '" + data.string() + "' (code.bin " + sha.substr(0, 12) +
+          "...) is not the one this executable was built from (" + std::string(DOT_CODE_SHA256).substr(0, 12) +
+          "...).\nThe game code is recompiled at build time: rebuild with\n"
+          "  cmake -B build -DDOT_GAME_DATA=" + data.string() + " && cmake --build build\n"
+          "or start this executable with the game_data it was built for.");
 }
 
 int main(int argc, char** argv) {
@@ -115,23 +131,38 @@ int main(int argc, char** argv) {
     const fs::path root = !fs::exists(base / "tools" / "extract_cia.py") && fs::exists(base / ".." / "tools" / "extract_cia.py")
                               ? (base / "..").lexically_normal()
                               : base;
-    fs::path data = argc > 1 ? fs::path(argv[1]) : fs::path("game_data");
-    if (argc <= 1 && !has_game_data(data)) data = root / "game_data";
-    if (!has_game_data(data)) {
-        // First run: ask for the player's .cia and extract it (offering one found in ISO/).
+    // usage: dawnoftermina [game_data] [--base <game.cia> --update <update_v1.1.cia>]
+    fs::path data;
+    ui::SetupFiles setup;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if ((a == "--base" || a == "--update") && i + 1 < argc) (a == "--base" ? setup.base : setup.update) = argv[++i];
+        else if (a.starts_with("--")) return fatal("usage: dawnoftermina [game_data] [--base <game.cia> --update <update_v1.1.cia>]");
+        else data = a;
+    }
+    if (data.empty()) data = check_game_data("game_data") != GameData::Missing ? fs::path("game_data") : root / "game_data";
+    std::string sha;
+    GameData state = check_game_data(data, &sha);
+    if (state == GameData::OtherBuild) other_build(data, sha);
+    if (state == GameData::Missing) {
+        // No v1.1 game data: the launcher requires the base game and the v1.1 update (.cia),
+        // given on the command line or picked there (offering ones found in ISO/).
         if (!SDL_Init(SDL_INIT_VIDEO)) return fatal(std::string("SDL_Init: ") + SDL_GetError());
-        fs::path suggested;
+        setup.start = !setup.base.empty() && !setup.update.empty();
         std::error_code ec;
         for (const fs::path& dir : {root / "ISO", root, fs::current_path() / "ISO"})
-            for (const auto& f : fs::directory_iterator(dir, ec))
-                if (suggested.empty() && f.path().extension() == ".cia") suggested = f.path();
-        const fs::path target = argc > 1 ? data : root / "game_data";
-        if (!ui::run_setup(target, root / "tools" / "extract_cia.py", suggested)) return 0;
-        data = target;
-#ifndef DOT_HAVE_RECOMP
-        return fatal("Game data extracted. This build was configured without it, so it cannot run the game yet:\n"
-                     "rebuild (cmake --build build) and start it again.");
-#endif
+            for (const auto& f : fs::directory_iterator(dir, ec)) {
+                if (f.path().extension() != ".cia") continue;
+                std::string name = f.path().filename().string();
+                std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+                // shortcut: guessed by file name (the extractor checks the title IDs), offered only
+                fs::path& slot = name.find("update") != std::string::npos ? setup.update : setup.base;
+                if (slot.empty()) slot = f.path();
+            }
+        if (!ui::run_setup(data, root / "tools" / "extract_cia.py", setup)) return 0;
+        state = check_game_data(data, &sha);
+        if (state == GameData::OtherBuild) other_build(data, sha);
+        if (state != GameData::Ready) return fatal("The extraction at '" + data.string() + "' is incomplete.");
     }
     gfx::g_hd_hud = fs::exists(data / "romfs" / "layout" / "Joker.Main.New.gar");  // extract_cia.py --romfs
     // config.toml lives next to game_data/ (like saves/ and cache/); DOT_* variables override it.
@@ -159,7 +190,6 @@ int main(int argc, char** argv) {
     hle::svc::AddRegion(core::Memory::STACK_TOP - stack, stack, 3, 5);
     hle::dsp::Initialize();
 
-#ifdef DOT_HAVE_RECOMP
     // The recompiled code.bin runs on guest threads (hle::kernel); this host thread keeps
     // the window, input and presentation. Whatever the guest needs next and the runtime
     // does not provide yet stops it with a report: that is the next thing to implement.
@@ -175,16 +205,6 @@ int main(int argc, char** argv) {
     // DOT_LOAD_STATE=<file>: the main thread loads it at its first syscall.
     if (const char* st = std::getenv("DOT_LOAD_STATE")) hle::kernel::request_load(st);
     hle::kernel::start_main_thread(code->text.addr, core::Memory::STACK_TOP, main_priority);
-#else
-    // No recompiled code (game_data absent at configure time): run the hand-transcribed
-    // boot until it reaches code that is not transcribed yet.
-    game::bind(mem);
-    try {
-        game::crt0::_start();
-    } catch (const game::Frontier& f) {
-        std::printf("boot: reached the transcription frontier: %s\n", f.what());
-    }
-#endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD) || !hle::hid::Initialize()) {
         return fatal(std::string("SDL_Init: ") + SDL_GetError());
     }
@@ -201,13 +221,11 @@ int main(int argc, char** argv) {
         gfx::vulkan::Context gpu;
         if (!gpu.init(window)) return fatal("Vulkan initialisation failed (see the terminal output). A GPU driver with Vulkan 1.1 is required.");
         if (!ui::init(window, gpu, config, config_file)) std::fprintf(stderr, "ui: settings menu unavailable\n");
-#ifdef DOT_HAVE_RECOMP
         gfx::vulkan::Renderer renderer(gpu);
         if (!renderer.init(std::filesystem::absolute(data).parent_path() / "cache"))
             return fatal("Renderer initialisation failed (see the terminal output).");
         hle::service::gsp::set_renderer(&renderer);
         ui::set_renderer(&renderer, &mem);
-#endif
         const std::vector<u32> top(gfx::vulkan::TOP_W * gfx::vulkan::SCREEN_H, 0xFF402010);
         const std::vector<u32> bottom = icon_screen(data / "exefs" / "icon.bin");
         std::vector<u32> game_top, game_bottom;
@@ -215,7 +233,6 @@ int main(int argc, char** argv) {
         // Until the game loop is transcribed (stage 5), pump input, log pad changes and
         // present placeholder screens.
         bool reported = false;
-#ifdef DOT_HAVE_RECOMP
         // Periodic guest work (VBlank, HID sampling) is due on its own clock, not the display's:
         // an idle guest only advances through host_tick, and DOT_SPEED needs it above 60 Hz.
         std::atomic<bool> ticking{true};
@@ -225,12 +242,10 @@ int main(int argc, char** argv) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         });
-#endif
         for (bool running = true; running;) {
             for (SDL_Event e; SDL_PollEvent(&e);)
                 if (e.type == SDL_EVENT_QUIT) running = false;
                 else ui::handle_event(e);  // menu and hotkeys; the game polls the device state itself
-#ifdef DOT_HAVE_RECOMP
             if (auto st = reported ? std::nullopt : hle::kernel::stopped()) {
                 reported = true;
                 if (st->exited) std::printf("guest: process exited\n");
@@ -244,12 +259,10 @@ int main(int argc, char** argv) {
                 }
                 if (std::getenv("DOT_EXIT_ON_STOP")) running = false;
             }
-#endif
             hle::hid::Update();
             auto pad = hle::hid::ReadPad();
             if (pad.trigger || pad.release)
                 std::printf("pad hold=%08x stick=(%d,%d)\n", pad.hold, pad.stick_x, pad.stick_y);
-#ifdef DOT_HAVE_RECOMP
             // N64 layout: bit 0 of 0x6A3A18 (v1.0) = the world is paused, written each frame by the
             // play loop (0x15F644) from the touch-screen menu state; set with the Items/Masks menus,
             // clear through boot, title and cutscenes (savestate diffs + trace). Same .data offset in
@@ -262,9 +275,7 @@ int main(int argc, char** argv) {
             // 0 only while the bottom screen shows the gameplay HUD (1 through boot, title, opening
             // cutscenes and menus). The HUD pieces are hidden otherwise.
             gfx::g_hud_visible = mem.read<u16>(code->data.addr + 0x42300) == 0 && !dekui;
-#endif
             ui::frame();  // before fetching the screens: a resolution change destroys their images
-#ifdef DOT_HAVE_RECOMP
             // DOT_SAVE_STATE_AT=<guest seconds> (DOT_INPUT's clock): one automatic save to states/slot1.state.
             if (static const char* at = std::getenv("DOT_SAVE_STATE_AT"); at) {
                 static bool saved = false;
@@ -333,12 +344,6 @@ int main(int argc, char** argv) {
             const u32* bottom_px = have_bottom ? game_bottom.data() : bottom.data();
             const gfx::vulkan::GpuScreen* gpu_top_ptr = gpu_top ? &gpu_screens[0] : nullptr;
             const gfx::vulkan::GpuScreen* gpu_bottom_ptr = gpu_bottom ? &gpu_screens[1] : nullptr;
-#else
-            const u32* top_px = top.data();
-            const u32* bottom_px = bottom.data();
-            const gfx::vulkan::GpuScreen* gpu_top_ptr = nullptr;
-            const gfx::vulkan::GpuScreen* gpu_bottom_ptr = nullptr;
-#endif
             if (!config.vsync) {  // FIFO paces the loop with vsync; without it, cap at 240 Hz
                 static auto next = std::chrono::steady_clock::now();
                 std::this_thread::sleep_until(next);
@@ -349,16 +354,12 @@ int main(int argc, char** argv) {
                 break;  // FIFO present paces the loop to vsync
         }
         ui::shutdown();
-#ifdef DOT_HAVE_RECOMP
         ticking = false;
         ticker.join();
         hle::service::gsp::set_renderer(nullptr);
-#endif
     }
 
-#ifdef DOT_HAVE_RECOMP
     if (std::getenv("DOT_STATS")) std::printf("guest threads at exit:\n%s", hle::kernel::dump_threads().c_str());
-#endif
     SDL_DestroyWindow(window);
     hle::dsp::Shutdown();
     SDL_Quit();

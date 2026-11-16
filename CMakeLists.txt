@@ -47,8 +47,6 @@ add_library(dot_runtime STATIC
     src/gfx/pica/vertex_loader.cpp
     src/gfx/pica/shader_interp.cpp
     src/gfx/vulkan/context.cpp
-    src/game/guest.cpp
-    src/game/crt0.cpp
     src/hle/kernel.cpp
     src/hle/service/services.cpp
     src/hle/service/apt.cpp
@@ -82,37 +80,51 @@ target_link_libraries(dawnoftermina PRIVATE dot_runtime imgui)
 
 # Static recompilation of the user's code.bin (tools/recomp). Generated at build time
 # into the build tree only: it is derived from the game and must never be committed.
-set(DOT_GAME_DATA "${CMAKE_SOURCE_DIR}/game_data" CACHE PATH "Extracted game data (tools/extract_cia.py)")
+# Majora's Mask 3D v1.1 only: game data extracted from the base .cia + the v1.1 update .cia
+# (tools/extract_cia.py <game.cia> <dir> --update <update_v1.1.cia>), mods over v1.1 allowed.
+set(DOT_GAME_DATA "${CMAKE_SOURCE_DIR}/game_data" CACHE PATH "Extracted v1.1 game data (tools/extract_cia.py)")
 set(DOT_RECOMP_CHUNKS 64)
-if(EXISTS "${DOT_GAME_DATA}/exefs/code.bin")
-    find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    set(gen "${CMAKE_BINARY_DIR}/recomp_gen")
-    set(gen_sources "${gen}/recomp_table.cpp")
-    math(EXPR last "${DOT_RECOMP_CHUNKS} - 1")
-    foreach(i RANGE ${last})
-        if(i LESS 10)
-            list(APPEND gen_sources "${gen}/recomp_0${i}.cpp")
-        else()
-            list(APPEND gen_sources "${gen}/recomp_${i}.cpp")
-        endif()
-    endforeach()
-    file(GLOB recomp_tool CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/tools/recomp/*.py")
-    add_custom_command(
-        OUTPUT ${gen_sources} "${gen}/recomp_funcs.h"
-        COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tools/recomp/recomp.py" "${DOT_GAME_DATA}" "${gen}"
-                --chunks ${DOT_RECOMP_CHUNKS}
-        DEPENDS ${recomp_tool} "${DOT_GAME_DATA}/exefs/code.bin" "${DOT_GAME_DATA}/exheader.bin"
-                "${CMAKE_SOURCE_DIR}/tools/recomp/extra_entries.txt" "${CMAKE_SOURCE_DIR}/tools/recomp/hooks.txt"
-        COMMENT "Recompiling code.bin (ARM11 -> C++)"
-        VERBATIM)
-    add_library(dot_game STATIC ${gen_sources})
-    target_include_directories(dot_game PRIVATE src "${gen}")
-    target_link_libraries(dot_game PRIVATE dot_runtime)  # native hooks (src/recomp/hooks.cpp)
-    # Generated code: VFP MAC must not be fused; guest memory is accessed through u8*.
-    target_compile_options(dot_game PRIVATE -O1 -w -ffp-contract=off -fno-strict-aliasing)
-    target_link_libraries(dawnoftermina PRIVATE dot_game)
-    target_compile_definitions(dawnoftermina PRIVATE DOT_HAVE_RECOMP=1)
+set(manifest_file "${DOT_GAME_DATA}/manifest.json")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${manifest_file}")
+if(EXISTS "${manifest_file}" AND EXISTS "${DOT_GAME_DATA}/exefs/code.bin")
+    file(READ "${manifest_file}" manifest)
+    string(JSON game_version ERROR_VARIABLE json_error GET "${manifest}" game_version)
+    string(JSON code_sha256 ERROR_VARIABLE json_error GET "${manifest}" code_sha256)
 endif()
+if(NOT game_version STREQUAL "1.1" OR NOT code_sha256)
+    message(FATAL_ERROR "DOT_GAME_DATA (${DOT_GAME_DATA}) is not a Majora's Mask 3D v1.1 extraction "
+        "(manifest.json with game_version 1.1). Extract the base game and the v1.1 update:\n"
+        "  python3 tools/extract_cia.py <game.cia> <dir> --update <update_v1.1.cia>\n"
+        "and configure with -DDOT_GAME_DATA=<dir>.")
+endif()
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(gen "${CMAKE_BINARY_DIR}/recomp_gen")
+set(gen_sources "${gen}/recomp_table.cpp")
+math(EXPR last "${DOT_RECOMP_CHUNKS} - 1")
+foreach(i RANGE ${last})
+    if(i LESS 10)
+        list(APPEND gen_sources "${gen}/recomp_0${i}.cpp")
+    else()
+        list(APPEND gen_sources "${gen}/recomp_${i}.cpp")
+    endif()
+endforeach()
+file(GLOB recomp_tool CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/tools/recomp/*.py")
+add_custom_command(
+    OUTPUT ${gen_sources} "${gen}/recomp_funcs.h"
+    COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tools/recomp/recomp.py" "${DOT_GAME_DATA}" "${gen}"
+            --chunks ${DOT_RECOMP_CHUNKS}
+    DEPENDS ${recomp_tool} "${DOT_GAME_DATA}/exefs/code.bin" "${DOT_GAME_DATA}/exheader.bin"
+            "${CMAKE_SOURCE_DIR}/tools/recomp/extra_entries.txt" "${CMAKE_SOURCE_DIR}/tools/recomp/hooks.txt"
+    COMMENT "Recompiling code.bin (ARM11 -> C++)"
+    VERBATIM)
+add_library(dot_game STATIC ${gen_sources})
+target_include_directories(dot_game PRIVATE src "${gen}")
+target_link_libraries(dot_game PRIVATE dot_runtime)  # native hooks (src/recomp/hooks.cpp)
+# Generated code: VFP MAC must not be fused; guest memory is accessed through u8*.
+target_compile_options(dot_game PRIVATE -O1 -w -ffp-contract=off -fno-strict-aliasing)
+target_link_libraries(dawnoftermina PRIVATE dot_game)
+# The executable runs only the code.bin it was compiled from (checked against manifest.json at start).
+target_compile_definitions(dawnoftermina PRIVATE DOT_CODE_SHA256="${code_sha256}")
 
 # Self-contained folder: cmake --install build --prefix dist. With game data configured the
 # executable holds the recompiled game code: personal use only, never commit or share it.
@@ -125,7 +137,7 @@ add_executable(dot_selftest tests/selftest.cpp tests/pica_test.cpp tests/shader_
     tests/recomp_test.cpp tests/audio_test.cpp)
 target_link_libraries(dot_selftest PRIVATE dot_runtime)
 target_include_directories(dot_selftest SYSTEM PRIVATE src/dekui)
-add_test(NAME selftest COMMAND dot_selftest ${CMAKE_SOURCE_DIR}/game_data)
+add_test(NAME selftest COMMAND dot_selftest ${DOT_GAME_DATA})
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
     add_test(NAME recomp_lifter COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tools/recomp/test_lifter.py)

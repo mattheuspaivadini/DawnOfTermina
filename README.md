@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="DOT_Logo.png" alt="DawnOfTermina" width="480">
+  <img src="Logo.png" alt="DawnOfTermina" width="480">
 </p>
 
 # DawnOfTermina

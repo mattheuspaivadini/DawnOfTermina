@@ -17,6 +17,8 @@
 #include "gfx/vulkan/renderer.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -38,12 +40,15 @@
 #include "gfx/layout.h"
 #include "gfx/pica/pixel.h"
 #include "gfx/pica/shader_gen.h"
+#include "gfx/pica/shbin.h"
 #include "gfx/pica/shader_interp.h"
 #include "gfx/camera_midpoint.h"
 #include "gfx/pica/texture.h"
 #include "gfx/pica/vertex_loader.h"
 #include "gfx/vulkan/context.h"
 #include "gfx/vulkan/spirv.h"
+#include "shaders/pass_vert.h"      // SPIR-V compiled at build time (CMakeLists.txt)
+#include "shaders/transfer_comp.h"
 
 namespace gfx::vulkan {
 
@@ -83,35 +88,6 @@ struct ShadedVertex {
     float pos[4], color[4], uv01[4] /* t0.xy t1.xy */, uv2w[4] /* t2.xy t0.w */, quat[4], view[4];
 };
 
-// Pass-through vertex shader: PICA clip space -> Vulkan, fixed interface of shader_gen.h.
-constexpr const char* PASS_VS = R"(#version 450
-layout(location = 0) in vec4 in_pos;
-layout(location = 1) in vec4 in_color;
-layout(location = 2) in vec4 in_uv01;
-layout(location = 3) in vec4 in_uv2w;
-layout(location = 4) in vec4 in_quat;
-layout(location = 5) in vec4 in_view;
-layout(std140, set = 0, binding = 0) uniform PicaVsUniforms { vec4 c[96]; ivec4 i[4]; vec4 depth; uint b; } u;
-layout(location = 0) out vec4 primary_color;
-layout(location = 1) out vec2 texcoord0;
-layout(location = 2) out vec2 texcoord1;
-layout(location = 3) out vec2 texcoord2;
-layout(location = 4) out float texcoord0_w;
-layout(location = 5) out vec4 normquat;
-layout(location = 6) out vec3 view;
-void main() {
-    // PICA window depth = z/w * scale + offset; pre-multiplied by w for Vulkan. depth.z: widescreen.
-    gl_Position = vec4(in_pos.x, in_pos.y * u.depth.z, in_pos.z * u.depth.x + in_pos.w * u.depth.y, in_pos.w);
-    primary_color = min(abs(in_color), vec4(1.0));
-    texcoord0 = in_uv01.xy;
-    texcoord1 = in_uv01.zw;
-    texcoord2 = in_uv2w.xy;
-    texcoord0_w = in_uv2w.z;
-    normquat = in_quat;
-    view = in_view.xyz;
-}
-)";
-
 u64 fnv(const void* data, size_t n, u64 h = 1469598103934665603ull) {
     const u8* p = static_cast<const u8*>(data);
     for (size_t i = 0; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
@@ -148,29 +124,6 @@ u64 hash_words(const u8* p, size_t n) {
     for (; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
     return h ^ (a + (h >> 31));
 }
-
-// DisplayTransfer on the GPU: colour surface -> screen-oriented image (framebuffer rows are
-// screen columns, bottom to top). a = {flip, x downscale shift, y downscale shift, source height},
-// b.x = source rows per output column (> 1 when a widened surface feeds a normal-width screen).
-constexpr const char* TRANSFER_CS = R"(#version 450
-layout(local_size_x = 8, local_size_y = 8) in;
-layout(set = 0, binding = 0) uniform sampler2D src;
-layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
-layout(push_constant) uniform P { ivec4 a; vec4 b; } p;
-void main() {
-    const ivec2 o = ivec2(gl_GlobalInvocationID.xy), size = imageSize(dst);
-    if (o.x >= size.x || o.y >= size.y) return;
-    const int x = p.a.x != 0 ? size.x - 1 - o.x : o.x;  // output framebuffer row = screen column
-    const int row = int((float(x) + 0.5) * p.b.x);
-    const int col = (size.y - 1 - o.y) << p.a.y;
-    const int mem_row = row << p.a.z;                      // colour buffers are bottom-up
-    const int nx = 1 << p.a.y, ny = 1 << p.a.z;
-    vec4 c = vec4(0.0);
-    for (int dy = 0; dy < ny; ++dy)
-        for (int dx = 0; dx < nx; ++dx) c += texelFetch(src, ivec2(col + dx, p.a.w - 1 - (mem_row + dy)), 0);
-    imageStore(dst, o, vec4(c.rgb / float(nx * ny), 1.0));
-}
-)";
 
 bool check(VkResult r, const char* what) {
     if (r == VK_SUCCESS) return true;
@@ -416,6 +369,179 @@ struct Renderer::Impl {
     std::filesystem::path cache_dir;
     VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
     std::map<u64, std::vector<u32>> spirv_cache;
+    // pipeline_manifest.bin: every graphics pipeline ever created, as {SPIR-V key of the vertex and
+    // fragment shader, pipeline state}, so the next start creates them all before the guest runs.
+    struct PipelineRecord {
+        u64 vs, fs;
+        u32 state[8];
+    };
+    std::vector<PipelineRecord> manifest;
+    std::set<u64> manifest_keys;                    // fnv of each record (no duplicates)
+    std::map<VkShaderModule, u64> module_keys;      // module -> its SPIR-V cache key
+    bool warmed = false;                            // after warm(): log what still compiles on demand
+    static constexpr u32 MANIFEST_MAGIC = 0x314D5050;  // "PPM1"
+
+    // pipeline_seed.bin: the same pipelines as generator inputs only (no shader code, no SPIR-V):
+    // which .shbin code blob (by hash) + entry/outmap/bool/int uniforms for the vertex program
+    // (blob 0 = the pass-through shader), the registers the fragment generator reads, the
+    // pipeline state, and the GLSL hashes to check the regeneration. The launcher regenerates and
+    // compiles all of it from the player's own romfs right after extraction (precompile()).
+    static constexpr u32 FS_REGS = 45;
+    struct SeedRecord {
+        u64 vs_key, fs_key, blob;
+        u32 entry, outmap[7], ints[4], bools;
+        u32 fs_regs[FS_REGS];
+        u32 state[8];
+    };
+    static constexpr u32 SEED_MAGIC = 0x31445353;  // "SSD1"
+    static_assert(sizeof(SeedRecord) == 3 * 8 + 4 * (1 + 7 + 4 + 1 + FS_REGS + 8), "tools/merge_seed.py RECORD");
+    std::vector<SeedRecord> seed;
+    std::set<u64> seed_keys;
+    struct Blob {
+        u64 id;
+        std::vector<u32> code, swizzles;
+    };
+    std::vector<Blob> blobs;  // romfs/shaders/*.shbin code blobs
+    bool seed_unmatched_reported = false;
+
+    void load_blobs(const std::filesystem::path& romfs) {
+        std::error_code ec;
+        for (const auto& f : std::filesystem::directory_iterator(romfs / "shaders", ec)) {
+            const auto data = read_file(f.path());
+            if (auto sh = pica::parse_shbin(data); sh && !sh->code.empty()) {
+                const u64 id = fnv(sh->code.data(), sh->code.size() * 4);
+                if (std::none_of(blobs.begin(), blobs.end(), [&](const Blob& b) { return b.id == id; }))
+                    blobs.push_back({id, std::move(sh->code), std::move(sh->swizzles)});
+            }
+        }
+    }
+
+    static std::vector<SeedRecord> read_seed(const std::filesystem::path& p) {
+        const auto d = read_file(p);
+        std::vector<SeedRecord> out;
+        u32 magic = 0;
+        if (d.size() >= 4) std::memcpy(&magic, d.data(), 4);
+        for (size_t i = 4; magic == SEED_MAGIC && i + sizeof(SeedRecord) <= d.size(); i += sizeof(SeedRecord))
+            std::memcpy(&out.emplace_back(), &d[i], sizeof(SeedRecord));
+        return out;
+    }
+
+    void add_seed(const SeedRecord& r) {
+        if (seed_keys.insert(fnv(&r, sizeof r)).second) seed.push_back(r);
+    }
+
+    // A pipeline the game just needed, as generator inputs.
+    void record_seed(const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs, u32 entry,
+                     VkShaderModule vmod, VkShaderModule fmod) {
+        SeedRecord r{};
+        const auto kv = module_keys.find(vmod), kf = module_keys.find(fmod);
+        if (kv == module_keys.end() || kf == module_keys.end()) return;
+        r.vs_key = kv->second, r.fs_key = kf->second;
+        if (vmod != pass_vs) {
+            for (const Blob& b : blobs)
+                if (b.code.size() <= vs.code.size() && b.swizzles.size() <= vs.swizzle.size() &&
+                    std::equal(b.code.begin(), b.code.end(), vs.code.begin()) &&
+                    std::equal(b.swizzles.begin(), b.swizzles.end(), vs.swizzle.begin()))
+                    r.blob = b.id;
+            if (!r.blob) {
+                if (!seed_unmatched_reported) std::printf("renderer: seed: a vertex program matches no .shbin (not recorded)\n");
+                seed_unmatched_reported = true;
+                return;
+            }
+            r.entry = entry, r.bools = vs.bool_uniforms;
+            std::memcpy(r.outmap, &regs[OUTMAP], sizeof r.outmap);
+            std::memcpy(r.ints, vs.int_uniforms.data(), sizeof r.ints);
+        }
+        for (u32 i = 0; i < FS_REGS; ++i) r.fs_regs[i] = regs[fs_reg_list()[i]];
+        pipe_state(regs, r.state);
+        add_seed(r);
+    }
+
+    // Regenerates every seed pipeline from the romfs blobs, compiles the SPIR-V (several threads)
+    // and creates the pipelines; the caches (SPIR-V, driver cache, manifest) are saved for the game.
+    void precompile(const std::vector<SeedRecord>& in, std::atomic<u32>& done, std::atomic<u32>& total) {
+        const auto t0 = std::chrono::steady_clock::now();
+        struct Job {
+            u64 key;
+            std::string glsl;
+            ShaderStage stage;
+        };
+        std::vector<Job> jobs;
+        std::set<u64> queued;
+        std::vector<const SeedRecord*> usable;
+        u32 no_blob = 0, mismatch = 0;
+        const u64 pass_key = module_keys.at(pass_vs);
+        for (const SeedRecord& r : in) {
+            std::string vglsl;
+            if (r.blob) {
+                const auto b = std::find_if(blobs.begin(), blobs.end(), [&](const Blob& x) { return x.id == r.blob; });
+                if (b == blobs.end()) {
+                    ++no_blob;
+                    continue;
+                }
+                std::array<u32, 512> code{};
+                std::array<u32, 128> swz{};
+                std::copy_n(b->code.begin(), std::min(b->code.size(), code.size()), code.begin());
+                std::copy_n(b->swizzles.begin(), std::min(b->swizzles.size(), swz.size()), swz.begin());
+                std::string err;
+                std::array<u32, 4> ints;
+                std::memcpy(ints.data(), r.ints, sizeof r.ints);
+                vglsl = pica::generate_vertex_shader({code, swz, r.entry, {r.outmap, 7}, u16(r.bools), ints}, &err);
+                if (vglsl.empty() || fnv(vglsl.data(), vglsl.size(), u64(ShaderStage::Vertex)) != r.vs_key) {
+                    ++mismatch;
+                    continue;
+                }
+            } else if (r.vs_key != pass_key) {
+                ++mismatch;
+                continue;
+            }
+            std::array<u32, pica::reg::COUNT> regs{};
+            for (u32 i = 0; i < FS_REGS; ++i) regs[fs_reg_list()[i]] = r.fs_regs[i];
+            std::string fglsl = pica::generate_fragment_shader(regs);
+            if (fnv(fglsl.data(), fglsl.size(), u64(ShaderStage::Fragment)) != r.fs_key) {
+                ++mismatch;
+                continue;
+            }
+            if (r.blob && !spirv_cache.count(r.vs_key) && queued.insert(r.vs_key).second)
+                jobs.push_back({r.vs_key, std::move(vglsl), ShaderStage::Vertex});
+            if (!spirv_cache.count(r.fs_key) && queued.insert(r.fs_key).second)
+                jobs.push_back({r.fs_key, std::move(fglsl), ShaderStage::Fragment});
+            usable.push_back(&r);
+        }
+        total = u32(jobs.size());
+        const u32 nthreads = std::clamp(std::thread::hardware_concurrency(), 1u, 16u);
+        std::printf("precompile: %zu seed pipelines (%u need a missing .shbin, %u regenerate differently), "
+                    "%zu shaders to compile on %u threads\n",
+                    usable.size(), no_blob, mismatch, jobs.size(), nthreads);
+        std::fflush(stdout);
+        std::vector<std::vector<u32>> spv(jobs.size());
+        std::atomic<size_t> next{0};
+        std::atomic<u32> failed{0};
+        std::vector<std::thread> pool;
+        for (u32 t = 0; t < nthreads; ++t)
+            pool.emplace_back([&] {
+                for (size_t i; (i = next++) < jobs.size(); ++done) {
+                    std::string log;
+                    spv[i] = compile_glsl(jobs[i].glsl, jobs[i].stage, &log);
+                    if (spv[i].empty()) ++failed;
+                }
+            });
+        for (auto& th : pool) th.join();
+        for (size_t i = 0; i < jobs.size(); ++i)
+            if (!spv[i].empty()) spirv_cache[jobs[i].key] = std::move(spv[i]);
+        cache_dirty = true;
+        std::printf("precompile: %zu shaders compiled (%u failed) in %.0f ms\n", jobs.size(), failed.load(),
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        std::fflush(stdout);
+        for (const SeedRecord* r : usable) {
+            add_seed(*r);
+            PipelineRecord m{r->vs_key, r->fs_key, {}};
+            std::memcpy(m.state, r->state, sizeof m.state);
+            if (manifest_keys.insert(fnv(&m, sizeof m)).second) manifest.push_back(m);
+        }
+        warm(done, total);  // adds the pipelines to `total`
+        save_caches();
+    }
     bool cache_dirty = false;
     std::chrono::steady_clock::time_point cache_saved = std::chrono::steady_clock::now();
     static constexpr u32 SPIRV_CACHE_MAGIC = 0x31565053;  // "SPV1"
@@ -594,6 +720,16 @@ struct Renderer::Impl {
             std::memcpy(code.data(), &sc[at], size_t(words) * 4);
             at += size_t(words) * 4;
         }
+        for (const SeedRecord& r : read_seed(cache_dir / "pipeline_seed.bin")) add_seed(r);
+        // pipeline_manifest.bin: magic, then PipelineRecord...
+        const auto mf = read_file(cache_dir / "pipeline_manifest.bin");
+        u32 mmagic = 0;
+        if (mf.size() >= 4) std::memcpy(&mmagic, mf.data(), 4);
+        for (size_t i = 4; mmagic == MANIFEST_MAGIC && i + sizeof(PipelineRecord) <= mf.size(); i += sizeof(PipelineRecord)) {
+            PipelineRecord r;
+            std::memcpy(&r, &mf[i], sizeof r);
+            if (manifest_keys.insert(fnv(&r, sizeof r)).second) manifest.push_back(r);
+        }
     }
 
     // Writes to a temporary file first so a kill mid-save cannot leave a corrupt cache.
@@ -629,6 +765,82 @@ struct Renderer::Impl {
             std::memcpy(&data[at + 12], code.data(), code.size() * 4);
         }
         write_file(cache_dir / "spirv_cache.bin", data);
+        data.assign(4, 0);
+        std::memcpy(data.data(), &MANIFEST_MAGIC, 4);
+        data.resize(4 + manifest.size() * sizeof(PipelineRecord));
+        if (!manifest.empty()) std::memcpy(&data[4], manifest.data(), manifest.size() * sizeof(PipelineRecord));
+        write_file(cache_dir / "pipeline_manifest.bin", data);
+        data.assign(4, 0);
+        std::memcpy(data.data(), &SEED_MAGIC, 4);
+        data.resize(4 + seed.size() * sizeof(SeedRecord));
+        if (!seed.empty()) std::memcpy(&data[4], seed.data(), seed.size() * sizeof(SeedRecord));
+        write_file(cache_dir / "pipeline_seed.bin", data);
+    }
+
+    // Creates every pipeline of the manifest (several threads; the pipeline cache is internally
+    // synchronised) so none compiles during play. Runs before the guest starts.
+    void warm(std::atomic<u32>& done, std::atomic<u32>& total) {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::pair<const PipelineRecord*, VkShaderModule[2]>> jobs;
+        jobs.reserve(manifest.size());
+        u32 missing = 0;
+        for (const PipelineRecord& r : manifest) {
+            VkShaderModule m[2] = {cached_module(r.vs), cached_module(r.fs)};
+            if (!m[0] || !m[1]) {
+                ++missing;  // SPIR-V gone from spirv_cache.bin: it compiles again when the game needs it
+                continue;
+            }
+            auto& j = jobs.emplace_back();
+            j.first = &r, j.second[0] = m[0], j.second[1] = m[1];
+        }
+        total += u32(jobs.size());
+        const u32 nthreads = std::clamp(std::thread::hardware_concurrency(), 1u, 16u);
+        std::printf("renderer: creating %zu pipelines from pipeline_manifest.bin on %u threads (%u shader modules ready)\n",
+                    jobs.size(), nthreads, u32(modules.size()));
+        std::fflush(stdout);
+        std::vector<VkPipeline> out(jobs.size());
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> pool;
+        for (u32 t = 0; t < nthreads; ++t)
+            pool.emplace_back([&] {
+                for (size_t i; (i = next++) < jobs.size(); ++done)
+                    out[i] = create_pipeline(jobs[i].second[0], jobs[i].second[1], jobs[i].first->state);
+            });
+        for (auto& th : pool) th.join();
+        for (size_t i = 0; i < jobs.size(); ++i)
+            pipelines[pipe_key(jobs[i].second[0], jobs[i].second[1], jobs[i].first->state)] = out[i];
+        warmed = true;
+        stats.warmed = jobs.size();
+        std::printf("renderer: %zu pipelines ready in %.0f ms (%u without SPIR-V skipped); "
+                    "pipelines compiled on demand from now on are logged\n",
+                    jobs.size(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                    missing);
+        std::fflush(stdout);
+    }
+
+    // The shader module for a SPIR-V cache key, created from spirv_cache.bin if needed.
+    VkShaderModule cached_module(u64 key) {
+        if (auto it = modules.find(key); it != modules.end()) return it->second;
+        auto it = spirv_cache.find(key);
+        return it == spirv_cache.end() || it->second.empty() ? VK_NULL_HANDLE
+                                                            : modules[key] = make_module(key, it->second.data(), it->second.size());
+    }
+
+    VkShaderModule make_module(u64 key, const u32* code, size_t words) {
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = words * 4;
+        mi.pCode = code;
+        VkShaderModule m = VK_NULL_HANDLE;
+        if (!check(vkCreateShaderModule(dev, &mi, nullptr, &m), "vkCreateShaderModule")) return VK_NULL_HANDLE;
+        module_keys[m] = key;
+        return m;
+    }
+
+    // Built-in shaders: SPIR-V compiled at build time, no glslang at run time.
+    VkShaderModule builtin_module(const u32* code, size_t bytes) {
+        const u64 key = fnv(code, bytes, 0xB1u);
+        if (auto it = modules.find(key); it != modules.end()) return it->second;
+        return modules[key] = make_module(key, code, bytes / 4);
     }
 
     bool init(const std::filesystem::path& dir) {
@@ -742,11 +954,14 @@ struct Renderer::Impl {
         vkCreatePipelineLayout(dev, &pli, nullptr, &xfer_layout);
         VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,
-                     module(TRANSFER_CS, ShaderStage::Compute), "main", nullptr};
+                     builtin_module(k_transfer_comp, sizeof k_transfer_comp), "main", nullptr};
         cpi.layout = xfer_layout;
         if (!cpi.stage.module ||
             !check(vkCreateComputePipelines(dev, pipeline_cache, 1, &cpi, nullptr, &xfer_pipe), "transfer pipeline"))
             return false;
+
+        pass_vs = builtin_module(k_pass_vert, sizeof k_pass_vert);
+        if (!pass_vs) return false;
 
         // Resolution scale: DOT_RES_SCALE=<1..8> or "native" (the window's size at startup).
         if (const char* e = std::getenv("DOT_WIDESCREEN")) {
@@ -797,18 +1012,13 @@ struct Renderer::Impl {
             spv = compile_glsl(glsl, stage, &log);
             cache_dirty = !spv.empty();
             ++stats.shaders;
+            if (warmed) std::printf("renderer: shader compiled on demand (%llu so far)\n", (unsigned long long)stats.shaders);
             if (std::getenv("DOT_TRACE_SHADERS") && stage == ShaderStage::Fragment)
                 std::fprintf(stderr, "---- new fragment shader ----\n%s\n", glsl.c_str());
         }
         VkShaderModule m = VK_NULL_HANDLE;
-        if (spv.empty()) {
-            std::fprintf(stderr, "renderer: shader compile failed:\n%s\n", log.c_str());
-        } else {
-            VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            mi.codeSize = spv.size() * 4;
-            mi.pCode = spv.data();
-            vkCreateShaderModule(dev, &mi, nullptr, &m);
-        }
+        if (spv.empty()) std::fprintf(stderr, "renderer: shader compile failed:\n%s\n", log.c_str());
+        else m = make_module(key, spv.data(), spv.size());
         modules[key] = m;
         return m;
     }
@@ -1369,16 +1579,43 @@ struct Renderer::Impl {
         return t;
     }
 
-    VkPipeline pipeline(VkShaderModule vs, VkShaderModule fs, const std::array<u32, pica::reg::COUNT>& regs) {
-        const u32 topo = regs[PRIMITIVE_CONFIG] >> 8 & 3;
+    static void pipe_state(const std::array<u32, pica::reg::COUNT>& regs, u32 (&state)[8]) {
         const bool stencil = has_stencil(regs) && (regs[STENCIL_TEST] & 1);
-        const u32 state[] = {topo, regs[CULL] & 3, regs[COLOR_OP], regs[BLEND_FUNC], regs[DEPTH_COLOR_MASK],
-                             regs[COLOR_WRITE_ENABLE] != 0, regs[DEPTH_WRITE_ENABLE] != 0,
-                             stencil ? (regs[STENCIL_TEST] & 0x70) | (regs[STENCIL_OP] & 0x777) << 8 | 1 : 0};
-        const u64 key = fnv(state, sizeof state, fnv(&vs, sizeof vs, fnv(&fs, sizeof fs)));
+        const u32 st[] = {regs[PRIMITIVE_CONFIG] >> 8 & 3, regs[CULL] & 3, regs[COLOR_OP], regs[BLEND_FUNC],
+                          regs[DEPTH_COLOR_MASK], regs[COLOR_WRITE_ENABLE] != 0, regs[DEPTH_WRITE_ENABLE] != 0,
+                          stencil ? (regs[STENCIL_TEST] & 0x70) | (regs[STENCIL_OP] & 0x777) << 8 | 1 : 0};
+        std::memcpy(state, st, sizeof st);
+    }
+
+    VkPipeline pipeline(VkShaderModule vs, VkShaderModule fs, const std::array<u32, pica::reg::COUNT>& regs) {
+        u32 state[8];
+        pipe_state(regs, state);
+        const u64 key = pipe_key(vs, fs, state);
         auto it = pipelines.find(key);
         if (it != pipelines.end()) return it->second;
+        VkPipeline p = create_pipeline(vs, fs, state);
+        pipelines[key] = p;
+        ++stats.pipelines;
+        cache_dirty = true;
+        const auto kv = module_keys.find(vs), kf = module_keys.find(fs);
+        if (p && kv != module_keys.end() && kf != module_keys.end()) {
+            PipelineRecord r{kv->second, kf->second, {}};
+            std::memcpy(r.state, state, sizeof state);
+            if (manifest_keys.insert(fnv(&r, sizeof r)).second) manifest.push_back(r);
+        }
+        if (warmed) std::printf("renderer: pipeline compiled on demand (%llu so far)\n", (unsigned long long)stats.pipelines);
+        return p;
+    }
 
+    static u64 pipe_key(VkShaderModule vs, VkShaderModule fs, const u32 (&state)[8]) {
+        return fnv(state, sizeof state, fnv(&vs, sizeof vs, fnv(&fs, sizeof fs)));
+    }
+
+    // Everything below comes from `state` (pipeline() above), so the manifest can recreate it.
+    VkPipeline create_pipeline(VkShaderModule vs, VkShaderModule fs, const u32 (&state)[8]) const {
+        const u32 topo = state[0], cull = state[1], color_op = state[2], bf = state[3], dcm = state[4];
+        const bool stencil = state[7] & 1;
+        const u32 stencil_test = state[7] & 0x70, stencil_ops = state[7] >> 8 & 0x777;
         VkPipelineShaderStageCreateInfo stages[2]{};
         stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vs,
                      "main", nullptr};
@@ -1405,30 +1642,27 @@ struct Renderer::Impl {
         // PICA culls in GL terms (1: counter-clockwise, 2: clockwise); with the same window
         // coordinates Vulkan's winding is mirrored, so GL-CCW is Vulkan-CW.
         rs.frontFace = VK_FRONT_FACE_CLOCKWISE;
-        const u32 cull = regs[CULL] & 3;
         rs.cullMode = cull == 1 ? VK_CULL_MODE_FRONT_BIT : cull == 2 ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
         rs.lineWidth = 1.0f;
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-        const u32 dcm = regs[DEPTH_COLOR_MASK];
         VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         ds.depthTestEnable = dcm & 1;
         ds.depthCompareOp = compare_op(dcm >> 4);
-        ds.depthWriteEnable = (dcm >> 12 & 1) && regs[DEPTH_WRITE_ENABLE] != 0;
+        ds.depthWriteEnable = (dcm >> 12 & 1) && state[6];
         // Reference and masks are dynamic state (set per draw).
         ds.stencilTestEnable = stencil;
-        ds.front.failOp = stencil_op(regs[STENCIL_OP]);
-        ds.front.depthFailOp = stencil_op(regs[STENCIL_OP] >> 4);
-        ds.front.passOp = stencil_op(regs[STENCIL_OP] >> 8);
-        ds.front.compareOp = compare_op(regs[STENCIL_TEST] >> 4);
+        ds.front.failOp = stencil_op(stencil_ops);
+        ds.front.depthFailOp = stencil_op(stencil_ops >> 4);
+        ds.front.passOp = stencil_op(stencil_ops >> 8);
+        ds.front.compareOp = compare_op(stencil_test >> 4);
         ds.back = ds.front;
         VkPipelineColorBlendAttachmentState cb{};
-        const u32 bf = regs[BLEND_FUNC];
-        cb.blendEnable = regs[COLOR_OP] >> 8 & 1;  // otherwise logic op (shortcut: treated as COPY)
+        cb.blendEnable = color_op >> 8 & 1;  // otherwise logic op (shortcut: treated as COPY)
         cb.colorBlendOp = blend_op(bf & 7), cb.alphaBlendOp = blend_op(bf >> 8 & 7);
         cb.srcColorBlendFactor = blend_factor(bf >> 16 & 0xF), cb.dstColorBlendFactor = blend_factor(bf >> 20 & 0xF);
         cb.srcAlphaBlendFactor = blend_factor(bf >> 24 & 0xF), cb.dstAlphaBlendFactor = blend_factor(bf >> 28 & 0xF);
-        cb.colorWriteMask = regs[COLOR_WRITE_ENABLE] ? (dcm >> 8 & 0xF) : 0;
+        cb.colorWriteMask = state[5] ? (dcm >> 8 & 0xF) : 0;
         VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         cbs.attachmentCount = 1, cbs.pAttachments = &cb;
         const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
@@ -1444,9 +1678,6 @@ struct Renderer::Impl {
         pi.layout = pipeline_layout, pi.renderPass = render_pass;
         VkPipeline p = VK_NULL_HANDLE;
         check(vkCreateGraphicsPipelines(dev, pipeline_cache, 1, &pi, nullptr, &p), "vkCreateGraphicsPipelines");
-        pipelines[key] = p;
-        ++stats.pipelines;
-        cache_dirty = true;
         return p;
     }
 
@@ -1741,16 +1972,23 @@ struct Renderer::Impl {
     // structure); per-draw values travel as push constants or in the lighting buffer.
     // DOT_VERIFY_FS=1 regenerates every time and reports a mismatch with the memoised one.
     std::map<u64, VkShaderModule> fs_memo;
+    static const std::array<u16, FS_REGS>& fs_reg_list() {
+        static const auto list = [] {
+            std::array<u16, FS_REGS> l{};
+            u32 n = 0;
+            for (u16 r : {0x080, 0x08F, 0x090, 0x0E0, 0x104, 0x1C2, 0x1C3, 0x1C4, 0x1C6, 0x1D0, 0x1D1, 0x1D2, 0x1D9}) l[n++] = r;
+            for (u16 base : {0xC0, 0xC8, 0xD0, 0xD8, 0xF0, 0xF8})
+                for (u16 k = 0; k < 5; ++k)
+                    if (k != 3) l[n++] = base + k;
+            for (u16 i = 0; i < 8; ++i) l[n++] = 0x149 + 16 * i;
+            return l;
+        }();
+        return list;
+    }
     VkShaderModule fragment_shader(const std::array<u32, pica::reg::COUNT>& regs) {
-        u32 key_regs[64];
-        u32 n = 0;
-        for (u32 r : {0x080u, 0x08Fu, 0x090u, 0x0E0u, 0x104u, 0x1C2u, 0x1C3u, 0x1C4u, 0x1C6u, 0x1D0u, 0x1D1u, 0x1D2u, 0x1D9u})
-            key_regs[n++] = regs[r];
-        for (u32 base : {0xC0u, 0xC8u, 0xD0u, 0xD8u, 0xF0u, 0xF8u})
-            for (u32 k = 0; k < 5; ++k)
-                if (k != 3) key_regs[n++] = regs[base + k];
-        for (u32 l = 0; l < 8; ++l) key_regs[n++] = regs[0x149 + 16 * l];
-        const u64 key = fnv(key_regs, n * 4);
+        u32 key_regs[FS_REGS];
+        for (u32 i = 0; i < FS_REGS; ++i) key_regs[i] = regs[fs_reg_list()[i]];
+        const u64 key = fnv(key_regs, sizeof key_regs);
         static const bool verify = std::getenv("DOT_VERIFY_FS") != nullptr;
         auto it = fs_memo.find(key);
         if (it != fs_memo.end() && !verify) return it->second;
@@ -1869,12 +2107,13 @@ struct Renderer::Impl {
                 shaded[n] = sv;
             }
         }
-        if (!pass_vs) pass_vs = module(PASS_VS, ShaderStage::Vertex);
         const VkShaderModule vmod = gpu_vs ? gpu_vs : pass_vs;
         const VkShaderModule fmod = fragment_shader(regs);
         if (!vmod || !fmod) return skip("shader compile");
+        const u64 created = stats.pipelines;
         const VkPipeline pipe = pipeline(vmod, fmod, regs);
         if (!pipe) return skip("pipeline creation");
+        if (stats.pipelines != created) record_seed(regs, vs, entry, vmod, fmod);
 
         // Room in this batch: vertices, uniforms, lighting, staging (texture uploads are
         // bounded by the units' full sizes, the target upload by its size).
@@ -2005,6 +2244,21 @@ Renderer::~Renderer() {
     impl_->save_caches();
 }
 bool Renderer::init(const std::filesystem::path& cache_dir) { return impl_->init(cache_dir); }
+void Renderer::load_shader_blobs(const std::filesystem::path& romfs) {
+    std::lock_guard lk(impl_->lock);
+    impl_->load_blobs(romfs);
+}
+bool Renderer::precompile(const std::filesystem::path& seed, std::atomic<u32>& done, std::atomic<u32>& total) {
+    std::lock_guard lk(impl_->lock);
+    const auto records = Impl::read_seed(seed);
+    if (records.empty()) return false;
+    impl_->precompile(records, done, total);
+    return true;
+}
+void Renderer::warm(std::atomic<u32>& done, std::atomic<u32>& total) {
+    std::lock_guard lk(impl_->lock);
+    impl_->warm(done, total);
+}
 
 template <class F> static void timed(const char* what, F&& f) {
     const auto t0 = std::chrono::steady_clock::now();

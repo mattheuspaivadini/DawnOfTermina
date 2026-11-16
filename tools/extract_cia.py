@@ -379,6 +379,35 @@ def apply_romfs_mod(mod: Path, out: Path):
     print(f"romfs mod {mod}: {n} files added to romfs.bin")
 
 
+# The mods DawnOfTermina is built for (DekUI's single screen needs both): official downloads,
+# pinned by SHA-256. Kept in <out>/../mods so a re-extraction does not download again.
+MODS = {
+    "restoration": ("https://github.com/leoetlino/project-restoration/releases/download/v1.5.9/"
+                    "mm3d_project_restoration_plus_hd_hud_v1.5.9-5-g8bb2a7b.7z",
+                    "69e10b92ab52ddcb8347e28353410f5cc5b8ea0b0d884913fd793db46fcf1a3b"),
+    "romfs": ("https://zora.re/dl/mm3d_big_screen_layout_779512b.7z",
+              "2c55e262b65edcbfafbb896d2434d5eb3ccb966183e86229602a72a92d525b35"),
+}
+
+
+def download_mod(url: str, sha: str, folder: Path) -> Path:
+    import urllib.request
+    dst = folder / url.rsplit("/", 1)[1]
+    if dst.is_file() and hashlib.sha256(dst.read_bytes()).hexdigest() == sha:
+        print(f"mod      {dst.name} (already downloaded)", flush=True)
+        return dst
+    folder.mkdir(parents=True, exist_ok=True)
+    print(f"download {url}", flush=True)
+    req = urllib.request.Request(url, headers={"User-Agent": "DawnOfTermina-extractor"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        data = r.read()
+    got = hashlib.sha256(data).hexdigest()
+    if got != sha:
+        raise ValueError(f"{dst.name}: SHA-256 {got} is not the expected {sha}")
+    dst.write_bytes(data)
+    return dst
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cia", type=Path, help="decrypted base game .cia")
@@ -388,8 +417,15 @@ def main():
                     help="Project Restoration release (.zip/.7z) or folder; needs --update v1.1")
     ap.add_argument("--romfs", type=Path, action="append", default=[],
                     help="RomFS mod (.zip/.7z or folder) added into romfs.bin; repeatable")
+    ap.add_argument("--download-mods", action="store_true",
+                    help="download and apply Project Restoration plus HD HUD + the big screen layout "
+                         "(what the DekUI build needs) instead of --restoration/--romfs")
     args = ap.parse_args()
     try:
+        if args.download_mods:
+            folder = args.out.resolve().parent / "mods"
+            args.restoration = download_mod(*MODS["restoration"], folder)
+            args.romfs = [download_mod(*MODS["romfs"], folder)]
         with open(args.cia, "rb") as f:
             _, base_tid, _, _ = cia_layout(f)
         with open(args.update, "rb") as f:  # validated before writing anything

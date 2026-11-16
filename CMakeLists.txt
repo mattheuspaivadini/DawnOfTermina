@@ -70,6 +70,26 @@ file(READ resources/dekui/presentation.json DOT_DEKUI_PRESENTATION)
 file(CONFIGURE OUTPUT ${CMAKE_BINARY_DIR}/dekui_presentation.cpp @ONLY CONTENT
     "extern const char* const kDekuiPresentation;\nconst char* const kDekuiPresentation = R\"json(@DOT_DEKUI_PRESENTATION@)json\";\n")
 target_include_directories(dot_runtime PUBLIC src)
+# The renderer's fixed shaders (src/gfx/vulkan/shaders/) are compiled to SPIR-V here, not at run time:
+# embedded as C arrays (shaders/<name>.h) and also installed as .spv into dist/shaders/.
+find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
+set(DOT_SHADER_HEADERS)
+set(DOT_SHADER_SPV)
+foreach(src pass.vert transfer.comp)
+    string(REPLACE "." "_" name ${src})
+    set(in ${CMAKE_SOURCE_DIR}/src/gfx/vulkan/shaders/${src})
+    set(h ${CMAKE_BINARY_DIR}/shaders/${name}.h)
+    set(spv ${CMAKE_BINARY_DIR}/shaders/${src}.spv)
+    add_custom_command(OUTPUT ${h} ${spv}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
+        COMMAND ${GLSLANG_VALIDATOR} -V --target-env vulkan1.1 --quiet --vn k_${name} -o ${h} ${in}
+        COMMAND ${GLSLANG_VALIDATOR} -V --target-env vulkan1.1 --quiet -o ${spv} ${in}
+        DEPENDS ${in} VERBATIM)
+    list(APPEND DOT_SHADER_HEADERS ${h})
+    list(APPEND DOT_SHADER_SPV ${spv})
+endforeach()
+target_sources(dot_runtime PRIVATE ${DOT_SHADER_HEADERS})
+target_include_directories(dot_runtime PRIVATE ${CMAKE_BINARY_DIR})
 target_include_directories(dot_runtime SYSTEM PRIVATE src/dekui)  # DekUI's headers, verbatim (GPL-2.0-or-later)
 target_link_libraries(dot_runtime PUBLIC SDL3::SDL3 Vulkan::Vulkan
     glslang::glslang glslang::SPIRV glslang::glslang-default-resource-limits)
@@ -90,6 +110,8 @@ if(EXISTS "${manifest_file}" AND EXISTS "${DOT_GAME_DATA}/exefs/code.bin")
     file(READ "${manifest_file}" manifest)
     string(JSON game_version ERROR_VARIABLE json_error GET "${manifest}" game_version)
     string(JSON code_sha256 ERROR_VARIABLE json_error GET "${manifest}" code_sha256)
+    # Built with Project Restoration (+ HD HUD/DekUI): the launcher downloads and applies the same mods.
+    string(JSON dot_modded ERROR_VARIABLE json_error GET "${manifest}" restoration_enabled)
 endif()
 if(NOT game_version STREQUAL "1.1" OR NOT code_sha256)
     message(FATAL_ERROR "DOT_GAME_DATA (${DOT_GAME_DATA}) is not a Majora's Mask 3D v1.1 extraction "
@@ -125,12 +147,20 @@ target_compile_options(dot_game PRIVATE -O1 -w -ffp-contract=off -fno-strict-ali
 target_link_libraries(dawnoftermina PRIVATE dot_game)
 # The executable runs only the code.bin it was compiled from (checked against manifest.json at start).
 target_compile_definitions(dawnoftermina PRIVATE DOT_CODE_SHA256="${code_sha256}")
+if(dot_modded)
+    target_compile_definitions(dawnoftermina PRIVATE DOT_DOWNLOAD_MODS=1)
+endif()
 
 # Self-contained folder: cmake --install build --prefix dist. With game data configured the
 # executable holds the recompiled game code: personal use only, never commit or share it.
 install(TARGETS dawnoftermina RUNTIME DESTINATION .)
 install(FILES tools/extract_cia.py tools/bps_patch.py tools/romfs_patch.py DESTINATION tools)
 install(FILES LICENSE README.md DESTINATION .)
+install(FILES ${DOT_SHADER_SPV} DESTINATION shaders)
+# Pipelines to compile right after extraction (generator inputs only; tools/merge_seed.py).
+if(EXISTS ${CMAKE_SOURCE_DIR}/resources/pipeline_seed.bin)
+    install(FILES resources/pipeline_seed.bin DESTINATION .)
+endif()
 
 enable_testing()
 add_executable(dot_selftest tests/selftest.cpp tests/pica_test.cpp tests/shader_test.cpp

@@ -1,0 +1,38 @@
+#version 450
+// DawnOfTermina — native static recompilation of Majora's Mask 3D.
+// Copyright (C) 2026 DawnOfTermina contributors
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+// DisplayTransfer on the GPU: colour surface -> screen-oriented image (framebuffer rows are
+// screen columns, bottom to top). a = {flip, x downscale shift, y downscale shift, source height},
+// b.x = source rows per output column (> 1 when a widened surface feeds a normal-width screen).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
+layout(push_constant) uniform P { ivec4 a; vec4 b; } p;
+void main() {
+    const ivec2 o = ivec2(gl_GlobalInvocationID.xy), size = imageSize(dst);
+    if (o.x >= size.x || o.y >= size.y) return;
+    const int x = p.a.x != 0 ? size.x - 1 - o.x : o.x;  // output framebuffer row = screen column
+    const int row = int((float(x) + 0.5) * p.b.x);
+    const int col = (size.y - 1 - o.y) << p.a.y;
+    const int mem_row = row << p.a.z;                      // colour buffers are bottom-up
+    const int nx = 1 << p.a.y, ny = 1 << p.a.z;
+    vec4 c = vec4(0.0);
+    for (int dy = 0; dy < ny; ++dy)
+        for (int dx = 0; dx < nx; ++dx) c += texelFetch(src, ivec2(col + dx, p.a.w - 1 - (mem_row + dy)), 0);
+    imageStore(dst, o, vec4(c.rgb / float(nx * ny), 1.0));
+}

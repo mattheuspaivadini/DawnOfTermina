@@ -17,6 +17,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <vector>
@@ -46,6 +47,15 @@ public:
     ~Renderer();
     // `cache_dir` holds the on-disk shader/pipeline caches (created on first save).
     bool init(const std::filesystem::path& cache_dir);
+    // Creates every pipeline recorded in cache/pipeline_manifest.bin (all earlier runs) on several
+    // threads; call before the guest starts. `done`/`total` report progress to another thread.
+    void warm(std::atomic<u32>& done, std::atomic<u32>& total);
+    // The .shbin code blobs of the romfs: a draw's vertex program is recorded in the seed by blob.
+    void load_shader_blobs(const std::filesystem::path& romfs);
+    // Launcher, after extraction: compiles and creates every pipeline of a pipeline_seed.bin (from
+    // the repository: generator inputs only) against the romfs blobs; saves the caches for the
+    // game. False if the seed is missing or empty.
+    bool precompile(const std::filesystem::path& seed, std::atomic<u32>& done, std::atomic<u32>& total);
 
     void draw(core::Memory& mem, const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs,
               bool indexed);
@@ -82,6 +92,7 @@ public:
 
     struct Stats {
         u64 draws, skipped, pipelines, readbacks, shaders;  // shaders = GLSL compiled (not from the disk cache)
+        u64 warmed;                                         // pipelines created by warm(); `pipelines` = on demand
         u64 interpolated, not_interpolated;                 // DOT_FPS>=60: game frames interpolated / not (cuts)
         u64 camera_draws;                                   // in-between draws moved along the rigid camera path
         u64 uv_wrapped, uv_stepped;                         // in-between UV translations: shortest way round / cell switch

@@ -354,8 +354,13 @@ struct Extraction {
         posix_spawn_file_actions_adddup2(&fa, fds[1], 2);
         posix_spawn_file_actions_addclose(&fa, fds[0]);
         char flag[] = "--update";
+#ifdef DOT_DOWNLOAD_MODS  // this build runs Project Restoration + HD HUD (DekUI): the extractor fetches them
+        char mods[] = "--download-mods";
+#else
+        char* mods = nullptr;
+#endif
         char* argv[] = {const_cast<char*>("python3"), const_cast<char*>("-I"), script.data(), base.data(), out.data(),
-                        flag, update.data(), nullptr};
+                        flag, update.data(), mods, nullptr};
         pid_t pid = 0;
         const int err = posix_spawnp(&pid, "python3", &fa, nullptr, argv, environ);
         posix_spawn_file_actions_destroy(&fa);
@@ -413,6 +418,22 @@ bool run_setup(const std::filesystem::path& target, const std::filesystem::path&
             });
         };
         if (files.start) start();  // both given on the command line
+        // After the extraction: every pipeline of the seed compiled here, before the game opens.
+        std::unique_ptr<gfx::vulkan::Renderer> pre;
+        std::thread pre_worker;
+        std::atomic<u32> pre_done{0}, pre_total{0};
+        std::atomic<bool> pre_running{false};
+        auto precompile = [&] {
+            pre = std::make_unique<gfx::vulkan::Renderer>(gpu);
+            if (!pre->init(target.parent_path() / "cache")) return void(finished = true);  // the game compiles on demand
+            pre->load_shader_blobs(target / "romfs");
+            pre_running = true;
+            pre_worker = std::thread([&] {
+                if (!pre->precompile(files.seed, pre_done, pre_total))
+                    std::printf("precompile: no pipeline seed at '%s'\n", files.seed.string().c_str());
+                pre_running = false;
+            });
+        };
         auto browse = [&](int which) {
             static const SDL_DialogFileFilter filter{"Nintendo 3DS CIA (*.cia)", "cia"};
             SDL_ShowOpenFileDialog(
@@ -430,7 +451,8 @@ bool run_setup(const std::filesystem::path& target, const std::filesystem::path&
         for (bool open = true; open && !finished;) {
             for (SDL_Event e; SDL_PollEvent(&e);) {
                 ImGui_ImplSDL3_ProcessEvent(&e);
-                if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) open = running;  // not mid-extraction
+                if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED)
+                    open = running || pre_worker.joinable();  // not mid-extraction
             }
             {
                 std::lock_guard lk(picked_lock);
@@ -440,7 +462,12 @@ bool run_setup(const std::filesystem::path& target, const std::filesystem::path&
             if (running && ex->done) {
                 worker.join();
                 running = false;
-                finished = ex->ok;
+                if (ex->ok) precompile();
+            }
+            if (pre_worker.joinable() && !pre_running) {
+                pre_worker.join();
+                pre.reset();  // saves the SPIR-V, driver and manifest caches
+                finished = true;
             }
             ImGui_ImplVulkan_NewFrame();
             ImGui_ImplSDL3_NewFrame();
@@ -454,9 +481,15 @@ bool run_setup(const std::filesystem::path& target, const std::filesystem::path&
                                "select your own copy of the game AND its official v1.1 update, both as decrypted .cia "
                                "files of the same region. They will be checked and extracted to:");
             ImGui::TextDisabled("%s", target.string().c_str());
+#ifdef DOT_DOWNLOAD_MODS
+            ImGui::TextWrapped("This is done once (about 650 MB, a few minutes). Project Restoration (plus HD HUD) "
+                               "and the big screen layout, which the single-screen interface needs, are downloaded "
+                               "from their official pages (about 0.7 MB, checked by SHA-256) and applied.");
+#else
             ImGui::TextWrapped("This is done once (about 650 MB, a minute or two). Nothing is downloaded.");
+#endif
             ImGui::Spacing();
-            ImGui::BeginDisabled(running);
+            ImGui::BeginDisabled(running || pre_worker.joinable());
             const char* labels[2] = {"1. Base game (.cia)", "2. Update v1.1 (.cia)"};
             const std::filesystem::path* chosen[2] = {&files.base, &files.update};
             for (int i = 0; i < 2; ++i) {
@@ -479,6 +512,11 @@ bool run_setup(const std::filesystem::path& target, const std::filesystem::path&
             ImGui::EndDisabled();
             if (!ready && !running) ImGui::TextDisabled("Both files are required to continue.");
             if (running) ImGui::TextUnformatted("Checking and extracting...");
+            if (pre_worker.joinable()) {
+                ImGui::TextUnformatted("Compiling shaders and creating pipelines (once; the game will not compile during play)...");
+                ImGui::ProgressBar(pre_total ? float(pre_done) / float(pre_total) : 0.0f, ImVec2(-1, 0),
+                                   (std::to_string(pre_done.load()) + " / " + std::to_string(pre_total.load())).c_str());
+            }
             else if (ex->done && !ex->ok)
                 ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "Rejected or failed: see the log below, then pick the right files.");
             {
@@ -497,6 +535,8 @@ bool run_setup(const std::filesystem::path& target, const std::filesystem::path&
                 break;
         }
         if (worker.joinable()) worker.join();
+        if (pre_worker.joinable()) pre_worker.join();
+        pre.reset();
         result = finished;
         gpu.set_overlay(nullptr);
         gpu.set_bottom_texture(VK_NULL_HANDLE);  // freed with ImGui's descriptor pool
@@ -576,6 +616,25 @@ bool handle_event(const SDL_Event& e) {
     default:
         return !g_visible;
     }
+}
+
+void loading(const char* what, u32 done, u32 total) {
+    if (!g_ready) return;
+    ImGui_ImplVulkan_NewFrame();
+    ImGui_ImplSDL3_NewFrame();
+    ImGui::NewFrame();
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
+    ImGui::Begin("loading", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove);
+    ImGui::TextUnformatted("DawnOfTermina");
+    ImGui::Separator();
+    ImGui::TextUnformatted(what);
+    ImGui::ProgressBar(total ? float(done) / float(total) : 1.0f, ImVec2(-1, 0),
+                       (std::to_string(done) + " / " + std::to_string(total)).c_str());
+    ImGui::TextDisabled("The game starts when this finishes: nothing compiles during play.");
+    ImGui::End();
+    ImGui::Render();
+    g_gpu->set_overlay([](VkCommandBuffer cmd) { ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd); });
 }
 
 void frame() {

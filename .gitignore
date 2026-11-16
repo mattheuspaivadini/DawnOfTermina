@@ -36,3 +36,13 @@ cache/
 # Local user settings (written by the game)
 config.toml
 states/
+
+# Shader/pipeline caches (written by the game or the build)
+*.spv
+pipeline_cache.bin
+pipeline_manifest.bin
+spirv_cache.bin
+mods/
+*.7z
+# Pipeline seed: generator inputs only (register values, shader blob hashes), no game data
+!resources/pipeline_seed.bin

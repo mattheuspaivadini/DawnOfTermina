@@ -21,6 +21,7 @@
 #include <filesystem>
 
 #include "core/config.h"
+#include "core/types.h"
 
 namespace gfx::vulkan {
 class Context;
@@ -44,6 +45,8 @@ bool handle_event(const SDL_Event& e);
 // resolution change destroys the renderer's screen images).
 void frame();
 bool visible();
+// One frame of the start-up screen: pipelines from earlier runs being created (`done` of `total`).
+void loading(const char* what, u32 done, u32 total);
 
 // No valid v1.1 game data: a window that requires the user's Majora's Mask 3D base .cia and
 // its v1.1 update .cia, which `script` (tools/extract_cia.py) checks (title IDs, region,
@@ -51,6 +54,7 @@ bool visible();
 // command line); `start` begins at once. Returns false if the player closed the window.
 struct SetupFiles {
     std::filesystem::path base, update;
+    std::filesystem::path seed;  // pipeline_seed.bin: compiled right after the extraction
     bool start = false;
 };
 bool run_setup(const std::filesystem::path& target, const std::filesystem::path& script, SetupFiles files);

@@ -72,7 +72,11 @@ cmake --build build
 cmake --install build --prefix dist
 ```
 
-Gera `dist/dawnoftermina` com `dist/tools/extract_cia.py` ao lado. Aberto sem um `game_data/` v1.1, ele pede o jogo base e o update v1.1 (`.cia`) e extrai para `dist/game_data` (precisa de `python3`); configurações, saves e caches também ficam em `dist/`. O executável contém o código do jogo recompilado da **sua** cópia: é para uso pessoal, não distribua.
+Gera `dist/dawnoftermina` com `dist/tools/extract_cia.py`, `dist/shaders/*.spv` e `dist/pipeline_seed.bin` ao lado. Aberto sem um `game_data/` v1.1, ele pede o jogo base e o update v1.1 (`.cia`) e extrai para `dist/game_data` (precisa de `python3`); configurações, saves e caches também ficam em `dist/`.
+
+**Build recomendado (Project Restoration + HD HUD + DekUI):** compile contra uma extração com `--restoration mm3d_project_restoration_plus_hd_hud_v1.5.9-5-g8bb2a7b.7z --romfs mm3d_big_screen_layout_779512b.7z` (ou `--download-mods`, que baixa os dois das páginas oficiais e confere o SHA-256). O launcher desse build faz o mesmo sozinho: depois dos dois `.cia`, **baixa e aplica os dois pacotes** (~0,7 MB), então o jogo abre já com o Restoration, o HUD HD e a interface de tela única do DekUI, mesmo na primeira vez.
+
+**Shaders e pipelines compilados antes de o jogo abrir:** logo depois da extração, ainda na janela do launcher (barra de progresso), todos os pipelines de `pipeline_seed.bin` são gerados a partir dos `.shbin` do **seu** RomFS, compilados para SPIR-V e criados no Vulkan em várias threads; os caches (`cache/spirv_cache.bin`, `cache/pipeline_cache.bin`, `cache/pipeline_manifest.bin`) ficam prontos. Ao abrir, o jogo cria todos os pipelines conhecidos antes de iniciar a thread do guest; o terminal registra qualquer shader/pipeline que ainda compile durante o jogo (`... compiled on demand`), e ele entra no manifesto para a próxima vez. A semente guarda só parâmetros (registradores do TEV/blend/depth, hash do bloco de código do `.shbin`, entrada, uniforms bool/int): nenhum shader ou asset do jogo. O executável contém o código do jogo recompilado da **sua** cópia: é para uso pessoal, não distribua.
 
 ### Configuração e controles
 
@@ -136,7 +140,8 @@ Cada função transcrita mantém o endereço virtual original em comentário (`/
 | 5E | Experiência de PC: `config.toml`, menu ImGui (F1), tela única N64/tela única/dupla, câmera no mouse (C-stick), atalhos de toque | ✅ |
 | 13 | Savestates: F5 salva, F9 carrega (`states/slot1.state`), `DOT_LOAD_STATE=<arquivo>` no boot | ✅ |
 | 14 | Tela única: toda a interface da tela de toque na tela de cima (porte do DekUI, build HD HUD) | 🟡 |
-| 15+ | Subsistemas do jogo (cenas, loop, colisão, atores, HUD) | ⏳ |
+| 15 | Shaders fixos em SPIR-V no build; semente de pipelines compilada no launcher (após a extração) e pipelines criados antes da thread do guest; Restoration + HD HUD + DekUI baixados e aplicados pelo launcher | ✅ |
+| 16+ | Subsistemas do jogo (cenas, loop, colisão, atores, HUD) | ⏳ |
 
 ## Contribuindo
 
@@ -144,7 +149,7 @@ O desenvolvimento acontece na branch `dev` (ou em branches derivadas dela). Nada
 
 ## Créditos
 
-- **[Project Restoration](https://restoration.zora.re/)** ([código](https://github.com/leoetlino/project-restoration)), de **leoetlino** e colaboradores (GPL-2.0): o mod de jogabilidade que o extrator aplica com `--restoration` a partir do pacote oficial fornecido pelo usuário. Nenhum arquivo do mod é distribuído aqui.
+- **[Project Restoration](https://restoration.zora.re/)** ([código](https://github.com/leoetlino/project-restoration)), de **leoetlino** e colaboradores (GPL-2.0): o mod de jogabilidade que o extrator aplica com `--restoration` a partir do pacote oficial (fornecido pelo usuário ou baixado pelo launcher/`--download-mods` da página de releases, com SHA-256 fixo). Nenhum arquivo do mod é distribuído aqui.
 - **[DekUI](https://gamebanana.com/mods/723825)** ([código](https://github.com/tgacquin/mm3d-dekui)), de **Thomas (tgacquin)** e dos *MM3D presentation contributors*, sobre o Azahar e o Project Restoration: toda a interface de tela única (headers do DekUI copiados sem modificação em `src/dekui/`, cola em `src/recomp/dekui.cpp`, padrões de `resources/dekui/presentation.json` lidos por uma transcrição do `Settings::Load` dele em `src/recomp/dekui_settings.cpp`), correção do fundo da pausa (PC do `PauseCapture`), base da interpolação de câmera do modo 60 FPS (ponto médio rígido por quaternion e detecção de cortes, `src/gfx/camera_midpoint.h`) e do FOV ajustável (hook em `0x18D570`/`0x18D584`, `src/recomp/hooks.cpp`). Trechos portados do código GPL-2.0-or-later do DekUI, com atribuição nos arquivos.
 - **[Citra](https://github.com/citra-emu/citra) / [Azahar](https://github.com/azahar-emu/azahar)** e **[3dbrew](https://www.3dbrew.org/)**: referência para o PICA200, o DSP e os serviços do Horizon.
 

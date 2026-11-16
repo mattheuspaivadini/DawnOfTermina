@@ -47,6 +47,7 @@
 0x0018d570 fov_projection insn  # vldr s0, [r4, #0x18]: camera FOV when building the projection (DekUI)
 0x0018d584 fov_projection insn  # same, second branch of the function
 0x00120648 pause_capture_sync insn  # add r0, r7, r8, lsl #2: the CPU reads the top framebuffer for the pause backdrop
+0x0014f70c play_context insn  # mov r0, r4 before bl 0x15F644 (play update): r4 = the Play object (DOT_TOUR)
 
 # Project Restoration 1.5.9 + HD HUD (mm3d_project_restoration_plus_hd_hud_v1.5.9-5-g8bb2a7b, the
 # build DekUI uses; every v100/v101/v110 variant yields this code.bin): same addresses.
@@ -66,6 +67,7 @@
 0x0018d570 fov_projection insn  # vldr s0, [r4, #0x18]: camera FOV when building the projection (DekUI)
 0x0018d584 fov_projection insn  # same, second branch of the function
 0x00120648 pause_capture_sync insn  # add r0, r7, r8, lsl #2: the CPU reads the top framebuffer for the pause backdrop
+0x0014f70c play_context insn  # mov r0, r4 before bl 0x15F644 (play update): r4 = the Play object (DOT_TOUR)
 # DekUI's single-screen interface (src/recomp/dekui.cpp): the instructions DekUI swaps for SVCs
 # (MemoryReadCode chain of its arm_dynarmic.cpp), checked by each module's CodeMatches at runtime;
 # tools/dekui_coverage.py lists what is still missing. Targets: local labels the hook may continue

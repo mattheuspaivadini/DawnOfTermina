@@ -149,6 +149,8 @@ int main(int argc, char** argv) {
         // given on the command line or picked there (offering ones found in ISO/).
         if (!SDL_Init(SDL_INIT_VIDEO)) return fatal(std::string("SDL_Init: ") + SDL_GetError());
         setup.start = !setup.base.empty() && !setup.update.empty();
+        // Installed next to the executable (dist/), or resources/ of a checkout (build/..).
+        setup.seed = fs::exists(root / "pipeline_seed.bin") ? root / "pipeline_seed.bin" : root / "resources" / "pipeline_seed.bin";
         std::error_code ec;
         for (const fs::path& dir : {root / "ISO", root, fs::current_path() / "ISO"})
             for (const auto& f : fs::directory_iterator(dir, ec)) {
@@ -202,9 +204,6 @@ int main(int argc, char** argv) {
     const u8 main_priority = read_main_priority(data);
     std::printf("boot: running recompiled code (%u functions), main thread priority 0x%02X\n",
                 recomp::kFunctionCount, main_priority);
-    // DOT_LOAD_STATE=<file>: the main thread loads it at its first syscall.
-    if (const char* st = std::getenv("DOT_LOAD_STATE")) hle::kernel::request_load(st);
-    hle::kernel::start_main_thread(code->text.addr, core::Memory::STACK_TOP, main_priority);
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD) || !hle::hid::Initialize()) {
         return fatal(std::string("SDL_Init: ") + SDL_GetError());
     }
@@ -224,10 +223,29 @@ int main(int argc, char** argv) {
         gfx::vulkan::Renderer renderer(gpu);
         if (!renderer.init(std::filesystem::absolute(data).parent_path() / "cache"))
             return fatal("Renderer initialisation failed (see the terminal output).");
+        renderer.load_shader_blobs(data / "romfs");  // new pipelines go into cache/pipeline_seed.bin
         hle::service::gsp::set_renderer(&renderer);
         ui::set_renderer(&renderer, &mem);
         const std::vector<u32> top(gfx::vulkan::TOP_W * gfx::vulkan::SCREEN_H, 0xFF402010);
         const std::vector<u32> bottom = icon_screen(data / "exefs" / "icon.bin");
+        {  // every pipeline earlier runs needed, created before the guest thread exists
+            std::atomic<u32> done{0}, total{0};
+            std::atomic<bool> warming{true};
+            std::thread warm([&] { renderer.warm(done, total), warming = false; });
+            bool quit = false;
+            while (warming) {
+                for (SDL_Event e; SDL_PollEvent(&e);) quit |= e.type == SDL_EVENT_QUIT;
+                ui::loading("Creating shaders and pipelines recorded by earlier runs...", done, total);
+                gpu.present({gfx::vulkan::TOP_W, gfx::vulkan::SCREEN_H, top.data()},
+                            {gfx::vulkan::BOTTOM_W, gfx::vulkan::SCREEN_H, bottom.data()});
+            }
+            warm.join();
+            gpu.set_overlay(nullptr);
+            if (quit) std::_Exit(0);
+        }
+        // DOT_LOAD_STATE=<file>: the main thread loads it at its first syscall.
+        if (const char* st = std::getenv("DOT_LOAD_STATE")) hle::kernel::request_load(st);
+        hle::kernel::start_main_thread(code->text.addr, core::Memory::STACK_TOP, main_priority);
         std::vector<u32> game_top, game_bottom;
 
         // Until the game loop is transcribed (stage 5), pump input, log pad changes and
@@ -276,6 +294,31 @@ int main(int argc, char** argv) {
             // cutscenes and menus). The HUD pieces are hidden otherwise.
             gfx::g_hud_visible = mem.read<u16>(code->data.addr + 0x42300) == 0 && !dekui;
             ui::frame();  // before fetching the screens: a resolution change destroys their images
+            // DOT_TOUR=<start s>,<s per scene>,<first>,<last>: from guest second <start>, warps to entrance
+            // group <first>..<last> (entrance = group << 9), one per period, to record every scene's
+            // pipelines into the seed (pipeline_seed.bin). Play object from the play_context hook
+            // (Restoration/v1.0 layout builds); a scene change is the same writes as 0x1BFF3C.
+            // shortcut: written from the host thread while the guest runs (a test tool, like the gdb warp).
+            if (static const char* tour = std::getenv("DOT_TOUR"); tour) {
+                static double start = 0, period = 15;
+                static int first = 0, last = 0x6D, next = -1;
+                if (next < 0) std::sscanf(tour, "%lf,%lf,%i,%i", &start, &period, &first, &last), next = first;
+                const double t = double(hle::service::gsp::stats().vblanks) / 59.83;
+                if (next <= last && t >= start + (next - first) * period) {
+                    const u32 play = recomp::hooks::play();
+                    if (play) {
+                        const u16 entrance = u16(next << 9);
+                        mem.write<u16>(play + 0xC52E, entrance);
+                        mem.write<u8>(play + 0xC529, 0x14);
+                        mem.write<u8>(play + 0xC534, 3);
+                        mem.write<u8>(play + 0xC535, 0);
+                        std::printf("tour: t=%.0f s, entrance group 0x%02X (entrance 0x%04X)\n", t, next, entrance);
+                        std::fflush(stdout);
+                    }
+                    ++next;
+                }
+                if (next > last && t >= start + (last - first + 1) * period) running = false;  // done: caches saved on exit
+            }
             // DOT_SAVE_STATE_AT=<guest seconds> (DOT_INPUT's clock): one automatic save to states/slot1.state.
             if (static const char* at = std::getenv("DOT_SAVE_STATE_AT"); at) {
                 static bool saved = false;

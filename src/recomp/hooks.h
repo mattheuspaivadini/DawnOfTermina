@@ -51,6 +51,8 @@ extern std::atomic<float> fov, cutscene_fov;
 void fov_projection(Context* c);
 
 void pause_capture_sync(Context* c);
+void play_context(Context* c);
+u32 play();  // the Play object (GlobalContext) of the last play update, 0 before any (v1.0 layout builds)
 
 // DekUI's single-screen interface (src/recomp/dekui.cpp): each hook replaces one instruction DekUI
 // swaps for an SVC and does what DekUI's handler does. Those returning u32 return 0 (fall through)

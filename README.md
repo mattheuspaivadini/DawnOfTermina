@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="DOT_Logo.png" alt="DawnOfTermina" width="480">
+</p>
+
 # DawnOfTermina
 
 Recompilação estática nativa (static recompilation / port HLE) de **The Legend of Zelda: Majora's Mask 3D** (Nintendo 3DS) para **C++20**, com renderização via **Vulkan**.

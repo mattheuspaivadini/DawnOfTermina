@@ -18,6 +18,7 @@
 
 #include "core/savestate.h"
 
+#include <atomic>
 #include <chrono>
 #include <iterator>
 #include <map>
@@ -34,8 +35,12 @@ using core::Memory;
 static u32 linear_next = Memory::LINEAR_BASE;
 static u32 committed = 0;
 static std::map<u32, MemoryInfo> regions;  // by base
+// Bumped whenever `regions` changes: QueryMemory keeps the last region it found per thread (DekUI's
+// modules check every guest read with it, thousands per frame, nearly all in the same few regions).
+static std::atomic<u32> generation{1};
 
 void AddRegion(u32 base, u32 size, u32 perm, u32 state) {
+    ++generation;
     // Merge with a directly preceding region of the same kind (heap grows in steps).
     auto it = regions.lower_bound(base);
     if (it != regions.begin()) {
@@ -50,6 +55,7 @@ void AddRegion(u32 base, u32 size, u32 perm, u32 state) {
 }
 
 static void RemoveRange(u32 base, u32 size) {
+    ++generation;
     for (auto it = regions.begin(); it != regions.end();) {
         MemoryInfo r = it->second;
         const u64 end = u64(r.base) + r.size, cut_end = u64(base) + size;
@@ -64,11 +70,15 @@ static void RemoveRange(u32 base, u32 size) {
 }
 
 MemoryInfo QueryMemory(u32 addr) {
+    thread_local MemoryInfo last{};
+    thread_local u32 last_generation = 0;
+    const u32 gen = generation.load(std::memory_order_relaxed);
+    if (last_generation == gen && addr - last.base < last.size) return last;
     auto it = regions.upper_bound(addr);
     u32 gap_start = 0;
     if (it != regions.begin()) {
         const MemoryInfo& r = std::prev(it)->second;
-        if (addr < u64(r.base) + r.size) return r;
+        if (addr < u64(r.base) + r.size) return last_generation = gen, last = r;
         gap_start = r.base + r.size;
     }
     const u32 gap_end = it == regions.end() ? 0xFFFFF000u : it->first;
@@ -81,7 +91,7 @@ void InitProcess(Memory& mem, u32 image_bytes) {
     mem.write<u32>(Memory::CONFIG_MEM + 0x48, 0x01400000);  // BASEMEMALLOC
     committed = image_bytes;
     linear_next = Memory::LINEAR_BASE;
-    regions.clear();
+    regions.clear(), ++generation;
 }
 
 u32 CommittedMemory() { return committed; }
@@ -157,11 +167,12 @@ void load_state(core::StateReader& r) {
     r.get(linear_next), r.get(committed);
     const u64 tick = r.get<u64>();
     tick_offset += tick - GetSystemTick();
-    regions.clear();
+    regions.clear(), ++generation;
     for (u64 n = r.get<u64>(); n--;) {
         const MemoryInfo info = r.get<MemoryInfo>();
         regions[info.base] = info;
     }
+    ++generation;
 }
 
 void Break(u32 reason) {

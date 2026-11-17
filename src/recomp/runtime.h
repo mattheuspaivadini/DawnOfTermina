@@ -85,7 +85,20 @@ void service_interrupt();
     } while (0)
 
 // ---- control flow
-u32 call(Context* c, u32 target);  // indirect call / tail jump through the table
+// Indirect call / tail jump through the table (set_function_table). Inline: generated code does
+// this at every computed branch. Slot (key - g_lo) / 2 holds 1 + the entry's position (0 = none).
+extern const FuncEntry* g_table;
+extern const u32* g_slots;
+extern u32 g_slot_count, g_lo;
+[[noreturn, gnu::cold]] u32 call_miss(Context* c, u32 target);
+inline u32 call(Context* c, u32 target) {
+    const u32 slot = (target - g_lo) >> 1;  // wraps to huge below g_lo
+    if (slot < g_slot_count) [[likely]] {
+        // The key check rejects an ARM/Thumb mode mismatch at a real entry address.
+        if (const u32 i = g_slots[slot]; i && g_table[i - 1].key == target) [[likely]] return g_table[i - 1].fn(c);
+    }
+    call_miss(c, target);
+}
 inline u32 jump(Context* c, u32 target) { return call(c, target); }
 // Continues a thread from `pc` (a resume point or a function entry, | 1 for Thumb) with the
 // registers in `c`: each frame returns to an address in guest state, entered the same way.

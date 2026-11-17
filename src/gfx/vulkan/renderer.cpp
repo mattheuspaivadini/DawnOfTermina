@@ -620,7 +620,17 @@ struct Renderer::Impl {
         im = {};
     }
 
+    // Consecutive draws into one framebuffer share a render pass (it used to be one pass per draw).
+    // Everything else recorded into `cmd` starts with barrier() or memory_barrier(), which close it.
+    VkFramebuffer pass_fb = VK_NULL_HANDLE;
+    void end_pass() {
+        if (!pass_fb) return;
+        vkCmdEndRenderPass(cmd);
+        pass_fb = VK_NULL_HANDLE;
+    }
+
     void barrier(VkImage img, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to) {
+        end_pass();
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -656,6 +666,7 @@ struct Renderer::Impl {
     }
 
     void submit_open() {
+        end_pass();
         recording = false;
         vkEndCommandBuffer(cmd);
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -1094,6 +1105,7 @@ struct Renderer::Impl {
     u64 ram_hash(const Memory& mem, const Surface& sf) const { return hash_ram(mem.host(sf.va), guest_bytes(sf)); }
 
     void memory_barrier() {
+        end_pass();
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -2209,11 +2221,15 @@ struct Renderer::Impl {
                 VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ii, nullptr, nullptr};
         vkUpdateDescriptorSets(dev, 3, w, 0, nullptr);
 
-        VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-        rbi.renderPass = render_pass;
-        rbi.framebuffer = fb;
-        rbi.renderArea = {{0, 0}, {cur->width * scale, cur->image_h}};
-        vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        if (pass_fb != fb) {
+            end_pass();
+            VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+            rbi.renderPass = render_pass;
+            rbi.framebuffer = fb;
+            rbi.renderArea = {{0, 0}, {cur->width * scale, cur->image_h}};
+            vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+            pass_fb = fb;
+        }
         cur->gpu_newer = true;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         const float S = float(scale);
@@ -2249,7 +2265,6 @@ struct Renderer::Impl {
             vkCmdDrawIndexed(cmd, u32(indices.size()), 1, 0, 0, 0);
         }
         stats.vertices += verts.size();
-        vkCmdEndRenderPass(cmd);
         ++stats.draws;
         if (trace_fb)
             std::fprintf(stderr, "renderer:   draw %zu vertices into %08X\n", verts.size(), cur->va);

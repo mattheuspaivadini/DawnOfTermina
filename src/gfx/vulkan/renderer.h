@@ -57,6 +57,8 @@ public:
     // game. False if the seed is missing or empty.
     bool precompile(const std::filesystem::path& seed, std::atomic<u32>& done, std::atomic<u32>& total);
 
+    // A new command list starts: the guest may have rewritten any texture since the last one.
+    void begin_list();
     void draw(core::Memory& mem, const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs,
               bool indexed);
     // Brings guest memory in [start, end) up to date with the GPU before a CPU-side GX

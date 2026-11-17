@@ -209,6 +209,7 @@ struct Renderer::Impl {
         Image image;
         u32 width = 0, height = 0;
         u64 hash = 0;
+        u64 epoch = 0;  // `Impl::epoch` when the guest memory was last hashed
         bool ready = false;
         VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     };
@@ -350,6 +351,9 @@ struct Renderer::Impl {
     VkPipelineLayout xfer_layout = VK_NULL_HANDLE;
     VkPipeline xfer_pipe = VK_NULL_HANDLE;
     Texture dummy;
+    // Guest memory cannot change while one command list runs (the guest thread is inside the GSP
+    // handler), except through readback(): a texture is hashed once per epoch, not once per draw.
+    u64 epoch = 1;
     std::map<u64, Texture> textures;  // by (va, size, format)
     std::map<u32, VkSampler> samplers;
     std::map<u64, VkShaderModule> modules;
@@ -1176,6 +1180,7 @@ struct Renderer::Impl {
             }
         }
         write_guest_color(mem, sf, px);
+        ++epoch;  // guest memory changed under any texture overlapping the surface
         sf.ram_hash = ram_hash(mem, sf);
         sf.gpu_newer = false;
         ++stats.readbacks;
@@ -1540,7 +1545,9 @@ struct Renderer::Impl {
         const u64 key = fnv(&va, 4, fnv(&w, 4, fnv(&h, 4, u64(fmt))));
         Texture& t = textures[key];
         if (replaying) return t.ready ? t : dummy;  // the real frame uploaded it a moment ago
+        if (t.ready && t.epoch == epoch) return t;
         const u64 hash = hash_words(mem.host(va), size);
+        t.epoch = epoch;
         if (t.ready && t.hash == hash) return t;
         const auto rgba = pica::decode_texture({mem.host(va), size}, w, h, fmt);
         if (static const char* dir = std::getenv("DOT_DUMP_TEX"); dir && !rgba.empty()) {
@@ -2290,6 +2297,11 @@ void Renderer::draw(core::Memory& mem, const std::array<u32, pica::reg::COUNT>& 
     const float clip = impl_->draw(mem, regs, vs, verts, indices);
     impl_->record_draw(regs, vs, indexed, std::move(verts), std::move(indices), clip);
     impl_->stats.draw_ns += u64(Impl::now_ns() - t0);
+}
+
+void Renderer::begin_list() {
+    auto lk = impl_->acquire();
+    ++impl_->epoch;
 }
 
 void Renderer::sync(core::Memory& mem, u32 start, u32 end, bool overwrite) {

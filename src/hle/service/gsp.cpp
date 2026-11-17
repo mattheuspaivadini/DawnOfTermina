@@ -222,6 +222,7 @@ void run_command(u32 cmd) {
     case 0x01: {  // SubmitGpuCommandList(address, size, flags)
         const u32 addr = w(1), size = w(2);
         if (g_trace_fb) std::fprintf(stderr, "gsp: command list %08X size %u\n", addr, size);
+        if (r) r->begin_list();
         g_pica.process({reinterpret_cast<const u32*>(g_mem->host(addr)), size / 4});
         ++g_lists;
         signal_interrupt(P3D);

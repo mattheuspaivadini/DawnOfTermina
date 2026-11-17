@@ -91,6 +91,7 @@ public:
     void drop_targets();
     void set_widescreen(float aspect);
     void set_frame_rate(u32 fps);
+    u32 frame_rate() const;  // 30, 60, 90 or 120: images per second the presenter should show
 
     struct Stats {
         u64 draws, skipped, pipelines, readbacks, shaders;  // shaders = GLSL compiled (not from the disk cache)

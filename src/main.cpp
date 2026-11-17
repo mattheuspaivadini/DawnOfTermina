@@ -388,14 +388,30 @@ int main(int argc, char** argv) {
             const u32* bottom_px = have_bottom ? game_bottom.data() : bottom.data();
             const gfx::vulkan::GpuScreen* gpu_top_ptr = gpu_top ? &gpu_screens[0] : nullptr;
             const gfx::vulkan::GpuScreen* gpu_bottom_ptr = gpu_bottom ? &gpu_screens[1] : nullptr;
-            if (!config.vsync) {  // FIFO paces the loop with vsync; without it, cap at 240 Hz
-                static auto next = std::chrono::steady_clock::now();
-                std::this_thread::sleep_until(next);
-                next = std::max(next + std::chrono::microseconds(4167), std::chrono::steady_clock::now());
+            // Presented frame rate = the selected one (30/60/90/120), with or without VSync: FIFO alone
+            // paced the loop at the monitor's rate (144 presents/s for a 60 FPS setting) and without
+            // VSync it ran at 240 Hz.
+            {
+                using namespace std::chrono;
+                static auto next = steady_clock::now();
+                static u64 seen_frames = 0;
+                const u32 fps = renderer.frame_rate();
+                const auto period = nanoseconds(1'000'000'000 / fps);
+                if (fps > 30) {  // interpolated: evenly spaced, the timeline picks the image due at each present
+                    std::this_thread::sleep_until(next);
+                } else {
+                    // 30 FPS: one present per game frame, as soon as it is latched. A fixed 30 Hz timer
+                    // drifts against the game's 29.9 frames/s and repeats a frame every few seconds.
+                    // Twice the period without a new frame (loading, menu open) presents anyway.
+                    while (hle::service::gsp::stats().frames == seen_frames && steady_clock::now() < next + period)
+                        std::this_thread::sleep_for(milliseconds(1));
+                    seen_frames = hle::service::gsp::stats().frames;
+                }
+                next = std::max(next + period, steady_clock::now());
             }
             if (!gpu.present({gfx::vulkan::TOP_W, gfx::vulkan::SCREEN_H, top_px},
                              {gfx::vulkan::BOTTOM_W, gfx::vulkan::SCREEN_H, bottom_px}, gpu_top_ptr, gpu_bottom_ptr))
-                break;  // FIFO present paces the loop to vsync
+                break;
         }
         ui::shutdown();
         ticking = false;

@@ -80,7 +80,7 @@ Gera `dist/dawnoftermina` com `dist/tools/extract_cia.py`, `dist/shaders/*.spv` 
 
 ### Configuração e controles
 
-Na primeira execução é criado um `config.toml` ao lado de `game_data/` (ignorado pelo Git) com: **1080p**, widescreen **16:9**, **tela única estilo N64** (corações, itens I/X/Y/II, Ocarina e minimapa recortados da tela de baixo para os cantos; ao abrir um menu da tela de toque — Items, Masks — a tela de baixo aparece ampliada no centro, sobre o jogo escurecido, e some ao fechar), VSync e **30 FPS**. O modo **60 FPS** (quadros intermediários interpolados; a lógica do jogo continua a 30 Hz) renderiza o dobro na GPU: ative no menu se ela tiver folga na resolução escolhida (uma Intel Iris Xe mantém 720p a 60 FPS). Tudo pode ser mudado em jogo no menu (**F1** ou **Esc**) e é salvo na hora, inclusive a resolução interna: 1080p = 4×, 720p = 3×, 240p = 1× (a escala é inteira).
+Na primeira execução é criado um `config.toml` ao lado de `game_data/` (ignorado pelo Git) com: **1080p**, widescreen **16:9**, **tela única estilo N64** (corações, itens I/X/Y/II, Ocarina e minimapa recortados da tela de baixo para os cantos; ao abrir um menu da tela de toque — Items, Masks — a tela de baixo aparece ampliada no centro, sobre o jogo escurecido, e some ao fechar), VSync e **30 FPS**. O modo **60 FPS** (quadros intermediários interpolados; a lógica do jogo continua a 30 Hz) renderiza o dobro na GPU: ative no menu se ela tiver folga na resolução escolhida (uma Intel Iris Xe mantém 720p a 60 FPS). A apresentação é limitada ao FPS escolhido, com ou sem VSync. Tudo pode ser mudado em jogo no menu (**F1** ou **Esc**) e é salvo na hora, inclusive a resolução interna: 1080p = 4×, 720p = 3×, 240p = 1× (a escala é inteira).
 
 | Tecla | Ação |
 |---|---|

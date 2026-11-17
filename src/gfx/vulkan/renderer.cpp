@@ -2432,6 +2432,7 @@ bool Renderer::read_display(u32 va, std::vector<u32>& rgba, u32& width, u32& hei
 }
 
 u32 Renderer::scale() const { return impl_->scale; }
+u32 Renderer::frame_rate() const { return impl_->samples * 30; }
 
 void Renderer::flush(core::Memory& mem) {
     auto lk = impl_->acquire();

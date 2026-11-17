@@ -26,7 +26,6 @@
 
 #include "core/config.h"
 #include "core/loader.h"
-#include "hle/fs.h"
 #include "gfx/camera_midpoint.h"
 #include "gfx/layout.h"
 #include "hle/hid.h"
@@ -56,30 +55,6 @@ static void test_memory_and_svc(Memory& mem) {
     assert(mem.read<u32>(addr + 0xFFFC) == 0);  // freed pages come back zeroed
     assert(failed(svc::ControlMemory(mem, &addr, 0x1000, 0, 0x1000, svc::MEMOP_COMMIT, 3)));
     assert(failed(svc::ControlMemory(mem, &addr, 0, 0, Memory::FCRAM_SIZE, svc::MEMOP_COMMIT | svc::MEMOP_LINEAR, 3)));
-
-    const u64 t0 = svc::GetSystemTick();
-    svc::SleepThread(2'000'000);
-    assert(svc::GetSystemTick() - t0 >= 268111856ull / 1000);  // >= 1 ms of ticks
-}
-
-static void test_fs() {
-    const stdfs::path root = stdfs::temp_directory_path() / "dot_selftest_romfs";
-    stdfs::create_directories(root / "actors");
-    std::ofstream(root / "actors" / "a.bin", std::ios::binary) << "HELLO";
-    assert(hle::fs::MountRom(root));
-
-    Handle h = 0;
-    assert(hle::fs::OpenFile(&h, "rom:/actors/a.bin") == RESULT_OK);
-    u64 size = 0;
-    assert(hle::fs::GetSize(h, &size) == RESULT_OK && size == 5);
-    char buf[8] = {};
-    u32 n = 0;
-    assert(hle::fs::Read(h, 1, buf, 8, &n) == RESULT_OK && n == 4 && std::string_view(buf, 4) == "ELLO");
-    assert(hle::fs::Close(h) == RESULT_OK);
-    assert(hle::fs::Close(h) == hle::fs::ERR_INVALID_HANDLE);
-    assert(hle::fs::OpenFile(&h, "rom:/missing") == hle::fs::ERR_NOT_FOUND);
-    assert(hle::fs::OpenFile(&h, "rom:/../etc/passwd") == hle::fs::ERR_INVALID_PATH);
-    stdfs::remove_all(root);
 }
 
 static void test_hid() {
@@ -214,7 +189,6 @@ void test_audio();                     // tests/audio_test.cpp
 int main(int argc, char** argv) {
     Memory mem;
     test_memory_and_svc(mem);
-    test_fs();
     test_hid();
     test_camera();
     test_dekui_presentation();

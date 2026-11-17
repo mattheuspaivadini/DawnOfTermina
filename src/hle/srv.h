@@ -20,7 +20,7 @@
 
 #include "core/types.h"
 
-// nn::srv — service manager. Services are HLE'd as direct C++ calls (see hle/fs.h,
+// nn::srv — service manager. Services are HLE'd as direct C++ calls (see
 // hle/hid.h, hle/dsp.h), so a handle here only lets transcribed code keep its
 // "get handle, check result" flow intact.
 namespace hle::srv {

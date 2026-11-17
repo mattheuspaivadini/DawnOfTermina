@@ -35,7 +35,6 @@ add_library(dot_runtime STATIC
     src/core/config.cpp
     src/hle/svc.cpp
     src/hle/srv.cpp
-    src/hle/fs.cpp
     src/hle/hid.cpp
     src/hle/dsp.cpp
     src/gfx/pica/texture.cpp

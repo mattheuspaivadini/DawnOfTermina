@@ -24,7 +24,6 @@
 #include <map>
 #include <cstdio>
 #include <cstdlib>
-#include <thread>
 
 namespace hle::svc {
 
@@ -129,8 +128,6 @@ Result ControlMemory(Memory& mem, u32* out_addr, u32 addr0, u32 /*addr1*/, u32 s
     }
 }
 
-void ExitProcess() { std::exit(0); }
-
 double TimeScale() {
     static const double scale = [] {
         const char* s = std::getenv("DOT_SPEED");
@@ -138,11 +135,6 @@ double TimeScale() {
         return v > 0 ? v : 1.0;
     }();
     return scale;
-}
-
-void SleepThread(s64 ns) {
-    if (ns > 0) std::this_thread::sleep_for(std::chrono::nanoseconds(s64(ns / TimeScale())));
-    else std::this_thread::yield();
 }
 
 static u64 tick_offset = 0;  // set by load_state

@@ -36,7 +36,6 @@
 #include "gfx/vulkan/renderer.h"
 #include "gfx/layout.h"
 #include "hle/dsp.h"
-#include "hle/fs.h"
 #include "hle/hid.h"
 #include "hle/srv.h"
 #include "hle/kernel.h"
@@ -177,7 +176,7 @@ int main(int argc, char** argv) {
 
     core::Memory mem;
     auto code = core::load_code(mem, data);
-    if (!code || !hle::fs::MountRom(data / "romfs")) {
+    if (!code || !std::filesystem::is_directory(data / "romfs")) {
         return fatal("game_data not found or incomplete at '" + data.string() + "'. Run tools/extract_cia.py first.");
     }
     std::printf("loaded .text %#x+%#x .rodata %#x+%#x .data %#x+%#x .bss %#x, entry %#x\n",
@@ -248,8 +247,6 @@ int main(int argc, char** argv) {
         hle::kernel::start_main_thread(code->text.addr, core::Memory::STACK_TOP, main_priority);
         std::vector<u32> game_top, game_bottom;
 
-        // Until the game loop is transcribed (stage 5), pump input, log pad changes and
-        // present placeholder screens.
         bool reported = false;
         // Periodic guest work (VBlank, HID sampling) is due on its own clock, not the display's:
         // an idle guest only advances through host_tick, and DOT_SPEED needs it above 60 Hz.
@@ -278,9 +275,6 @@ int main(int argc, char** argv) {
                 if (std::getenv("DOT_EXIT_ON_STOP")) running = false;
             }
             hle::hid::Update();
-            auto pad = hle::hid::ReadPad();
-            if (pad.trigger || pad.release)
-                std::printf("pad hold=%08x stick=(%d,%d)\n", pad.hold, pad.stick_x, pad.stick_y);
             // N64 layout: bit 0 of 0x6A3A18 (v1.0) = the world is paused, written each frame by the
             // play loop (0x15F644) from the touch-screen menu state; set with the Items/Masks menus,
             // clear through boot, title and cutscenes (savestate diffs + trace). Same .data offset in

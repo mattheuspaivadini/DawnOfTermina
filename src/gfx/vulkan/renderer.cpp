@@ -273,6 +273,7 @@ struct Renderer::Impl {
         // The replay reads no guest memory (it runs beside the guest, see `job`): the draw's
         // fetched vertices and widescreen clip factor, a fill's colour (a[2], RGBA8).
         std::vector<pica::VertexInput> verts;
+        std::vector<u16> indices;  // into verts; empty = drawn in order
         float clip = 1.0f;
     };
     bool interpolate = false, replaying = false;
@@ -628,6 +629,8 @@ struct Renderer::Impl {
     }
 
     static constexpr u32 MAX_BATCH_DRAWS = 1024;
+    // vbuf holds each draw's vertices and, for indexed draws, its u16 indices right after them.
+    static constexpr VkBufferUsageFlags VBUF_USAGE = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
 
     static VkDeviceSize align(VkDeviceSize v) { return (v + 255) & ~VkDeviceSize(255); }  // >= any offset alignment
 
@@ -929,7 +932,7 @@ struct Renderer::Impl {
 
         // Vertices go as 16 vec4 attributes (256 bytes each): 8 MB filled ~10 times per frame at
         // 60 FPS (the replay doubles it), and every fill cost a submit.
-        ensure(vbuf, 64 << 20, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        ensure(vbuf, 64 << 20, VBUF_USAGE);
         ensure(ubuf, MAX_BATCH_DRAWS * align(UBO_SIZE), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
         ensure(lbuf, 64 * align(LIGHT_BUF_SIZE), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         ensure(xfer, 16 << 20, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -939,7 +942,7 @@ struct Renderer::Impl {
             vkAllocateCommandBuffers(dev, &cai, &sl.cmd);
             vkCreateFence(dev, &fci, nullptr, &sl.fence);
             vkCreateDescriptorPool(dev, &dpi, nullptr, &sl.desc_pool);
-            ensure(sl.vbuf, vbuf.size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+            ensure(sl.vbuf, vbuf.size, VBUF_USAGE);
             ensure(sl.ubuf, ubuf.size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
             ensure(sl.lbuf, lbuf.size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             ensure(sl.xfer, xfer.size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -1701,11 +1704,11 @@ struct Renderer::Impl {
     }
 
     void record_draw(const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs, bool indexed,
-                     std::vector<pica::VertexInput>&& verts, float clip) {
+                     std::vector<pica::VertexInput>&& verts, std::vector<u16>&& indices, float clip) {
         if (!interpolate || replaying) return;
         if (!last_vs || std::memcmp(last_vs.get(), &vs, sizeof vs)) last_vs = std::make_shared<pica::ShaderState>(vs);
         Op op{Op::Draw};
-        op.indexed = indexed, op.regs = regs, op.vs = last_vs, op.verts = std::move(verts), op.clip = clip;
+        op.indexed = indexed, op.regs = regs, op.vs = last_vs, op.verts = std::move(verts), op.indices = std::move(indices), op.clip = clip;
         // What is drawn: program entry, attribute buffers, index buffer and count, texture 0.
         const u32 what[] = {regs[VS_ENTRY] & 0xFFFF, regs[0x200], regs[0x203], regs[0x227], regs[0x228], regs[0x085],
                             regs[COLOR_ADDR]};
@@ -1948,7 +1951,7 @@ struct Renderer::Impl {
                             for (const UvFix& f : uv[n])
                                 (&vs.float_uniforms[0].x)[f.comp] = f.step ? (t < 0.5f ? f.a : f.a + f.d) : f.a + t * f.d;
                         }
-                        draw(*job_mem, op.regs, vs, op.verts, op.clip);
+                        draw(*job_mem, op.regs, vs, op.verts, op.indices, op.clip);
                         break;
                     }
                     case Op::Fill:
@@ -2010,7 +2013,7 @@ struct Renderer::Impl {
     // draws spanning the full width (fades, full-screen composites) stay stretched to the edges.
     // Projection is told apart by running the vertex program on the CPU for a few vertices.
     float widescreen_clip(const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs,
-                          const std::vector<pica::VertexInput>& verts) {
+                          const std::vector<pica::VertexInput>& verts, const std::vector<u16>& indices) {
         if (cur->image_h == cur->height * scale) return 1.0f;
         const float vh = f24_to_f32(regs[VIEWPORT_H] & 0xFFFFFF) * 2;
         if ((regs[VIEWPORT_XY] >> 16 & 0x3FF) != 0 || std::lround(vh) != long(cur->height)) return 1.0f;
@@ -2018,7 +2021,7 @@ struct Renderer::Impl {
         const u32 entry = regs[VS_ENTRY] & 0xFFFF;
         auto clip_yw = [&](size_t n, float& y, float& w) {
             pica::Vec4 out[16];
-            pica::run_vertex_shader(vs, entry, verts[n].v, out);
+            pica::run_vertex_shader(vs, entry, verts[indices.empty() ? n : indices[n]].v, out);
             y = 0, w = 1;
             for (u32 reg = 0; reg < 7; ++reg)
                 for (u32 c = 0; c < 4; ++c) {
@@ -2028,13 +2031,14 @@ struct Renderer::Impl {
                 }
         };
         float y, w;
-        for (size_t n = 0; n < std::min<size_t>(3, verts.size()); ++n) {
+        const size_t count = indices.empty() ? verts.size() : indices.size();  // vertices in draw order
+        for (size_t n = 0; n < std::min<size_t>(3, count); ++n) {
             clip_yw(n, y, w);
             if (std::fabs(w - 1.0f) > 1e-3f) return squeeze;  // perspective
         }
-        if (verts.size() > 64) return squeeze;  // orthographic geometry, not a screen quad
+        if (count > 64) return squeeze;  // orthographic geometry, not a screen quad
         float lo = 1e9f, hi = -1e9f;
-        for (size_t n = 0; n < verts.size(); ++n) {
+        for (size_t n = 0; n < count; ++n) {
             clip_yw(n, y, w);
             lo = std::min(lo, y / w), hi = std::max(hi, y / w);
         }
@@ -2043,7 +2047,7 @@ struct Renderer::Impl {
 
     // Returns the widescreen clip factor; `clip` < 0 computes it (replays pass the real draw's).
     float draw(Memory& mem, const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs,
-               const std::vector<pica::VertexInput>& verts, float clip = -1.0f) {
+               const std::vector<pica::VertexInput>& verts, const std::vector<u16>& indices, float clip = -1.0f) {
         auto skip = [&](const char* why) {
             static std::map<std::string, bool> seen;
             if (!seen[why]) std::fprintf(stderr, "renderer: skipping draws: %s\n", why), seen[why] = true;
@@ -2132,17 +2136,20 @@ struct Renderer::Impl {
                 const u32 dim = regs[TEX_REGS[i][0]];
                 xbytes += align(VkDeviceSize(dim & 0x7FF) * (dim >> 16 & 0x7FF) * 4);
             }
-        if (batch_draws == MAX_BATCH_DRAWS || vb_used + align(vbytes) > vbuf.size ||
+        const VkDeviceSize ibytes = indices.size() * sizeof(u16);
+        if (batch_draws == MAX_BATCH_DRAWS || vb_used + align(vbytes) + align(ibytes) > vbuf.size ||
             ub_used + align(UBO_SIZE) > ubuf.size || lb_used + align(LIGHT_BUF_SIZE) > lbuf.size ||
             x_used + xbytes > xfer.size)
             submit();
-        ensure(vbuf, vbytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);  // grows only right after a submit
+        ensure(vbuf, align(vbytes) + align(ibytes), VBUF_USAGE);  // grows only right after a submit
         ensure(xfer, xbytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         ++batch_draws;
 
         // Vertex data and uniforms.
         const VkDeviceSize voff = take(vb_used, vbytes), uoff = take(ub_used, UBO_SIZE);
         std::memcpy(vbuf.ptr + voff, vdata, vbytes);
+        const VkDeviceSize ioff = take(vb_used, ibytes);
+        std::memcpy(vbuf.ptr + ioff, indices.data(), ibytes);
         u8* u = ubuf.ptr + uoff;
         std::memcpy(u, vs.float_uniforms.data(), 96 * 16);
         for (u32 i = 0; i < 4; ++i) {
@@ -2150,7 +2157,7 @@ struct Renderer::Impl {
             const s32 v[4] = {s32(iv & 0xFF), s32(iv >> 8 & 0xFF), s32(s8(iv >> 16)), 0};
             std::memcpy(u + 1536 + i * 16, v, 16);
         }
-        if (clip < 0) clip = widescreen_clip(regs, vs, verts);
+        if (clip < 0) clip = widescreen_clip(regs, vs, verts, indices);
         const float depth[4] = {f24_to_f32(regs[DEPTH_SCALE] & 0xFFFFFF), f24_to_f32(regs[DEPTH_OFFSET] & 0xFFFFFF), clip, 0};
         std::memcpy(u + 1600, depth, 16);
         const u32 bools = vs.bool_uniforms;
@@ -2228,7 +2235,12 @@ struct Renderer::Impl {
         vkCmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof push, push.data());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 2, sets, 0, nullptr);
         vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf.buf, &voff);
-        vkCmdDraw(cmd, u32(verts.size()), 1, 0, 0);
+        if (indices.empty()) {
+            vkCmdDraw(cmd, u32(verts.size()), 1, 0, 0);
+        } else {
+            vkCmdBindIndexBuffer(cmd, vbuf.buf, ioff, VK_INDEX_TYPE_UINT16);
+            vkCmdDrawIndexed(cmd, u32(indices.size()), 1, 0, 0, 0);
+        }
         stats.vertices += verts.size();
         vkCmdEndRenderPass(cmd);
         ++stats.draws;
@@ -2273,9 +2285,10 @@ void Renderer::draw(core::Memory& mem, const std::array<u32, pica::reg::COUNT>& 
     auto lk = impl_->acquire();
     const s64 t0 = Impl::now_ns();
     std::vector<pica::VertexInput> verts;
-    if (!pica::load_vertices(mem, regs, vs, indexed, verts)) verts.clear();
-    const float clip = impl_->draw(mem, regs, vs, verts);
-    impl_->record_draw(regs, vs, indexed, std::move(verts), clip);
+    std::vector<u16> indices;
+    if (!pica::load_vertices(mem, regs, vs, indexed, verts, indices)) verts.clear(), indices.clear();
+    const float clip = impl_->draw(mem, regs, vs, verts, indices);
+    impl_->record_draw(regs, vs, indexed, std::move(verts), std::move(indices), clip);
     impl_->stats.draw_ns += u64(Impl::now_ns() - t0);
 }
 

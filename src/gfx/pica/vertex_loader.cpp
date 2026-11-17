@@ -16,6 +16,7 @@
 
 #include "gfx/pica/vertex_loader.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -33,8 +34,9 @@ u32 element_size(u32 type) { return type == 3 ? 4 : type == 2 ? 2 : 1; }  // flo
 }  // namespace
 
 bool load_vertices(const core::Memory& mem, const std::array<u32, reg::COUNT>& regs, const ShaderState& vs,
-                   bool indexed, std::vector<VertexInput>& out) {
+                   bool indexed, std::vector<VertexInput>& out, std::vector<u16>& indices) {
     out.clear();
+    std::vector<u32> expand;
     // Offsets are physical: the base is often the start of VRAM with offsets reaching FCRAM.
     const u32 base_pa = regs[ATTRIB_BASE] << 3;
     const u32 base = core::Memory::pa_to_va(base_pa);
@@ -79,33 +81,68 @@ bool load_vertices(const core::Memory& mem, const std::array<u32, reg::COUNT>& r
         std::fprintf(stderr, "draw: base %08X (va %08X) fmt %08X %08X index %08X count %u first %u indexed %d\n",
                      base_pa, base, regs[ATTRIB_FORMAT_LO], regs[ATTRIB_FORMAT_HI], index_info, count,
                      regs[FIRST_VERTEX], indexed);
-    out.resize(count);
-    for (u32 i = 0; i < count; ++i) {
-        u32 vertex;
-        if (indexed) vertex = index16 ? mem.read<u16>(index_va + i * 2) : mem.read<u8>(index_va + i);
-        else vertex = regs[FIRST_VERTEX] + i;
+    // Indexed draws keep their index buffer when the referenced vertex range is no longer than the
+    // index list (meshes reuse vertices ~2.3x: measured 48.6 M indices over 21.5 M vertices): only
+    // [lo, hi] is fetched and the draw is indexed. Otherwise one vertex per index, as before.
+    u32 first = regs[FIRST_VERTEX], nverts = count;
+    indices.clear();
+    if (indexed && count) {
+        std::vector<u32> raw(count);
+        u32 lo = ~0u, hi = 0;
+        for (u32 i = 0; i < count; ++i) {
+            raw[i] = index16 ? mem.read<u16>(index_va + i * 2) : mem.read<u8>(index_va + i);
+            lo = std::min(lo, raw[i]), hi = std::max(hi, raw[i]);
+        }
+        if (hi - lo < count) {
+            first = lo, nverts = hi - lo + 1;
+            indices.resize(count);
+            for (u32 i = 0; i < count; ++i) indices[i] = u16(raw[i] - lo);
+        } else {
+            first = 0;  // expanded: vertex i is raw[i]
+            expand = std::move(raw);
+        }
+    }
+
+    // Per attribute work done once: a template vertex (defaults and fixed attributes) and the list
+    // of attributes read from memory. A later attribute replaces an earlier one on the same register.
+    struct Attr {
+        u32 va, stride, type, n, reg;
+    };
+    Attr attrs[12];
+    u32 nattrs = 0;
+    VertexInput tmpl;
+    for (auto& r : tmpl.v) r = {0, 0, 0, 1};
+    for (u32 a = 0; a < attrib_count && a < 12; ++a) {
+        const u32 reg = perm >> (a * 4) & 0xF;
+        nattrs = u32(std::remove_if(attrs, attrs + nattrs, [&](const Attr& x) { return x.reg == reg; }) - attrs);
+        if (fixed_mask >> a & 1 || !loaded[a]) {
+            tmpl.v[reg] = vs.fixed_attribs[a];
+        } else {
+            tmpl.v[reg] = {0, 0, 0, 1};
+            attrs[nattrs++] = {source_va[a], stride[a], u32(formats >> (a * 4) & 3), u32(formats >> (a * 4 + 2) & 3) + 1, reg};
+        }
+    }
+    out.assign(nverts, tmpl);
+    const u8* const base_ptr = mem.host(0);
+    for (u32 i = 0; i < nverts; ++i) {
+        const u32 vertex = expand.empty() ? first + i : expand[i];
         VertexInput& vin = out[i];
-        for (auto& r : vin.v) r = {0, 0, 0, 1};
-        for (u32 a = 0; a < attrib_count && a < 12; ++a) {
-            const u32 reg = perm >> (a * 4) & 0xF;
-            Vec4 value;
-            if (fixed_mask >> a & 1 || !loaded[a]) {
-                value = vs.fixed_attribs[a];
-            } else {
-                value = {0, 0, 0, 1};
-                const u32 type = formats >> (a * 4) & 3, n = (formats >> (a * 4 + 2) & 3) + 1;
-                const u32 at = source_va[a] + vertex * stride[a];
-                float* dst = &value.x;
-                for (u32 k = 0; k < n; ++k) {
-                    switch (type) {
-                    case 0: dst[k] = float(s8(mem.read<u8>(at + k))); break;
-                    case 1: dst[k] = float(mem.read<u8>(at + k)); break;
-                    case 2: dst[k] = float(s16(mem.read<u16>(at + k * 2))); break;
-                    default: dst[k] = mem.read<float>(at + k * 4); break;
-                    }
+        for (u32 k = 0; k < nattrs; ++k) {
+            const Attr& at = attrs[k];
+            const u8* p = base_ptr + u32(at.va + vertex * at.stride);
+            float* dst = &vin.v[at.reg].x;
+            switch (at.type) {
+            case 0: for (u32 c = 0; c < at.n; ++c) dst[c] = float(s8(p[c])); break;
+            case 1: for (u32 c = 0; c < at.n; ++c) dst[c] = float(p[c]); break;
+            case 2:
+                for (u32 c = 0; c < at.n; ++c) {
+                    s16 v;
+                    std::memcpy(&v, p + c * 2, 2);
+                    dst[c] = float(v);
                 }
+                break;
+            default: std::memcpy(dst, p, at.n * 4); break;
             }
-            vin.v[reg] = value;
         }
     }
     return true;

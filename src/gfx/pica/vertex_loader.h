@@ -30,9 +30,10 @@ struct VertexInput {
 };
 
 // Fetches the vertices of the current draw (DRAW_ARRAYS / DRAW_ELEMENTS) from guest memory
-// following the attribute-buffer registers, already expanded through the index buffer.
+// following the attribute-buffer registers. `indices` empty: draw `out` in order (one vertex per
+// index for indexed draws). Else `out` is the referenced vertex range and `indices` point into it.
 // Returns false (with no vertices) for configurations not supported yet.
 bool load_vertices(const core::Memory& mem, const std::array<u32, reg::COUNT>& regs, const ShaderState& vs,
-                   bool indexed, std::vector<VertexInput>& out);
+                   bool indexed, std::vector<VertexInput>& out, std::vector<u16>& indices);
 
 }  // namespace gfx::pica

@@ -97,6 +97,8 @@ public:
         u64 camera_draws;                                   // in-between draws moved along the rigid camera path
         u64 uv_wrapped, uv_stepped;                         // in-between UV translations: shortest way round / cell switch
         u64 smooth, repeated, skipped_shots;                // top-screen presents: next image / same again / one jumped
+        // DOT_STATS: time inside draw() (real draws, vertex fetch included) and inside frame replays, vertices uploaded.
+        u64 draw_ns, replay_ns, vertices;
     };
     Stats stats() const;
 

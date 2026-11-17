@@ -74,7 +74,8 @@ bool load_vertices(const core::Memory& mem, const std::array<u32, reg::COUNT>& r
     const u32 index_va = core::Memory::pa_to_va(base_pa + (index_info & 0x0FFFFFFF));
     if (indexed && !index_va) return false;
     const bool index16 = index_info >> 31;
-    if (std::getenv("DOT_TRACE_DRAWS"))
+    static const bool trace = std::getenv("DOT_TRACE_DRAWS") != nullptr;
+    if (trace)
         std::fprintf(stderr, "draw: base %08X (va %08X) fmt %08X %08X index %08X count %u first %u indexed %d\n",
                      base_pa, base, regs[ATTRIB_FORMAT_LO], regs[ATTRIB_FORMAT_HI], index_info, count,
                      regs[FIRST_VERTEX], indexed);

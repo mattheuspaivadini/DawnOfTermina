@@ -125,6 +125,9 @@ u64 hash_words(const u8* p, size_t n) {
     return h ^ (a + (h >> 31));
 }
 
+// Diagnostics switches, read once: getenv per draw showed up in the draw path.
+const bool trace_fb = std::getenv("DOT_TRACE_FB") != nullptr, trace_draws = std::getenv("DOT_TRACE_DRAWS") != nullptr;
+
 bool check(VkResult r, const char* what) {
     if (r == VK_SUCCESS) return true;
     std::fprintf(stderr, "renderer: %s failed (VkResult %d)\n", what, int(r));
@@ -1140,7 +1143,7 @@ struct Renderer::Impl {
     // Surface -> guest memory (scaled down). Submits and waits.
     void readback(Memory& mem, Surface& sf) {
         if (!sf.gpu_newer) return;
-        if (std::getenv("DOT_TRACE_FB"))
+        if (trace_fb)
             std::fprintf(stderr, "renderer: readback %ux%u fmt %u at %08X\n", sf.width, sf.height, sf.format, sf.va);
         const VkDeviceSize bytes = VkDeviceSize(sf.width) * sf.height * 4;
         if (x_used + align(bytes) > xfer.size) submit();
@@ -1192,7 +1195,7 @@ struct Renderer::Impl {
         auto it = surfaces.find(va);
         if (it != surfaces.end() && (it->second.width != w || it->second.height != h || it->second.format != fmt ||
                                      it->second.image_h != image_h)) {
-            if (std::getenv("DOT_TRACE_FB"))
+            if (trace_fb)
                 std::fprintf(stderr, "renderer: surface %08X %ux%u fmt %u reused as %ux%u fmt %u\n", va, it->second.width,
                              it->second.height, it->second.format, w, h, fmt);
             readback(mem, it->second);  // the memory is being reused with another layout
@@ -1206,7 +1209,7 @@ struct Renderer::Impl {
         Surface& sf = surfaces[va];
         if (!sf.color.img) {
             sf.va = va, sf.width = w, sf.height = h, sf.format = fmt, sf.image_h = image_h;
-            if (std::getenv("DOT_TRACE_FB")) std::fprintf(stderr, "renderer: new surface %08X %ux%u fmt %u\n", va, w, h, fmt);
+            if (trace_fb) std::fprintf(stderr, "renderer: new surface %08X %ux%u fmt %u\n", va, w, h, fmt);
             sf.color = make_general(w * scale, image_h, VK_FORMAT_R8G8B8A8_UNORM,
                                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -1512,7 +1515,7 @@ struct Renderer::Impl {
             memory_barrier();
             return &p;
         }
-        if (std::getenv("DOT_TRACE_FB"))
+        if (trace_fb)
             for (auto& [va, sf] : surfaces)
                 if (sf.gpu_newer && va < t.va + t.size && t.va < va + guest_bytes(sf))
                     std::fprintf(stderr, "renderer: texture %ux%u fmt %u at %08X overlaps surface %ux%u fmt %u at %08X\n",
@@ -1557,7 +1560,7 @@ struct Renderer::Impl {
                 }
             }
         }
-        if (std::getenv("DOT_TRACE_DRAWS")) {
+        if (trace_draws) {
             size_t nonzero = 0;
             for (u32 px : rgba) nonzero += (px & 0xFFFFFF) != 0;
             std::fprintf(stderr, "renderer: texture unit %u %ux%u format %u at %08X: %zu non-black texels\n", unit, w,
@@ -1684,7 +1687,9 @@ struct Renderer::Impl {
     // The draw's vertex program as a GPU shader specialised on the bool/int uniforms, or null
     // when it cannot be structured (then it runs on the CPU).
     VkShaderModule vertex_shader(const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs, u32 entry) {
-        u64 key = fnv(vs.code.data(), sizeof vs.code, fnv(vs.swizzle.data(), sizeof vs.swizzle));
+        // The two big blocks by words: a byte-wise FNV over 2.5 KB per draw was ~3 us. In-memory key only.
+        u64 key = hash_words(reinterpret_cast<const u8*>(vs.code.data()), sizeof vs.code) ^
+                  hash_words(reinterpret_cast<const u8*>(vs.swizzle.data()), sizeof vs.swizzle) * 0x9E3779B97F4A7C15ull;
         key = fnv(&regs[OUTMAP], 7 * 4, fnv(vs.int_uniforms.data(), 16, fnv(&vs.bool_uniforms, 2, fnv(&entry, 4, key))));
         auto it = vertex_shaders.find(key);
         if (it != vertex_shaders.end()) return it->second;
@@ -1861,6 +1866,7 @@ struct Renderer::Impl {
     // to it, k = 1..samples-1. Reads no guest memory: the guest runs meanwhile.
     void replay_frame() {
         job = false;
+        const s64 replay_t0 = now_ns();
         // Previous draws of the same mesh/atlas (one key). Each draw takes the unused one with the
         // closest uniforms: pairing by order put a pane or NPC halfway to a sibling whenever one
         // instance appeared, hid or moved in the draw order (a "View" prompt and moved button
@@ -1961,6 +1967,7 @@ struct Renderer::Impl {
         }
         prev_ops.swap(frame_ops);
         frame_ops.clear();
+        stats.replay_ns += u64(now_ns() - replay_t0);
         // How long after its content time this frame's last shot was ready: the presenter's
         // latency must cover it. Decays slowly so one slow frame does not keep it high.
         std::lock_guard slk(shots_lock);
@@ -2222,9 +2229,10 @@ struct Renderer::Impl {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 2, sets, 0, nullptr);
         vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf.buf, &voff);
         vkCmdDraw(cmd, u32(verts.size()), 1, 0, 0);
+        stats.vertices += verts.size();
         vkCmdEndRenderPass(cmd);
         ++stats.draws;
-        if (std::getenv("DOT_TRACE_FB"))
+        if (trace_fb)
             std::fprintf(stderr, "renderer:   draw %zu vertices into %08X\n", verts.size(), cur->va);
         return clip;
     }
@@ -2260,26 +2268,20 @@ void Renderer::warm(std::atomic<u32>& done, std::atomic<u32>& total) {
     impl_->warm(done, total);
 }
 
-template <class F> static void timed(const char* what, F&& f) {
-    const auto t0 = std::chrono::steady_clock::now();
-    f();
-    const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    if (ms > 30 && std::getenv("DOT_TRACE_DRAWS")) std::fprintf(stderr, "renderer: slow %s %.0f ms\n", what, ms);
-}
-
 void Renderer::draw(core::Memory& mem, const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs,
                     bool indexed) {
     auto lk = impl_->acquire();
+    const s64 t0 = Impl::now_ns();
     std::vector<pica::VertexInput> verts;
     if (!pica::load_vertices(mem, regs, vs, indexed, verts)) verts.clear();
-    float clip = 1.0f;
-    timed("draw (total)", [&] { clip = impl_->draw(mem, regs, vs, verts); });
+    const float clip = impl_->draw(mem, regs, vs, verts);
     impl_->record_draw(regs, vs, indexed, std::move(verts), clip);
+    impl_->stats.draw_ns += u64(Impl::now_ns() - t0);
 }
 
 void Renderer::sync(core::Memory& mem, u32 start, u32 end, bool overwrite) {
     auto lk = impl_->acquire();
-    timed("sync", [&] { impl_->sync(mem, start, end, overwrite); });
+    impl_->sync(mem, start, end, overwrite);
 }
 
 void Renderer::memory_fill(core::Memory& mem, u32 start, u32 end, u32 value, u32 width_mode) {

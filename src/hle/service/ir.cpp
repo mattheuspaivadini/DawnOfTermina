@@ -94,7 +94,8 @@ void send(const std::vector<u8>& payload) {
     g_mem->write<u32>(infos + 8 * g_end, at), g_mem->write<u32>(infos + 8 * g_end + 4, u32(p.size()));
     for (size_t i = 0; i < p.size(); ++i) g_mem->write<u8>(data + (at + i) % data_size, p[i]);
     g_end = (g_end + 1) % g_packets, ++g_count;
-    if (std::getenv("DOT_TRACE_IR")) std::fprintf(stderr, "ir:USER -> %zu bytes at %u, %u queued\n", p.size(), at, g_count);
+    static const bool trace = std::getenv("DOT_TRACE_IR") != nullptr;  // once: this runs per packet
+    if (trace) std::fprintf(stderr, "ir:USER -> %zu bytes at %u, %u queued\n", p.size(), at, g_count);
     g_mem->write<u32>(g_shared + RECV_INFO, g_begin), g_mem->write<u32>(g_shared + RECV_INFO + 4, g_end);
     g_mem->write<u32>(g_shared + RECV_INFO + 8, g_count);
     if (g_events[0]) kernel::signal_event(g_events[0]);

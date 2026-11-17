@@ -344,7 +344,8 @@ int main(int argc, char** argv) {
                     const auto rs = renderer.stats();
                     std::printf("gsp: vblanks %llu, frames %llu, command lists %llu, draws %llu, fills %llu, transfers %llu | "
                                 "rendered %llu, skipped %llu, pipelines %llu, shaders %llu, readbacks %llu, interpolated %llu/%llu (camera draws %llu), "
-                                "presents smooth %llu repeated %llu skipped %llu, uv wrapped %llu stepped %llu\n",
+                                "presents smooth %llu repeated %llu skipped %llu, uv wrapped %llu stepped %llu | "
+                                "renderer draw %llu ms, replay %llu ms, vertices %llu\n",
                                 (unsigned long long)st.vblanks, (unsigned long long)st.frames, (unsigned long long)st.command_lists,
                                 (unsigned long long)st.draws, (unsigned long long)st.memory_fills,
                                 (unsigned long long)st.display_transfers, (unsigned long long)rs.draws,
@@ -354,7 +355,9 @@ int main(int argc, char** argv) {
                                 (unsigned long long)(rs.interpolated + rs.not_interpolated),
                                 (unsigned long long)rs.camera_draws, (unsigned long long)rs.smooth,
                                 (unsigned long long)rs.repeated, (unsigned long long)rs.skipped_shots,
-                                (unsigned long long)rs.uv_wrapped, (unsigned long long)rs.uv_stepped);
+                                (unsigned long long)rs.uv_wrapped, (unsigned long long)rs.uv_stepped,
+                                (unsigned long long)(rs.draw_ns / 1000000), (unsigned long long)(rs.replay_ns / 1000000),
+                                (unsigned long long)rs.vertices);
                 }
             }
             // Screens the renderer produced on the GPU are presented from there; otherwise from memory.

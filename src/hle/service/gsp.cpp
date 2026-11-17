@@ -56,6 +56,7 @@ Framebuffer g_fb[2];
 Handle g_shared = 0, g_event = 0;
 gfx::pica::CommandProcessor g_pica;
 std::atomic<gfx::vulkan::Renderer*> g_renderer{nullptr};
+const bool g_trace_fb = std::getenv("DOT_TRACE_FB") != nullptr;  // read once: checked per GX command
 std::atomic<u64> g_vblanks{0}, g_lists{0}, g_draws{0}, g_fills{0}, g_transfers{0}, g_frames{0};
 
 u32 shared_base() { return kernel::shared_memory(g_shared).addr; }
@@ -75,7 +76,7 @@ void signal_interrupt(Interrupt id) {
 
 void set_framebuffer(int screen, u32 info) {
     // FrameBufferInfo: active fb, left addr (PA), right addr, stride, format, shown fb, -
-    if (std::getenv("DOT_TRACE_FB"))
+    if (g_trace_fb)
         std::fprintf(stderr, "gsp: screen %d framebuffer pa %08X stride %u format %u\n", screen,
                      g_mem->read<u32>(info + 4), g_mem->read<u32>(info + 12), g_mem->read<u32>(info + 16));
     std::lock_guard lk(g_fb_lock);
@@ -220,14 +221,14 @@ void run_command(u32 cmd) {
         return;
     case 0x01: {  // SubmitGpuCommandList(address, size, flags)
         const u32 addr = w(1), size = w(2);
-        if (std::getenv("DOT_TRACE_FB")) std::fprintf(stderr, "gsp: command list %08X size %u\n", addr, size);
+        if (g_trace_fb) std::fprintf(stderr, "gsp: command list %08X size %u\n", addr, size);
         g_pica.process({reinterpret_cast<const u32*>(g_mem->host(addr)), size / 4});
         ++g_lists;
         signal_interrupt(P3D);
         return;
     }
     case 0x02: {  // MemoryFill(start0, value0, end0, start1, value1, end1, control0 | control1 << 16)
-        if (std::getenv("DOT_TRACE_FB"))
+        if (g_trace_fb)
             std::fprintf(stderr, "gsp: memory fill %08X-%08X = %08X, %08X-%08X = %08X\n", w(1), w(3), w(2), w(4),
                          w(6), w(5));
         for (u32 k = 0; k < 2; ++k) {
@@ -243,7 +244,7 @@ void run_command(u32 cmd) {
         return;
     }
     case 0x03:  // DisplayTransfer(in, out, in dims, out dims, flags)
-        if (std::getenv("DOT_TRACE_FB"))
+        if (g_trace_fb)
             std::fprintf(stderr, "gsp: display transfer %08X -> %08X in %08X out %08X flags %08X\n", w(1), w(2), w(3),
                          w(4), w(5));
         if (r && r->display_transfer(*g_mem, w(1), w(2), w(3), w(4), w(5))) {
@@ -260,7 +261,7 @@ void run_command(u32 cmd) {
             settle(t.out, t.out_end(), true);
             display_transfer(t.in, t.out, t.in_dim, t.out_dim, t.flags);
         }
-        if (std::getenv("DOT_TRACE_FB")) {
+        if (g_trace_fb) {
             const u32 n = (w(4) & 0xFFFF) * (w(4) >> 16) * bytes_per_pixel(w(5) >> 12 & 7);
             u32 in_nz = 0, out_nz = 0;
             for (u32 i = 0; i < n; ++i) out_nz += g_mem->read<u8>(w(2) + i) != 0;

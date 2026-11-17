@@ -353,7 +353,7 @@ struct Renderer::Impl {
     Texture dummy;
     // Guest memory cannot change while one command list runs (the guest thread is inside the GSP
     // handler), except through readback(): a texture is hashed once per epoch, not once per draw.
-    u64 epoch = 1;
+    std::atomic<u64> epoch{1};
     std::map<u64, Texture> textures;  // by (va, size, format)
     std::map<u32, VkSampler> samplers;
     std::map<u64, VkShaderModule> modules;
@@ -2314,10 +2314,9 @@ void Renderer::draw(core::Memory& mem, const std::array<u32, pica::reg::COUNT>& 
     impl_->stats.draw_ns += u64(Impl::now_ns() - t0);
 }
 
-void Renderer::begin_list() {
-    auto lk = impl_->acquire();
-    ++impl_->epoch;
-}
+// No lock: taking it here ran the pending frame replay on the guest thread (acquire()) before the
+// worker woke up, every frame.
+void Renderer::begin_list() { ++impl_->epoch; }
 
 void Renderer::sync(core::Memory& mem, u32 start, u32 end, bool overwrite) {
     auto lk = impl_->acquire();

@@ -15,7 +15,8 @@ check_update(USA, 0x0004000E00125500)
 for base, upd in ((USA, 0x0004000E00125600),   # other region
                   (USA, 0x0004000E000D6E00),   # other game
                   (USA, 0x0004008C00125500),   # DLC, not an update
-                  (0x0004000E00125500, 0x0004000E00125500)):  # update passed as base
+                  (0x0004000E00125500, 0x0004000E00125500),  # update passed as base
+                  (0x0004000000055D00, 0x0004000E00055D00)):  # another game with its own update
     try:
         check_update(base, upd)
     except ValueError:
@@ -38,10 +39,9 @@ assert select_hooks(text, "BBBB") == ("1.1", {0x300200: "aeabi_memcpy", 0x300300
                                       {0x18d570: ("fov_projection", ()), 0x5a0e88: ("nav", (0x5a0eb0, 0x5a14c0))},
                                       {0x5a5798: 0xe3a02000})
 assert select_hooks(text, "cccc") == (None, {}, {}, {})
-real = (root / "recomp" / "hooks.txt").read_text()  # the shipped table parses, v1.0 is known
-version, hooks, insns, _ = select_hooks(real, "050a58834365187ca67211eef0a29816715e9ab9f7289e8372b06fb906620580")
-assert version == "1.0" and len(hooks) == 12 and len(insns) == 3, (version, len(hooks), len(insns))
+real = (root / "recomp" / "hooks.txt").read_text()  # the shipped table: v1.1 (+ mods over it) only
+assert select_hooks(real, "050a58834365187ca67211eef0a29816715e9ab9f7289e8372b06fb906620580")[0] is None  # v1.0
 version, hooks11, _, _ = select_hooks(real, "a1d1724df4857a68df200d2543ab6c96df172738fe511f58168b77c58fe36e05")
-assert version == "1.1" and sorted(hooks11.values()) == sorted(hooks.values()), version
+assert version == "1.1" and len(hooks11) == 12, (version, len(hooks11))
 
 print("test_versions: OK")

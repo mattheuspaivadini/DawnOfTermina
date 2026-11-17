@@ -300,7 +300,8 @@ class Recompiler:
             body[a] = insn
             succ = self.successors(insn, local_only=True)
             for s in succ:
-                if s != insn.next or insn.kind == "branch":  # a branch to the next insn still needs its label
+                # a branch or jump-table case to the next insn still needs its label (0x4FDACC: case 0)
+                if s != insn.next or insn.kind == "branch" or insn.extra_targets:
                     labels.add(s)
                 stack.append(s)
         return [body[a] for a in sorted(body)], labels

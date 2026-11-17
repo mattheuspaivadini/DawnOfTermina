@@ -33,20 +33,21 @@ void service_interrupt() {
     g_interrupt.store(0, std::memory_order_relaxed);
     if (g_interrupt_handler) g_interrupt_handler();
 }
-static const FuncEntry* g_table = nullptr;
-// Direct index: slot (key - g_lo) / 2 holds 1 + the entry's position in g_table (0 = none).
+const FuncEntry* g_table = nullptr;
 // Entries are at least halfword aligned, so ARM and Thumb keys never share a slot.
-static std::vector<u32> g_slots;
-static u32 g_lo = 0;
+static std::vector<u32> g_slot_storage;
+const u32* g_slots = nullptr;
+u32 g_slot_count = 0, g_lo = 0;
 
 void set_memory(u8* guest_base) { g_base = guest_base; }
 void set_function_table(const FuncEntry* table, u32 count) {
     g_table = table;
-    g_slots.clear();
+    g_slot_storage.clear(), g_slots = nullptr, g_slot_count = 0;
     if (!count) return;
     g_lo = table[0].key & ~1u;  // sorted by key
-    g_slots.assign(((table[count - 1].key - g_lo) >> 1) + 1, 0);
-    for (u32 i = 0; i < count; ++i) g_slots[(table[i].key - g_lo) >> 1] = i + 1;
+    g_slot_storage.assign(((table[count - 1].key - g_lo) >> 1) + 1, 0);
+    for (u32 i = 0; i < count; ++i) g_slot_storage[(table[i].key - g_lo) >> 1] = i + 1;
+    g_slots = g_slot_storage.data(), g_slot_count = u32(g_slot_storage.size());
 }
 
 static const FuncEntry* g_resume = nullptr;
@@ -59,14 +60,9 @@ static std::string hex(u32 v) {
     return b;
 }
 
-u32 call(Context* c, u32 target) {
-    const u32 slot = (target - g_lo) >> 1;  // wraps to huge below g_lo
-    const u32 i = slot < g_slots.size() ? g_slots[slot] : 0;
-    // The key check rejects an ARM/Thumb mode mismatch at a real entry address.
-    if (!i || g_table[i - 1].key != target)
-        throw Trap(target, "indirect call/jump to " + hex(target) + " which is not a recompiled function entry "
-                           "(add it to tools/recomp/extra_entries.txt if it is real code); LR=" + hex(c->r[14]));
-    return g_table[i - 1].fn(c);
+u32 call_miss(Context* c, u32 target) {
+    throw Trap(target, "indirect call/jump to " + hex(target) + " which is not a recompiled function entry "
+                       "(add it to tools/recomp/extra_entries.txt if it is real code); LR=" + hex(c->r[14]));
 }
 
 void resume(Context* c, u32 pc, u32 exit_lr) {

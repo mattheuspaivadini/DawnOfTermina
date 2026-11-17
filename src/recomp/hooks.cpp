@@ -85,6 +85,15 @@ static bool scripted_camera() {
     return r32(camera + 0xA0) == game && (setting == 9 || setting == 10);
 }
 
+// mov r0, r4 at 0x14F70C (play update loop, right before bl 0x15F644): the Play object lives on the
+// heap with no global pointer, so it is captured here for the scene tour (DOT_TOUR in main.cpp).
+std::atomic<u32> g_play{0};
+void play_context(Context* c) {
+    c->r[0] = c->r[4];
+    g_play.store(c->r[4], std::memory_order_relaxed);
+}
+u32 play() { return g_play.load(std::memory_order_relaxed); }
+
 void fov_projection(Context* c) {
     const u32 projection = c->r[4];
     u32 bits = r32(projection + 0x18);

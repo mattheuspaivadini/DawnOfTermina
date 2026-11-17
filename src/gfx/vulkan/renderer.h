@@ -17,6 +17,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <vector>
@@ -46,7 +47,18 @@ public:
     ~Renderer();
     // `cache_dir` holds the on-disk shader/pipeline caches (created on first save).
     bool init(const std::filesystem::path& cache_dir);
+    // Creates every pipeline recorded in cache/pipeline_manifest.bin (all earlier runs) on several
+    // threads; call before the guest starts. `done`/`total` report progress to another thread.
+    void warm(std::atomic<u32>& done, std::atomic<u32>& total);
+    // The .shbin code blobs of the romfs: a draw's vertex program is recorded in the seed by blob.
+    void load_shader_blobs(const std::filesystem::path& romfs);
+    // Launcher, after extraction: compiles and creates every pipeline of a pipeline_seed.bin (from
+    // the repository: generator inputs only) against the romfs blobs; saves the caches for the
+    // game. False if the seed is missing or empty.
+    bool precompile(const std::filesystem::path& seed, std::atomic<u32>& done, std::atomic<u32>& total);
 
+    // A new command list starts: the guest may have rewritten any texture since the last one.
+    void begin_list();
     void draw(core::Memory& mem, const std::array<u32, pica::reg::COUNT>& regs, const pica::ShaderState& vs,
               bool indexed);
     // Brings guest memory in [start, end) up to date with the GPU before a CPU-side GX
@@ -79,13 +91,17 @@ public:
     void drop_targets();
     void set_widescreen(float aspect);
     void set_frame_rate(u32 fps);
+    u32 frame_rate() const;  // 30, 60, 90 or 120: images per second the presenter should show
 
     struct Stats {
         u64 draws, skipped, pipelines, readbacks, shaders;  // shaders = GLSL compiled (not from the disk cache)
+        u64 warmed;                                         // pipelines created by warm(); `pipelines` = on demand
         u64 interpolated, not_interpolated;                 // DOT_FPS>=60: game frames interpolated / not (cuts)
         u64 camera_draws;                                   // in-between draws moved along the rigid camera path
         u64 uv_wrapped, uv_stepped;                         // in-between UV translations: shortest way round / cell switch
         u64 smooth, repeated, skipped_shots;                // top-screen presents: next image / same again / one jumped
+        // DOT_STATS: time inside draw() (real draws, vertex fetch included) and inside frame replays, vertices uploaded.
+        u64 draw_ns, replay_ns, vertices;
     };
     Stats stats() const;
 

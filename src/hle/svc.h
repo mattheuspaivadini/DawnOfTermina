@@ -53,10 +53,6 @@ u32 CommittedMemory();
 // svc 0x01
 Result ControlMemory(core::Memory& mem, u32* out_addr, u32 addr0, u32 addr1, u32 size, u32 op,
                      u32 perm);
-// svc 0x03
-[[noreturn]] void ExitProcess();
-// svc 0x0A
-void SleepThread(s64 ns);
 // svc 0x28 — ARM11 ticks (268,111,856 Hz) since boot.
 u64 GetSystemTick();
 

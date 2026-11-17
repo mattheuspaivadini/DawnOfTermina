@@ -3,32 +3,16 @@
 # Each hook must keep the routine's AAPCS contract: arguments in r0-r3 (or s0/s1, hard-float),
 # result in r0 (or s0), return the entry LR.
 #
-# Addresses change between game versions, so hooks live in one section per code.bin:
+# DawnOfTermina runs v1.1 only (and mods applied over it, such as Project Restoration, whose
+# code.bin is back in the v1.0 layout). Hooks live in one section per code.bin:
 # [<version> <SHA-256 of game_data/exefs/code.bin>]. recomp.py hashes the extracted code.bin and
-# uses the matching section; an unknown code.bin builds without hooks (they are only a speed-up).
+# uses the matching section; another mod's code.bin builds without hooks (they are only a speed-up).
 # v1.1 addresses: each v1.0 routine matched to a single place in the v1.1 code.bin by its
 # instructions (relative branch offsets ignored; their targets agree with the neighbours below).
 #
 # `<VA> <function> insn` replaces one ARM instruction instead of a whole function (DekUI's
 # instruction substitutions): the hook gets the Context at that point and must do the replaced
 # instruction's work. Its condition is kept.
-
-[1.0 050a58834365187ca67211eef0a29816715e9ab9f7289e8372b06fb906620580]
-0x00300154 aeabi_memcpy      # RVCT __aeabi_memcpy(dst, src, n)
-0x00300144 memcpy_src_dst    # swaps r0/r1, then __aeabi_memcpy
-0x001f28e8 aeabi_memcpy4     # word-aligned variant
-0x0014c364 aeabi_memmove4    # word-aligned memmove (backward copy when overlapping)
-0x00137ed4 aeabi_memset      # __aeabi_memset(dst, n, c)
-0x0016e63c aeabi_memclr      # __aeabi_memclr(dst, n)
-0x00300338 aeabi_memclr4     # word-aligned variant
-0x003028e0 strlen
-0x00302e3c strcmp
-0x0022a3ac sinf              # hard-float: s0 -> s0
-0x0022a234 cosf
-0x001e4f78 atan2f            # atan2f(y = s0, x = s1) -> s0
-0x0018d570 fov_projection insn  # vldr s0, [r4, #0x18]: camera FOV when building the projection (DekUI)
-0x0018d584 fov_projection insn  # same, second branch of the function
-0x00120648 pause_capture_sync insn  # add r0, r7, r8, lsl #2: the CPU reads the top framebuffer for the pause backdrop
 
 [1.1 a1d1724df4857a68df200d2543ab6c96df172738fe511f58168b77c58fe36e05]
 0x0030029c aeabi_memcpy
@@ -45,9 +29,9 @@
 0x001e4f68 atan2f
 0x00120748 pause_capture_sync insn  # same, v1.1
 
-# Project Restoration 1.5.9 over v1.1 (or v1.0): the patched code.bin keeps the v1.0 layout and
-# leaves these 12 routines byte-identical, so the v1.0 addresses apply.
-[1.0+restoration-1.5.9 f3d8b649adeaef0eab43288726a824f607d301bbf5a1b48ff9873404e241be3f]
+# Project Restoration 1.5.9 over v1.1: the patched code.bin goes back to the v1.0 layout and
+# leaves these 12 routines byte-identical to v1.0, so the v1.0 addresses apply.
+[1.1+restoration-1.5.9 f3d8b649adeaef0eab43288726a824f607d301bbf5a1b48ff9873404e241be3f]
 0x00300154 aeabi_memcpy      # RVCT __aeabi_memcpy(dst, src, n)
 0x00300144 memcpy_src_dst    # swaps r0/r1, then __aeabi_memcpy
 0x001f28e8 aeabi_memcpy4     # word-aligned variant
@@ -63,10 +47,11 @@
 0x0018d570 fov_projection insn  # vldr s0, [r4, #0x18]: camera FOV when building the projection (DekUI)
 0x0018d584 fov_projection insn  # same, second branch of the function
 0x00120648 pause_capture_sync insn  # add r0, r7, r8, lsl #2: the CPU reads the top framebuffer for the pause backdrop
+0x0014f70c play_context insn  # mov r0, r4 before bl 0x15F644 (play update): r4 = the Play object (DOT_TOUR)
 
 # Project Restoration 1.5.9 + HD HUD (mm3d_project_restoration_plus_hd_hud_v1.5.9-5-g8bb2a7b, the
 # build DekUI uses; every v100/v101/v110 variant yields this code.bin): same addresses.
-[1.0+restoration-1.5.9-hd-hud dbb46a8b175b1e4df7e103cbaf188995567049c6bea8fce668b2e330eb872ef9]
+[1.1+restoration-1.5.9-hd-hud dbb46a8b175b1e4df7e103cbaf188995567049c6bea8fce668b2e330eb872ef9]
 0x00300154 aeabi_memcpy      # RVCT __aeabi_memcpy(dst, src, n)
 0x00300144 memcpy_src_dst    # swaps r0/r1, then __aeabi_memcpy
 0x001f28e8 aeabi_memcpy4     # word-aligned variant
@@ -82,6 +67,7 @@
 0x0018d570 fov_projection insn  # vldr s0, [r4, #0x18]: camera FOV when building the projection (DekUI)
 0x0018d584 fov_projection insn  # same, second branch of the function
 0x00120648 pause_capture_sync insn  # add r0, r7, r8, lsl #2: the CPU reads the top framebuffer for the pause backdrop
+0x0014f70c play_context insn  # mov r0, r4 before bl 0x15F644 (play update): r4 = the Play object (DOT_TOUR)
 # DekUI's single-screen interface (src/recomp/dekui.cpp): the instructions DekUI swaps for SVCs
 # (MemoryReadCode chain of its arm_dynarmic.cpp), checked by each module's CodeMatches at runtime;
 # tools/dekui_coverage.py lists what is still missing. Targets: local labels the hook may continue

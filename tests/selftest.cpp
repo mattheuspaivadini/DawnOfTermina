@@ -26,9 +26,6 @@
 
 #include "core/config.h"
 #include "core/loader.h"
-#include "game/crt0.h"
-#include "game/guest.h"
-#include "hle/fs.h"
 #include "gfx/camera_midpoint.h"
 #include "gfx/layout.h"
 #include "hle/hid.h"
@@ -58,30 +55,6 @@ static void test_memory_and_svc(Memory& mem) {
     assert(mem.read<u32>(addr + 0xFFFC) == 0);  // freed pages come back zeroed
     assert(failed(svc::ControlMemory(mem, &addr, 0x1000, 0, 0x1000, svc::MEMOP_COMMIT, 3)));
     assert(failed(svc::ControlMemory(mem, &addr, 0, 0, Memory::FCRAM_SIZE, svc::MEMOP_COMMIT | svc::MEMOP_LINEAR, 3)));
-
-    const u64 t0 = svc::GetSystemTick();
-    svc::SleepThread(2'000'000);
-    assert(svc::GetSystemTick() - t0 >= 268111856ull / 1000);  // >= 1 ms of ticks
-}
-
-static void test_fs() {
-    const stdfs::path root = stdfs::temp_directory_path() / "dot_selftest_romfs";
-    stdfs::create_directories(root / "actors");
-    std::ofstream(root / "actors" / "a.bin", std::ios::binary) << "HELLO";
-    assert(hle::fs::MountRom(root));
-
-    Handle h = 0;
-    assert(hle::fs::OpenFile(&h, "rom:/actors/a.bin") == RESULT_OK);
-    u64 size = 0;
-    assert(hle::fs::GetSize(h, &size) == RESULT_OK && size == 5);
-    char buf[8] = {};
-    u32 n = 0;
-    assert(hle::fs::Read(h, 1, buf, 8, &n) == RESULT_OK && n == 4 && std::string_view(buf, 4) == "ELLO");
-    assert(hle::fs::Close(h) == RESULT_OK);
-    assert(hle::fs::Close(h) == hle::fs::ERR_INVALID_HANDLE);
-    assert(hle::fs::OpenFile(&h, "rom:/missing") == hle::fs::ERR_NOT_FOUND);
-    assert(hle::fs::OpenFile(&h, "rom:/../etc/passwd") == hle::fs::ERR_INVALID_PATH);
-    stdfs::remove_all(root);
 }
 
 static void test_hid() {
@@ -160,35 +133,8 @@ static void test_loader(Memory& mem, const stdfs::path& data) {
     }
     auto cs = core::load_code(mem, data);
     assert(cs && cs->text.addr == 0x00100000);
-    assert(mem.read<u32>(cs->text.addr) == 0xEB000007);  // _start: bl __clear_bss
+    assert((mem.read<u32>(cs->text.addr) >> 25) == 0x75);  // _start: b/bl (v1.1: bl __clear_bss; mods jump to their boot)
     assert(mem.read<u32>(cs->data.addr + cs->data.size) == 0);  // .bss starts zeroed
-}
-
-// Runs the transcribed boot on a fresh address space and checks how far it gets.
-// Update the expected frontier whenever the boot advances.
-static void test_boot(const stdfs::path& data) {
-    if (!stdfs::exists(data / "exefs" / "code.bin")) return;
-    Memory mem;
-    auto cs = core::load_code(mem, data);
-    assert(cs);
-    hle::svc::InitProcess(mem, cs->image_bytes());
-    game::bind(mem);
-    u32 frontier = 0;
-    try {
-        game::crt0::_start();
-    } catch (const game::Frontier& f) {
-        frontier = f.va;
-    }
-    namespace va = game::crt0::va;
-    assert(frontier == 0x0011BECC);
-    assert(game::r32(va::CLIB_LOCALE_STATE + 4) == va::CTYPE_TABLE_C + 1);
-    assert(game::r32(va::CLIB_LOCALE_STATE + 0xC) == va::CASE_TABLE_C);
-    assert(game::r32(va::SRV_REFCOUNT) == 1);
-    const u32 heap = game::r32(va::HEAP_SIZE);
-    assert(heap > (16u << 20) && heap % Memory::PAGE == 0);
-    assert(heap + cs->image_bytes() + game::crt0::DEVICE_MEMORY_SIZE <= 0x04000000);
-    game::w32(Memory::HEAP_BASE + heap - 4, 1);  // whole heap is mapped
-    std::printf("selftest: boot frontier 0x%08X, heap %u KiB\n", frontier, heap >> 10);
 }
 
 // Interpolated camera (gfx/camera_midpoint.h): a fraction t between two yaws is t of the yaw,
@@ -243,7 +189,6 @@ void test_audio();                     // tests/audio_test.cpp
 int main(int argc, char** argv) {
     Memory mem;
     test_memory_and_svc(mem);
-    test_fs();
     test_hid();
     test_camera();
     test_dekui_presentation();
@@ -251,7 +196,6 @@ int main(int argc, char** argv) {
     test_recomp_runtime();
     test_audio();
     test_loader(mem, argc > 1 ? argv[1] : "game_data");
-    test_boot(argc > 1 ? argv[1] : "game_data");
     test_shaders(argc > 1 ? argv[1] : "game_data");
     std::puts("selftest: OK");
     return 0;

@@ -305,5 +305,5 @@ python3 tools/extract_cia.py "ISO/The Legend of Zelda Majora's Mask 3D (USA).cia
 | 13 | Savestates (F5/F9, `DOT_LOAD_STATE`) | ✅ | retomada por pontos de resume no código recompilado; ver "Savestates" |
 | 14 | Tela única: interface inteira do DekUI na tela de cima | 🟡 | 91/91 instruções do DekUI (`tools/dekui_coverage.py`), `patch` e hooks que chamam/desviam no recompilador, `presentation.json`; validado até a Lost Woods, falta validar de Clock Town em diante |
 | 15 | Shaders/pipelines antes do jogo + mods prontos na 1ª abertura | ✅ | shaders fixos em SPIR-V no build; semente de pipelines (`resources/pipeline_seed.bin`, gerada pelo `DOT_TOUR`) compilada no launcher; `warm` antes da thread do guest; launcher baixa Restoration HD HUD + layout; ver "Shaders e pipelines antes do jogo" |
-| OPT | Custo por draw do renderer | 🟡 | medição no `DOT_STATS`; ver "Custo por draw do renderer" |
+| OPT | Custo por draw do renderer + limite de apresentação | ✅ | index buffer, render pass compartilhado, hash de textura por lista, `recomp::call` em linha; medição no `DOT_STATS`; ver "Custo por draw do renderer" |
 | 16+ | Subsistemas do jogo | ⏳ | |
